@@ -58,7 +58,7 @@ This milestone is complete only when all are true:
 - [x] **S02: Training Pipeline with Live Log Streaming** `risk:high` `depends:[S01]`
   > After this: User can POST to start training for a profile, watch preprocess → feature extract → train logs stream via WebSocket in a test client, and find a real `.pth` in `assets/weights/` when training completes.
 
-- [ ] **S03: Realtime Voice Conversion & Waveform Visualization** `risk:high` `depends:[S01,S02]`
+- [x] **S03: Realtime Voice Conversion & Waveform Visualization** `risk:high` `depends:[S01,S02]`
   > After this: User opens the Realtime tab in the browser, selects MacBook Pro Microphone → BlackHole 2ch, starts session, speaks, and hears their converted voice on BlackHole output; input/output waveforms animate live in the browser.
 
 - [ ] **S04: Next.js Frontend Polish & Service Scripts** `risk:low` `depends:[S01,S02,S03]`

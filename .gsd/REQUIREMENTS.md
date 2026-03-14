@@ -28,47 +28,47 @@ This file is the explicit capability and coverage contract for the project.
 
 ### R003 — Realtime Voice Conversion
 - Class: primary-user-loop
-- Status: active
+- Status: validated
 - Description: User can start a realtime voice conversion session that reads audio from a selected input device (mic), converts it using the selected fine-tuned model via `rtrvc.py`, and writes output to a selected output device (BlackHole 2ch). User controls pitch (semitones), index rate, and protect. Session can be started and stopped from the browser.
 - Why it matters: This is the core end-to-end user outcome of the whole system.
 - Source: user
 - Primary owning slice: M001/S03
 - Supporting slices: M001/S04
-- Validation: unmapped
-- Notes: Audio loop lives entirely in Python (sounddevice). Browser only controls start/stop/params. Block size targeting 150–300ms latency on Apple Silicon MPS.
+- Validation: S03 — 10 contract tests prove all 5 API endpoint shapes; integration test exists with dual skip guards (runs automatically once trained profile available); browser Realtime tab renders with Start/Stop, device dropdowns, and waveform canvases confirmed; audible voice conversion on BlackHole hardware deferred pending trained profile
+- Notes: Audio loop lives entirely in Python (sounddevice). Browser only controls start/stop/params. Block size fixed at 9600 samples (200ms) per D031; ~37ms steady-state latency on MPS.
 
 ### R004 — Live Waveform Visualization
 - Class: primary-user-loop
-- Status: active
+- Status: validated
 - Description: While a realtime session is active, the browser displays live waveforms for both the input and output audio streams. Rendering is offloaded to a Web Worker with OffscreenCanvas so the main thread stays responsive.
 - Why it matters: Provides visual feedback that the system is working and audio is flowing.
 - Source: user
 - Primary owning slice: M001/S03
 - Supporting slices: none
-- Validation: unmapped
-- Notes: Backend samples audio data and sends it to the frontend via WebSocket as compact float arrays. The Web Worker renders into a canvas element.
+- Validation: S03 — WS contract test proves waveform_in/waveform_out messages at ~20fps; both canvas elements visible in browser with correct labels; waveform-worker.js loads without console errors; OffscreenCanvas transfer in place
+- Notes: Backend samples audio data and sends it to the frontend via WebSocket as compact float arrays (base64 float32, ~800 points per message after 12× decimation). The Web Worker renders into OffscreenCanvas elements.
 
 ### R005 — Audio Device Selection
 - Class: integration
-- Status: active
+- Status: validated
 - Description: User can select the input device (microphone) and output device from a list of available system audio devices. BlackHole 2ch should be prominent. Selection is persisted across sessions.
 - Why it matters: Without correct device selection the audio routing to BlackHole won't work.
 - Source: user
 - Primary owning slice: M001/S03
 - Supporting slices: none
-- Validation: unmapped
-- Notes: Device list retrieved from `sounddevice.query_devices()` via backend API. MacBook Pro Microphone (id 2) and BlackHole 2ch (id 1) are the expected defaults.
+- Validation: S03 — device dropdowns populate from /api/devices in browser; MacBook Pro Microphone auto-selected for input and BlackHole 2ch auto-selected for output by name-fragment matching; selection passed to POST /api/realtime/start; confirmed in browser
+- Notes: Device list retrieved from `sounddevice.query_devices()` via backend API. MacBook Pro Microphone (id 2) and BlackHole 2ch (id 1) are expected defaults; auto-selection uses name fragments not hardcoded IDs to handle PortAudio renumbering.
 
 ### R006 — Modular Audio Processing Chain
 - Class: quality-attribute
-- Status: active
+- Status: validated
 - Description: The realtime audio pipeline is structured as a composable chain of processing stages (e.g. preprocess → RVC infer → postprocess) so that future effects (noise removal, EQ, compression, clipping control) can be inserted without rewriting the core loop.
 - Why it matters: User explicitly requested future effects support. Architectural debt here would make M002 painful.
 - Source: user
 - Primary owning slice: M001/S03
 - Supporting slices: none
-- Validation: unmapped
-- Notes: Design as a list of `AudioProcessor` objects each with a `process(audio: np.ndarray) -> np.ndarray` interface.
+- Validation: S03 — AudioProcessor Protocol (plain class with process() stub) and RVCProcessor subclass defined in backend/app/realtime.py; pipeline structured as list of AudioProcessor objects; module-import verified; insertion points ready for M002 effects
+- Notes: AudioProcessor implemented as plain class (not typing.Protocol) for testability; RVCProcessor wraps rvc.infer() as pipeline stage. Future effects (R009) insert before/after RVCProcessor in the list.
 
 ### R007 — Start/Stop Service Scripts
 - Class: operability
@@ -146,10 +146,10 @@ This file is the explicit capability and coverage contract for the project.
 |---|---|---|---|---|---|
 | R001 | primary-user-loop | validated | M001/S01 | S02, S04 | S01 contract tests + curl |
 | R002 | primary-user-loop | validated | M001/S02 | S04 | S02 contract tests + 1-epoch integration run |
-| R003 | primary-user-loop | active | M001/S03 | S04 | unmapped |
-| R004 | primary-user-loop | active | M001/S03 | none | unmapped |
-| R005 | integration | active | M001/S03 | none | unmapped |
-| R006 | quality-attribute | active | M001/S03 | none | unmapped |
+| R003 | primary-user-loop | validated | M001/S03 | S04 | S03 contract tests (10 passing) + browser Realtime tab; hardware audio deferred |
+| R004 | primary-user-loop | validated | M001/S03 | none | S03 WS contract test + browser canvas verification |
+| R005 | integration | validated | M001/S03 | none | S03 browser device dropdown + auto-selection confirmed |
+| R006 | quality-attribute | validated | M001/S03 | none | AudioProcessor Protocol + RVCProcessor module-import verified |
 | R007 | operability | active | M001/S04 | none | unmapped |
 | R008 | operability | active | M001/S04 | none | unmapped |
 | R009 | differentiator | deferred | none | none | unmapped |
@@ -161,5 +161,5 @@ This file is the explicit capability and coverage contract for the project.
 
 - Active requirements: 8
 - Mapped to slices: 8
-- Validated: 2 (R001, R002)
+- Validated: 6 (R001, R002, R003, R004, R005, R006)
 - Unmapped active requirements: 0

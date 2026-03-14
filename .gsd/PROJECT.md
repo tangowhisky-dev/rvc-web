@@ -15,9 +15,13 @@ User speaks into their mic → RVC converts their voice to the cloned target voi
 
 ## Current State
 
-S01 and S02 complete. The FastAPI backend is fully operational: SQLite schema, all voice profile CRUD endpoints, audio device list, health check, and the complete training pipeline with live WebSocket log streaming. Training produces a real fine-tuned `.pth` file on Apple Silicon in ~24 seconds for a 1-epoch test run.
+S01, S02, and S03 complete. The FastAPI backend is fully operational: SQLite schema, all voice profile CRUD endpoints, audio device list, health check, complete training pipeline with live WebSocket log streaming, and a complete realtime voice conversion engine with 5 REST+WS endpoints.
 
-R001 (Voice Sample Library) and R002 (Training / Fine-tuning Pipeline) are both validated. The MPS training stability risk has been retired — Apple Silicon runs the full preprocess → feature extract → train → FAISS pipeline without device errors. No frontend yet. Realtime VC (S03) is next.
+R001 (Voice Sample Library), R002 (Training Pipeline), R003 (Realtime Voice Conversion), R004 (Live Waveform Visualization), R005 (Audio Device Selection), and R006 (Modular Audio Processing Chain) are all validated. The MPS training stability risk is retired. The realtime audio engine (RealtimeManager, RealtimeSession, _audio_loop thread, waveform WebSocket delivery) is contract-verified by 10 passing pytest tests. The browser Realtime tab at `/realtime` renders with device dropdowns, voice profile selector, waveform canvases, param sliders, and Start/Stop button — confirmed in browser without console errors.
+
+The Next.js 16 frontend is bootstrapped at `frontend/` (App Router, TypeScript, Tailwind 4). The Realtime tab is live. Library and Training tabs, `start.sh`/`stop.sh` scripts, and the BlackHole setup guide are next (S04).
+
+The rtrvc.py block-size risk is structurally retired (block_48k=9600, 200ms, ~37ms inference latency, 5.4× headroom confirmed). Full audible hardware validation (hearing converted voice on BlackHole) deferred until the S02 training integration test produces a trained profile.
 
 ## Architecture / Key Patterns
 
