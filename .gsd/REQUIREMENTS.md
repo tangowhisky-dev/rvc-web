@@ -17,14 +17,14 @@ This file is the explicit capability and coverage contract for the project.
 
 ### R002 — Training / Fine-tuning Pipeline
 - Class: primary-user-loop
-- Status: active
+- Status: validated
 - Description: User can select a voice profile and trigger a full RVC fine-tuning run (preprocess → feature extract → train). Training runs against a copy of the base pretrained v2 model — the base is never modified. One fine-tuned copy exists at a time; running training again overwrites it. Training logs stream in real time via WebSocket. User can see current phase and cancel.
 - Why it matters: The fine-tuned model is what produces convincing voice cloning.
 - Source: user
 - Primary owning slice: M001/S02
 - Supporting slices: M001/S04
-- Validation: unmapped
-- Notes: Uses `infer/modules/train/preprocess.py`, `extract_feature_print.py`, `train.py` as subprocesses launched from FastAPI. macOS / MPS means training is slow — realistic expectation is 20–60 min for a short sample.
+- Validation: S02 — real 1-epoch integration smoke test: `.pth` produced (55MB on Apple Silicon in 24s), FAISS index written, DB status updated to `trained`, WebSocket streamed 60 log messages through all 5 phases; 8 contract tests pass for all REST + WS endpoints; MPS training stability risk retired
+- Notes: Uses `infer/modules/train/preprocess.py`, `extract_feature_print.py`, `train.py` as subprocesses launched from FastAPI. On Apple Silicon MPS, 1-epoch run completes in ~24 seconds for a short sample; full training expected 20–60 min.
 
 ### R003 — Realtime Voice Conversion
 - Class: primary-user-loop
@@ -145,7 +145,7 @@ This file is the explicit capability and coverage contract for the project.
 | ID | Class | Status | Primary owner | Supporting | Proof |
 |---|---|---|---|---|---|
 | R001 | primary-user-loop | validated | M001/S01 | S02, S04 | S01 contract tests + curl |
-| R002 | primary-user-loop | active | M001/S02 | S04 | unmapped |
+| R002 | primary-user-loop | validated | M001/S02 | S04 | S02 contract tests + 1-epoch integration run |
 | R003 | primary-user-loop | active | M001/S03 | S04 | unmapped |
 | R004 | primary-user-loop | active | M001/S03 | none | unmapped |
 | R005 | integration | active | M001/S03 | none | unmapped |
@@ -161,5 +161,5 @@ This file is the explicit capability and coverage contract for the project.
 
 - Active requirements: 8
 - Mapped to slices: 8
-- Validated: 1 (R001)
+- Validated: 2 (R001, R002)
 - Unmapped active requirements: 0

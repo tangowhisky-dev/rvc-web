@@ -55,7 +55,7 @@ This milestone is complete only when all are true:
 - [x] **S01: Backend Foundation & Voice Sample Library** `risk:high` `depends:[]`
   > After this: FastAPI server runs from `rvc-web/`, SQLite schema initialized, REST API for creating/listing/deleting voice profiles is live, file upload stores audio to disk and records to DB — verified by curl.
 
-- [ ] **S02: Training Pipeline with Live Log Streaming** `risk:high` `depends:[S01]`
+- [x] **S02: Training Pipeline with Live Log Streaming** `risk:high` `depends:[S01]`
   > After this: User can POST to start training for a profile, watch preprocess → feature extract → train logs stream via WebSocket in a test client, and find a real `.pth` in `assets/weights/` when training completes.
 
 - [ ] **S03: Realtime Voice Conversion & Waveform Visualization** `risk:high` `depends:[S01,S02]`

@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.app.db import DB_PATH, init_db
 from backend.app.routers.devices import router as devices_router
 from backend.app.routers.profiles import router as profiles_router
+from backend.app.routers.training import router as training_router
+from backend.app.routers.training import ws_router as training_ws_router
 
 logger = logging.getLogger("rvc_web")
 
@@ -62,3 +64,5 @@ async def health():
 # Routers
 app.include_router(profiles_router)
 app.include_router(devices_router)
+app.include_router(training_router)
+app.include_router(training_ws_router)

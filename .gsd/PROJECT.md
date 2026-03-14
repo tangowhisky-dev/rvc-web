@@ -15,9 +15,9 @@ User speaks into their mic → RVC converts their voice to the cloned target voi
 
 ## Current State
 
-S01 complete. The FastAPI backend is fully operational: SQLite schema initialized, all four voice profile CRUD endpoints live (`POST/GET/GET-by-id/DELETE /api/profiles`), `GET /api/devices` returning system audio devices including BlackHole 2ch, and `GET /health` for liveness checks. All 17 contract tests pass. The server starts cleanly with `conda run -n rvc uvicorn backend.app.main:app --host 0.0.0.0 --port 8000` from `rvc-web/`.
+S01 and S02 complete. The FastAPI backend is fully operational: SQLite schema, all voice profile CRUD endpoints, audio device list, health check, and the complete training pipeline with live WebSocket log streaming. Training produces a real fine-tuned `.pth` file on Apple Silicon in ~24 seconds for a 1-epoch test run.
 
-R001 (Voice Sample Library) is validated. No frontend yet. Training pipeline (S02) and realtime VC (S03) are next.
+R001 (Voice Sample Library) and R002 (Training / Fine-tuning Pipeline) are both validated. The MPS training stability risk has been retired — Apple Silicon runs the full preprocess → feature extract → train → FAISS pipeline without device errors. No frontend yet. Realtime VC (S03) is next.
 
 ## Architecture / Key Patterns
 
