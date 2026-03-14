@@ -52,7 +52,7 @@ This milestone is complete only when all are true:
 
 ## Slices
 
-- [ ] **S01: Backend Foundation & Voice Sample Library** `risk:high` `depends:[]`
+- [x] **S01: Backend Foundation & Voice Sample Library** `risk:high` `depends:[]`
   > After this: FastAPI server runs from `rvc-web/`, SQLite schema initialized, REST API for creating/listing/deleting voice profiles is live, file upload stores audio to disk and records to DB — verified by curl.
 
 - [ ] **S02: Training Pipeline with Live Log Streaming** `risk:high` `depends:[S01]`

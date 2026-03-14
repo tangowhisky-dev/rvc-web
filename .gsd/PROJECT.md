@@ -15,7 +15,9 @@ User speaks into their mic → RVC converts their voice to the cloned target voi
 
 ## Current State
 
-Bootstrapping. The upstream RVC repo (`Retrieval-based-Voice-Conversion-WebUI`) is cloned at `Retrieval-based-Voice-Conversion-WebUI/` and all its Python dependencies are installed in the `rvc` conda environment. Pretrained v2 model weights, HuBERT, and RMVPE are confirmed downloaded. No application code yet.
+S01 complete. The FastAPI backend is fully operational: SQLite schema initialized, all four voice profile CRUD endpoints live (`POST/GET/GET-by-id/DELETE /api/profiles`), `GET /api/devices` returning system audio devices including BlackHole 2ch, and `GET /health` for liveness checks. All 17 contract tests pass. The server starts cleanly with `conda run -n rvc uvicorn backend.app.main:app --host 0.0.0.0 --port 8000` from `rvc-web/`.
+
+R001 (Voice Sample Library) is validated. No frontend yet. Training pipeline (S02) and realtime VC (S03) are next.
 
 ## Architecture / Key Patterns
 

@@ -6,13 +6,13 @@ This file is the explicit capability and coverage contract for the project.
 
 ### R001 — Voice Sample Library
 - Class: primary-user-loop
-- Status: active
+- Status: validated
 - Description: User can upload audio files and name them as voice profiles. Profiles are persisted in SQLite with metadata (name, created_at, file path, training status). User can list, select, and delete profiles.
 - Why it matters: All other features depend on a named, persistent voice profile.
 - Source: user
 - Primary owning slice: M001/S01
 - Supporting slices: M001/S02, M001/S04
-- Validation: unmapped
+- Validation: S01 — 10 passing contract tests + live curl verification (upload, list, get, delete) with real SQLite writes and disk I/O
 - Notes: Audio stored in `data/samples/<profile_id>/` relative to the backend root.
 
 ### R002 — Training / Fine-tuning Pipeline
@@ -144,7 +144,7 @@ This file is the explicit capability and coverage contract for the project.
 
 | ID | Class | Status | Primary owner | Supporting | Proof |
 |---|---|---|---|---|---|
-| R001 | primary-user-loop | active | M001/S01 | S02, S04 | unmapped |
+| R001 | primary-user-loop | validated | M001/S01 | S02, S04 | S01 contract tests + curl |
 | R002 | primary-user-loop | active | M001/S02 | S04 | unmapped |
 | R003 | primary-user-loop | active | M001/S03 | S04 | unmapped |
 | R004 | primary-user-loop | active | M001/S03 | none | unmapped |
@@ -161,5 +161,5 @@ This file is the explicit capability and coverage contract for the project.
 
 - Active requirements: 8
 - Mapped to slices: 8
-- Validated: 0
+- Validated: 1 (R001)
 - Unmapped active requirements: 0
