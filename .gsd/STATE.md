@@ -1,14 +1,14 @@
 # GSD State
 
 **Active Milestone:** M001 — RVC Web App
-**Active Slice:** S04 — Next.js Frontend Polish & Service Scripts
-**Phase:** S03 complete; S04 not started
+**Status:** COMPLETE — all 4 slices done, all 8 requirements validated
 
 ## Recent Decisions
 
-- D035: Device API schema uses `is_input`/`is_output` booleans (not `kind` field)
-- D036: Frontend bootstrapped fresh with Next.js 16 + App Router + Tailwind 4
-- D037: Realtime tab includes Voice Profile selector (fetches /api/profiles, filters trained)
+- D038: NavBar extracted as client component inside layout.tsx (Server Component boundary preserved)
+- D039: Library page polls GET /api/realtime/status every 3s for session-active indicator
+- D040: Training page shows all profiles in dropdown (not just trained); user picks who to train
+- D041: WS_BASE = 'ws://localhost:8000' separate from API = 'http://localhost:8000' in Training page
 
 ## Blockers
 
@@ -34,12 +34,21 @@ Complete. All 4 tasks done.
 - Integration test exists; skips until trained profile available (run S02 training integration first)
 - R003, R004, R005, R006 all validated
 
-## S04 Scope Reminder
+## Milestone S04 Status
 
-- Polished Next.js UI: Library tab (`/`), Training tab (`/training`), Realtime tab (`/realtime`) under unified layout
-- `scripts/start.sh` and `scripts/stop.sh`
-- In-app BlackHole setup guide
+**Complete** — All 3 tasks done.
+- T01: ✅ Fix training router duplicate + build Library page
+- T02: ✅ Build Training page with live WebSocket log stream
+- T03: ✅ Service scripts + BlackHole Setup page
+
+R007 (start/stop scripts) and R008 (BlackHole guide) validated. TypeScript clean. All S04 must-haves satisfied.
+
+## M001 Status
+
+**COMPLETE.** All 4 slices done. All 8 requirements validated (R001–R008).
+
+Remaining for full end-to-end: hardware UAT — run `start.sh`, upload a voice sample, train 1 epoch, open Realtime tab, start session, confirm audible converted voice on BlackHole output.
 
 ## Next Action
 
-Begin S04: Next.js Frontend Polish & Service Scripts.
+M001 complete. Slice branch `gsd/M001/S04` squash-merged to main. Ready for M002 planning.

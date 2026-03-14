@@ -1,1 +1,14 @@
-[]
+[
+  {
+    "id": "67f07ecd",
+    "label": "frontend-dev",
+    "command": "cd /Users/tango16/code/rvc-web/frontend && pnpm dev",
+    "cwd": "/Users/tango16/code/rvc-web",
+    "startedAt": 1773515496699,
+    "processType": "server",
+    "group": null,
+    "readyPattern": null,
+    "readyPort": 3000,
+    "pid": 25177
+  }
+]

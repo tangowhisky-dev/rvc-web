@@ -72,24 +72,24 @@ This file is the explicit capability and coverage contract for the project.
 
 ### R007 — Start/Stop Service Scripts
 - Class: operability
-- Status: active
+- Status: validated
 - Description: `scripts/start.sh` starts both services (FastAPI backend + Next.js frontend) and `scripts/stop.sh` stops them cleanly. Scripts handle conda env activation for the backend.
 - Why it matters: Without scripts, the user must manually start services each time.
 - Source: user
 - Primary owning slice: M001/S04
 - Supporting slices: none
-- Validation: unmapped
-- Notes: Backend runs under `conda run -n rvc`. PID files stored in `.pids/` for clean stop.
+- Validation: S04 — `bash -n` syntax checks pass; stop script exits 0 with and without PID files; start script confirmed executable with PID files written; stale-port kill logic in place
+- Notes: Backend runs under `conda run --no-capture-output -n rvc`. PID files stored in `.pids/` for clean stop. `.pids/` gitignored.
 
 ### R008 — BlackHole Setup Guide
 - Class: operability
-- Status: active
+- Status: validated
 - Description: The app tells the user exactly which macOS Audio MIDI Setup and system settings to configure for BlackHole 2ch to work as the virtual output. This information is presented in the UI (not just docs).
 - Why it matters: Without correct macOS routing, the converted voice never reaches other apps.
 - Source: user
 - Primary owning slice: M001/S04
 - Supporting slices: none
-- Validation: unmapped
+- Validation: S04 — `/setup` page renders at `http://localhost:3000/setup` with all 5 numbered sections (install, Audio MIDI Setup, system output, RVC routing, target app input), macOS menu paths, tip block, and quick reference; accessible from NavBar; confirmed in browser
 - Notes: BlackHole device id=1 on this machine. The typical setup is: set RVC output → BlackHole 2ch, then set the target app's mic input → BlackHole 2ch.
 
 ## Deferred
@@ -150,8 +150,8 @@ This file is the explicit capability and coverage contract for the project.
 | R004 | primary-user-loop | validated | M001/S03 | none | S03 WS contract test + browser canvas verification |
 | R005 | integration | validated | M001/S03 | none | S03 browser device dropdown + auto-selection confirmed |
 | R006 | quality-attribute | validated | M001/S03 | none | AudioProcessor Protocol + RVCProcessor module-import verified |
-| R007 | operability | active | M001/S04 | none | unmapped |
-| R008 | operability | active | M001/S04 | none | unmapped |
+| R007 | operability | validated | M001/S04 | none | S04 script syntax + stop-without-PIDs + PID files confirmed |
+| R008 | operability | validated | M001/S04 | none | S04 /setup page browser verification (5 sections + NavBar link) |
 | R009 | differentiator | deferred | none | none | unmapped |
 | R010 | core-capability | deferred | none | none | unmapped |
 | R011 | constraint | out-of-scope | none | none | n/a |
@@ -161,5 +161,5 @@ This file is the explicit capability and coverage contract for the project.
 
 - Active requirements: 8
 - Mapped to slices: 8
-- Validated: 6 (R001, R002, R003, R004, R005, R006)
+- Validated: 8 (R001, R002, R003, R004, R005, R006, R007, R008)
 - Unmapped active requirements: 0
