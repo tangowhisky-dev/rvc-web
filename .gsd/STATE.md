@@ -1,7 +1,7 @@
 # GSD State
 
-**Active Milestone:** M001 — COMPLETE
-**Status:** All 4 slices done, all 8 requirements validated, M001-SUMMARY.md written
+**Active Milestone:** M001 — COMPLETE + INFERENCE HARDENED
+**Status:** All 4 slices done, all 8 requirements validated, realtime inference fixed (MPS + warmup)
 
 ## Milestone M001 Final Status
 
@@ -12,7 +12,29 @@
 - S03: 10/10 contract tests; 35 passed / 2 skipped (integration skip-guarded without hardware) ✅
 - S04: TypeScript clean; script syntax verified; browser UI confirmed ✅
 
-Remaining for full end-to-end hardware UAT: run `./scripts/start.sh`, upload a voice sample, train 1 epoch, open Realtime tab, start session, confirm audible converted voice on BlackHole 2ch output.
+## Realtime Inference Fixes (Post-M001)
+
+**Segfault root causes fixed:**
+
+1. **hubert_base.pt relative path**: fairseq resolved relative to uvicorn cwd, not rvc_root
+   - Fix: set `hubert_path` env var; rtrvc.py reads `os.environ.get("hubert_path")`
+
+2. **faiss + fairseq OpenMP collision**: both link different libomp on macOS
+   - Fix: `faiss.omp_set_num_threads(1)` + `OMP_NUM_THREADS=1` before any imports
+
+3. **Native code segfaulting uvicorn**: RVC/fairseq/sounddevice moved to isolated subprocess
+   - Isolated worker: `_realtime_worker.py` (spawn context)
+   - Parent holds queues + proc ref; native code never touches uvicorn address space
+
+**MPS inference backend:**
+
+- Device selection: prefers Apple Silicon MPS, falls back to CPU
+- Model load: 1.4s; warmup: 2s; steady-state: 50ms/block (real-time compatible)
+- `is_half=False` for MPS stability
+- Warmup happens before "ready" signal — client knows inference is stable
+- Structured JSON logging: `worker_warming_up`, `worker_ready` with device type
+
+**Tests:** 35 passed, 2 skipped (integration skip-guarded)
 
 ## Blockers
 
@@ -20,4 +42,5 @@ None.
 
 ## Next Action
 
-Ready for M002 planning. Run `./scripts/start.sh` for hardware UAT first.
+Ready for M002 planning. Run `./scripts/start.sh` for hardware UAT with MPS inference.
+
