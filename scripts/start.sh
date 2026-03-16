@@ -51,6 +51,10 @@ RVC_ROOT="$(cd Retrieval-based-Voice-Conversion-WebUI && pwd)"
 
 # Fix libomp duplicate-init crash when PyTorch and system OpenMP both load
 export KMP_DUPLICATE_LIB_OK=TRUE
+# Restrict OMP/MKL/BLAS to single thread — prevents faiss+fairseq OpenMP collision
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
 
 echo "[start] RVC_ROOT=$RVC_ROOT"
 echo "[start] Starting backend (conda rvc env)..."
