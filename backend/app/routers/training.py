@@ -88,6 +88,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     rvc_root = os.environ.get("RVC_ROOT", "")
     if not rvc_root:
         raise HTTPException(status_code=400, detail="RVC_ROOT not set")
+    rvc_root = os.path.abspath(rvc_root)  # ensure absolute so subprocess paths resolve correctly
 
     # Derive absolute sample directory from sample_path (which is the file path)
     sample_dir = os.path.dirname(os.path.abspath(row["sample_path"]))

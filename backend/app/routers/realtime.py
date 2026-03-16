@@ -113,6 +113,8 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
 
     # Pass rvc_root to manager; if it's empty the manager will raise ValueError
     rvc_root = os.environ.get("RVC_ROOT") or None
+    if rvc_root:
+        rvc_root = os.path.abspath(rvc_root)  # ensure absolute so inference paths resolve correctly
 
     try:
         result = manager.start_session(
