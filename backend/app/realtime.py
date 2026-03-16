@@ -5,12 +5,14 @@ subprocess so it never shares the uvicorn address space (prevents segfault on ma
 
 Communication:
   cmd_q  (parent→child): stop, update_params
-  evt_q  (child→parent): ready, error, stopped, waveform_in, waveform_out, waveform_overflow
+  evt_q  (child→parent): warming_up, ready, error, stopped, waveform_in, waveform_out, waveform_overflow
 
 Session lifecycle observability (structured stdout JSON):
-  {"event":"session_start",  "session_id":..., "profile_id":..., ...}
-  {"event":"session_stop",   "session_id":...}
-  {"event":"session_error",  "session_id":..., "error":"..."}
+  {"event":"worker_warming_up", "device": "mps" | "cpu"}
+  {"event":"worker_ready",      "session_id":..., "device":...}
+  {"event":"session_start",     "session_id":..., "profile_id":..., ...}
+  {"event":"session_stop",      "session_id":...}
+  {"event":"session_error",     "session_id":..., "error":"..."}
 """
 
 import collections
@@ -200,8 +202,20 @@ class RealtimeManager:
 
             if msg.get("event") == "ready":
                 session_id = msg["session_id"]
+                infer_device = msg.get("device", "unknown")
                 ready = True
+                print(json.dumps({
+                    "event": "worker_ready",
+                    "session_id": session_id,
+                    "device": infer_device,
+                }), flush=True)
                 break
+            elif msg.get("event") == "warming_up":
+                infer_device = msg.get("device", "unknown")
+                print(json.dumps({
+                    "event": "worker_warming_up",
+                    "device": infer_device,
+                }), flush=True)
             elif msg.get("event") == "error":
                 proc.terminate()
                 raise RuntimeError(msg.get("error", "worker error"))

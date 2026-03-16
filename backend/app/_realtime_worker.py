@@ -7,14 +7,22 @@ Protocol (multiprocessing.Queue messages):
 
   Parent → child (cmd_q):
     {"cmd": "stop"}
+    {"cmd": "update_params", "pitch": float, "index_rate": float, "protect": float}
 
   Child → parent (evt_q):
-    {"event": "ready",   "session_id": str}
-    {"event": "error",   "error": str}
+    {"event": "warming_up",      "device": "mps" | "cpu"}
+    {"event": "ready",           "session_id": str, "device": str}
+    {"event": "error",           "error": str}
     {"event": "stopped"}
-    {"event": "waveform_in",  "samples": <b64 float32>, "sr": 48000}
-    {"event": "waveform_out", "samples": <b64 float32>, "sr": 48000}
+    {"event": "waveform_in",     "samples": <b64 float32>, "sr": 48000}
+    {"event": "waveform_out",    "samples": <b64 float32>, "sr": 48000}
     {"event": "waveform_overflow", "detail": str}
+
+Device selection:
+  - Prefers MPS (Metal Performance Shaders) on Apple Silicon for inference
+  - Falls back to CPU if MPS not available
+  - Warmup call ensures all MPS kernel compilation happens before "ready" signal
+  - Typical warmup: ~2s on MPS (first call), ~50ms on subsequent calls
 
 Usage:
     python _realtime_worker.py  (not meant to be invoked directly)
@@ -97,10 +105,17 @@ def run_worker(
     session_id = uuid.uuid4().hex
 
     try:
-        # Import torch first, then faiss with nthreads=1, before fairseq
+        # Import torch first, then faiss with nthreads=1, before fairseq.
+        # This order prevents the faiss+fairseq OpenMP collision on macOS.
         import torch as _torch  # noqa: PLC0415
         import faiss as _faiss  # noqa: PLC0415
         _faiss.omp_set_num_threads(1)
+
+        # Resolve inference device — prefer MPS (Apple Silicon GPU), fall back to CPU
+        if _torch.backends.mps.is_available():
+            infer_device = "mps"
+        else:
+            infer_device = "cpu"
 
         # fairseq safe-globals fix (PyTorch 2.6 — D025)
         try:
@@ -117,29 +132,32 @@ def run_worker(
             raise RuntimeError("no index file found — run training first")
         index_path = matches[0]
 
+        # is_half=False: MPS doesn't support float16 in all ops reliably
         rvc = RVC(
             key=pitch,
             formant=0,
             pth_path=f"{rvc_root}/assets/weights/rvc_finetune_active.pth",
             index_path=index_path,
             index_rate=index_rate,
+            device=infer_device,
+            is_half=False,
         )
 
         block_params = _compute_block_params(_BLOCK_48K)
 
-        # Warmup
-        silence = torch.zeros(block_params["total_16k_samples"])
-        try:
-            rvc.infer(
-                silence,
-                block_params["block_16k"],
-                block_params["skip_head_frames"],
-                block_params["return_length_frames"],
-                "rmvpe",
-                protect,
-            )
-        except Exception:
-            pass
+        # Warmup: run one full infer pass so MPS compiles its kernels.
+        # This ensures the "ready" signal only fires after real-time latency
+        # is stable (first call is ~2s on MPS, subsequent calls ~50ms).
+        evt_q.put({"event": "warming_up", "device": infer_device})
+        silence = _torch.zeros(block_params["total_16k_samples"])
+        rvc.infer(
+            silence,
+            block_params["block_16k"],
+            block_params["skip_head_frames"],
+            block_params["return_length_frames"],
+            "rmvpe",
+            protect,
+        )
 
         import sounddevice as sd  # noqa: PLC0415
 
@@ -161,7 +179,7 @@ def run_worker(
         stream_in.start()
         stream_out.start()
 
-        evt_q.put({"event": "ready", "session_id": session_id})
+        evt_q.put({"event": "ready", "session_id": session_id, "device": infer_device})
 
         # Audio loop
         block_44k = block_params["block_44k"]
@@ -206,7 +224,7 @@ def run_worker(
             rolling_buf[:-block_16k] = rolling_buf[block_16k:]
             rolling_buf[-block_16k:] = x_16k[:block_16k]
 
-            input_tensor = torch.from_numpy(rolling_buf).float()
+            input_tensor = _torch.from_numpy(rolling_buf).float()
             out = rvc.infer(
                 input_tensor,
                 block_16k,
