@@ -31,15 +31,30 @@ kill_port 8000
 kill_port 3000
 kill_next_dev
 
+# Kill any dangling training or inference (spawn_main) processes
+kill_dangling() {
+  local pids
+  pids=$(pgrep -f "train\.py\|spawn_main\|realtime\|infer/modules" 2>/dev/null) || true
+  if [ -n "$pids" ]; then
+    echo "[start] Killing dangling training/inference processes..."
+    echo "$pids" | xargs kill -9 2>/dev/null || true
+    sleep 1
+  fi
+}
+kill_dangling
+
 mkdir -p .pids
 
 # Export RVC_ROOT as absolute path so subprocesses resolve paths correctly
 export RVC_ROOT
 RVC_ROOT="$(cd Retrieval-based-Voice-Conversion-WebUI && pwd)"
 
+# Fix libomp duplicate-init crash when PyTorch and system OpenMP both load
+export KMP_DUPLICATE_LIB_OK=TRUE
+
 echo "[start] RVC_ROOT=$RVC_ROOT"
 echo "[start] Starting backend (conda rvc env)..."
-conda run --no-capture-output -n rvc \
+KMP_DUPLICATE_LIB_OK=TRUE conda run --no-capture-output -n rvc \
   uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
 echo "$BACKEND_PID" > .pids/backend.pid

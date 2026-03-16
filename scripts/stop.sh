@@ -41,4 +41,11 @@ if [ -n "$NEXT_PIDS" ]; then
   echo "$NEXT_PIDS" | xargs kill -9 2>/dev/null || true
 fi
 
+# Kill dangling training / inference sessions (train.py workers, spawn_main children)
+TRAIN_PIDS=$(pgrep -f "train\.py\|spawn_main\|infer/modules" 2>/dev/null) || true
+if [ -n "$TRAIN_PIDS" ]; then
+  echo "[stop] Killing dangling training/inference process(es)..."
+  echo "$TRAIN_PIDS" | xargs kill -9 2>/dev/null || true
+fi
+
 echo "[stop] Done."

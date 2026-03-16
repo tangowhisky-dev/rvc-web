@@ -20,9 +20,10 @@ interface Profile {
 }
 
 interface TrainingMsg {
-  type: 'log' | 'phase' | 'done' | 'error';
+  type: 'log' | 'phase' | 'done' | 'error' | 'keepalive';
   message?: string;
   phase?: string;
+  elapsed_s?: number;
 }
 
 type JobState = 'idle' | 'running' | 'done' | 'failed';
@@ -228,6 +229,17 @@ export default function TrainingPage() {
             if (msg.message) {
               appendLog(`[${msg.phase ?? ''}] ${msg.message}`);
             }
+          } else if (msg.type === 'keepalive') {
+            // Replace the last keepalive line rather than appending a new one
+            if (msg.message) {
+              setLogLines((prev) => {
+                const last = prev[prev.length - 1] ?? '';
+                if (last.startsWith('Training in progress…')) {
+                  return [...prev.slice(0, -1), msg.message!];
+                }
+                return [...prev, msg.message!];
+              });
+            }
           } else if (msg.type === 'done') {
             setCurrentPhase('done');
             setJobState('done');
@@ -258,11 +270,13 @@ export default function TrainingPage() {
       };
 
       ws.onclose = () => {
+        // Only treat unexpected close as an error — not after a clean done/failed
         if (jobStateRef.current === 'running') {
           appendLog('(connection closed)');
           setJobState('idle');
           jobStateRef.current = 'idle';
         }
+        // If done or failed: keep the state — don't reset to idle
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -300,6 +314,8 @@ export default function TrainingPage() {
   // ---------------------------------------------------------------------------
 
   const isRunning = jobState === 'running';
+  // Show Start Training only when fully idle or when previous run is done/failed
+  // (not while running — which includes the index phase)
   const canStart = !!selectedId && jobState !== 'running';
 
   // ---------------------------------------------------------------------------

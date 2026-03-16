@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
@@ -212,6 +213,7 @@ async def training_websocket(websocket: WebSocket, profile_id: str) -> None:
         return
 
     try:
+        ws_start = time.monotonic()
         while True:
             try:
                 msg = await asyncio.wait_for(job.queue.get(), timeout=10.0)
@@ -231,11 +233,13 @@ async def training_websocket(websocket: WebSocket, profile_id: str) -> None:
                     else:
                         await websocket.send_json({"type": "done", "phase": job.phase})
                     break
-                # Still running — send a keepalive log line every 10s
+                # Still running — send a keepalive with elapsed seconds
+                elapsed = int(time.monotonic() - ws_start)
                 await websocket.send_json({
-                    "type": "log",
-                    "message": f"Training in progress… (phase: {job.phase})",
+                    "type": "keepalive",
+                    "message": f"Training in progress… ({elapsed}s elapsed)",
                     "phase": job.phase,
+                    "elapsed_s": elapsed,
                 })
                 continue
 

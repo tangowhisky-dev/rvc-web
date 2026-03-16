@@ -5,6 +5,10 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+# Fix libomp duplicate-init crash when PyTorch and system OpenMP both load
+# (common on macOS with conda-installed torch). Must be set before any torch import.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
