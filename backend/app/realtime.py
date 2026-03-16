@@ -18,6 +18,7 @@ Session lifecycle observability (structured stdout JSON):
 import collections
 import json
 import multiprocessing
+import threading
 import os
 import sys
 from dataclasses import dataclass, field
@@ -106,6 +107,9 @@ class RealtimeSession:
     _waveform_deque: collections.deque = field(
         default_factory=lambda: collections.deque(maxlen=40), repr=False
     )
+
+    # Stop signal for WebSocket handler
+    _stop_event: threading.Event = field(default_factory=lambda: threading.Event(), repr=False)
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +298,9 @@ class RealtimeManager:
 
         session.status = "stopped"
 
+        # Signal WebSocket handler to exit
+        session._stop_event.set()
+
         # Send stop command
         try:
             session._cmd_q.put({"cmd": "stop"})
@@ -307,10 +314,17 @@ class RealtimeManager:
                 session._proc.terminate()
                 session._proc.join(timeout=1.0)
 
+        # Wait for drain thread to finish
+        if session._drain_thread is not None:
+            session._drain_thread.join(timeout=1.0)
+
         print(json.dumps({
             "event": "session_stop",
             "session_id": session_id,
         }), flush=True)
+
+        # Clean up from sessions dict
+        self._sessions.pop(session_id, None)
 
     def get_session(self, session_id: str) -> Optional[RealtimeSession]:
         return self._sessions.get(session_id)

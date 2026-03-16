@@ -284,6 +284,49 @@ export default function RealtimePage() {
   );
 
   // ---------------------------------------------------------------------------
+  // Stable refs for current state (for polling loop)
+  // ---------------------------------------------------------------------------
+
+  const sessionStateRef = useRef<typeof sessionState>('idle');
+  useEffect(() => {
+    sessionStateRef.current = sessionState;
+  }, [sessionState]);
+
+  // ---------------------------------------------------------------------------
+  // Poll session status continuously
+  // ---------------------------------------------------------------------------
+
+  useEffect(() => {
+    // Poll status every 1s to detect transitions
+    const interval = setInterval(async () => {
+      // Skip polling if idle
+      if (sessionStateRef.current === 'idle' || sessionStateRef.current === 'stopping') return;
+
+      try {
+        const res = await fetch(`${API}/api/realtime/status`);
+        if (!res.ok) return;
+        const status = await res.json();
+
+        // Transition: starting → active once backend confirms
+        if (status.active && sessionStateRef.current === 'starting') {
+          setSessionState('active');
+        }
+        // Transition: active → idle when session stops
+        else if (!status.active && sessionStateRef.current === 'active') {
+          setSessionState('idle');
+          setSessionId(null);
+          sessionIdRef.current = null;
+          cleanup();
+        }
+      } catch (_) {
+        // Ignore network errors; keep polling
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [cleanup]); // Only depends on cleanup, not sessionState
+
+  // ---------------------------------------------------------------------------
   // Start session
   // ---------------------------------------------------------------------------
 
@@ -321,7 +364,8 @@ export default function RealtimePage() {
       const { session_id } = await startRes.json();
       setSessionId(session_id);
       sessionIdRef.current = session_id;
-      setSessionState('active');
+      // Don't set to 'active' yet — let polling detect it
+
 
       // ---------------------------------------------------------------------------
       // Launch Web Worker

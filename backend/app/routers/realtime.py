@@ -157,14 +157,23 @@ async def stop_session(request: StopSessionRequest) -> dict:
     """Stop a running realtime voice conversion session.
 
     Args:
-        request: StopSessionRequest with session_id.
+        request: StopSessionRequest with session_id (or "all" to stop all).
 
     Returns:
         {"ok": True}
 
     Raises:
-        HTTPException(404): Session not found.
+        HTTPException(404): Session not found (only if specific session_id requested).
     """
+    if request.session_id == "all":
+        # Stop all active sessions
+        for session_id in list(manager._sessions.keys()):
+            try:
+                manager.stop_session(session_id)
+            except Exception:
+                pass  # Ignore errors for already-stopping sessions
+        return {"ok": True}
+
     session = manager.get_session(request.session_id)
     if session is None:
         raise HTTPException(

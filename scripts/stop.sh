@@ -2,6 +2,24 @@
 
 cd "$(dirname "$0")/.."
 
+# Step 1: Kill worker subprocesses FIRST (before killing backend)
+# These are spawn_main children that consume memory and don't clean up
+echo "[stop] Killing worker subprocesses (spawn_main)..."
+pkill -9 -f "spawn_main" 2>/dev/null || true
+pkill -9 -f "_realtime_worker" 2>/dev/null || true
+sleep 1
+
+# Step 2: If backend is running, try clean shutdown via API
+echo "[stop] Attempting clean shutdown via API..."
+if nc -z localhost 8000 2>/dev/null; then
+  timeout 3 curl -s http://localhost:8000/api/realtime/stop \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"session_id":"all"}' 2>/dev/null || true
+  sleep 1
+fi
+
+# Step 3: Kill processes by PID file
 stop_pid() {
   local name=$1
   local pidfile=".pids/${name}.pid"
@@ -16,6 +34,7 @@ stop_pid() {
   fi
 }
 
+# Step 4: Kill by port (forceful)
 stop_port() {
   local port=$1
   local pids
@@ -29,23 +48,22 @@ stop_port() {
 stop_pid backend
 stop_pid frontend
 
-# Belt-and-suspenders: kill by port in case PID files are stale or missing
+# Belt-and-suspenders: kill by port in case PID files are stale
 stop_port 8000
 stop_port 3000
 stop_port 3001
 
-# Kill any lingering next dev processes
+# Step 5: Kill any lingering dev/build processes
+echo "[stop] Cleaning up dev processes..."
 NEXT_PIDS=$(pgrep -f "next dev" 2>/dev/null) || true
 if [ -n "$NEXT_PIDS" ]; then
-  echo "[stop] Killing lingering next dev process(es)..."
   echo "$NEXT_PIDS" | xargs kill -9 2>/dev/null || true
 fi
 
-# Kill dangling training / inference sessions (train.py workers, spawn_main children)
-TRAIN_PIDS=$(pgrep -f "train\.py\|spawn_main\|infer/modules" 2>/dev/null) || true
+TRAIN_PIDS=$(pgrep -f "train\.py" 2>/dev/null) || true
 if [ -n "$TRAIN_PIDS" ]; then
-  echo "[stop] Killing dangling training/inference process(es)..."
   echo "$TRAIN_PIDS" | xargs kill -9 2>/dev/null || true
 fi
 
 echo "[stop] Done."
+
