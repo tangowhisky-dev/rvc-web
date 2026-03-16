@@ -214,15 +214,30 @@ async def training_websocket(websocket: WebSocket, profile_id: str) -> None:
     try:
         while True:
             try:
-                msg = await asyncio.wait_for(job.queue.get(), timeout=60.0)
+                msg = await asyncio.wait_for(job.queue.get(), timeout=10.0)
             except asyncio.TimeoutError:
-                # Send a keepalive-style error and stop
+                # No message in 10s — send a keepalive ping so the browser
+                # knows training is still running, then keep waiting.
+                # Only stop if the job has already finished/failed AND the
+                # queue is empty (i.e. the pipeline task has exited).
+                if job.status in ("trained", "failed") and job.queue.empty():
+                    # Job is done; send appropriate terminal message and stop
+                    if job.status == "failed":
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": job.error or "Training failed",
+                            "phase": job.phase,
+                        })
+                    else:
+                        await websocket.send_json({"type": "done", "phase": job.phase})
+                    break
+                # Still running — send a keepalive log line every 10s
                 await websocket.send_json({
-                    "type": "error",
-                    "message": "queue timeout — no messages for 60s",
+                    "type": "log",
+                    "message": f"Training in progress… (phase: {job.phase})",
                     "phase": job.phase,
                 })
-                break
+                continue
 
             await websocket.send_json(msg)
 

@@ -487,8 +487,8 @@ async def _run_pipeline(
 
     train_proc = await asyncio.create_subprocess_exec(
         *train_args,
-        stdout=asyncio_subprocess.DEVNULL,   # train.py has no stdout
-        stderr=asyncio_subprocess.DEVNULL,   # all output goes to train.log
+        stdout=asyncio_subprocess.DEVNULL,   # train.py has no stdout; logs go to train.log
+        stderr=asyncio_subprocess.PIPE,       # capture stderr so crashes surface in job error
         env=train_env,
         cwd=rvc_root,
     )
@@ -512,7 +512,12 @@ async def _run_pipeline(
         pass
 
     if train_proc.returncode != 0:
-        await _fail("train", f"Train phase failed (exit code {train_proc.returncode})")
+        stderr_bytes = await train_proc.stderr.read() if train_proc.stderr else b""
+        stderr_tail = stderr_bytes.decode(errors="replace")[-2000:].strip()
+        err_msg = f"Train phase failed (exit code {train_proc.returncode})"
+        if stderr_tail:
+            err_msg += f"\n{stderr_tail}"
+        await _fail("train", err_msg)
         return
 
     # ------------------------------------------------------------------
