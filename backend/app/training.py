@@ -147,6 +147,32 @@ async def _tail_train_log(job: TrainingJob, log_path: str) -> None:
             if line:
                 stripped = line.rstrip()
                 if stripped:
+                    # Detect epoch-start lines: "Train Epoch: N [N%]"
+                    if "Train Epoch:" in stripped:
+                        import re as _re
+                        m = _re.search(r"Train Epoch:\s*(\d+)", stripped)
+                        if m:
+                            epoch_num = int(m.group(1))
+                            await job.queue.put({
+                                "type": "epoch",
+                                "message": f"Epoch {epoch_num} started",
+                                "phase": "train",
+                                "epoch": epoch_num,
+                            })
+                            continue  # don't also emit the raw line
+                    # Detect epoch-done lines: "====> Epoch: N [timestamp] | (elapsed)"
+                    if "====> Epoch:" in stripped:
+                        import re as _re
+                        m = _re.search(r"====> Epoch:\s*(\d+)", stripped)
+                        if m:
+                            epoch_num = int(m.group(1))
+                            await job.queue.put({
+                                "type": "epoch_done",
+                                "message": f"Epoch {epoch_num} complete",
+                                "phase": "train",
+                                "epoch": epoch_num,
+                            })
+                            continue
                     await job.queue.put({
                         "type": "log",
                         "message": stripped,
@@ -241,81 +267,38 @@ def _write_config(rvc_root: str, exp_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FAISS index builder (runs in thread executor)
+# FAISS index builder — runs as an isolated subprocess to avoid segfault
 # ---------------------------------------------------------------------------
+# faiss + PyTorch/MPS in the same process causes a native segfault when
+# run_in_executor is used (faiss native code conflicts with MPS memory).
+# Solution: run the index build as a fully separate subprocess so faiss
+# never shares an address space with the uvicorn/PyTorch process.
+
+_INDEX_WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "_index_worker.py")
+
 
 def _build_index(rvc_root: str) -> str:
-    """Build FAISS IVF index from 3_feature768/ npy files.
-
-    Adapts train_index() from web.py. Runs synchronously in a thread
-    executor (run_in_executor) because it is CPU-bound numpy/faiss work.
+    """Build FAISS IVF index by spawning an isolated subprocess.
 
     Returns the path to the saved added_IVF*.index file.
+    Raises RuntimeError on failure.
     """
-    import faiss  # noqa: PLC0415 — lazy import; faiss is large
+    import subprocess as _sp
+    import sys as _sys
 
-    exp_name = "rvc_finetune_active"
-    exp_dir = os.path.join(rvc_root, "logs", exp_name)
-    feature_dir = os.path.join(exp_dir, "3_feature768")
-
-    if not os.path.isdir(feature_dir):
-        raise RuntimeError(f"Feature directory not found: {feature_dir}")
-
-    npy_files = sorted(f for f in os.listdir(feature_dir) if f.endswith(".npy"))
-    if not npy_files:
-        raise RuntimeError(f"No .npy files found in {feature_dir}")
-
-    npys = [np.load(os.path.join(feature_dir, fname)) for fname in npy_files]
-    big_npy = np.concatenate(npys, axis=0)
-
-    # Shuffle
-    idx = np.arange(big_npy.shape[0])
-    np.random.shuffle(idx)
-    big_npy = big_npy[idx]
-
-    # Skip kmeans reduction for typical short samples (shape[0] <= 2e5)
-    if big_npy.shape[0] > 2e5:
-        from sklearn.cluster import MiniBatchKMeans  # noqa: PLC0415
-        n_clusters = 10000
-        big_npy = (
-            MiniBatchKMeans(
-                n_clusters=n_clusters,
-                verbose=True,
-                batch_size=256 * multiprocessing.cpu_count(),
-                compute_labels=False,
-                init="random",
-            )
-            .fit(big_npy)
-            .cluster_centers_
-        )
-
-    np.save(os.path.join(exp_dir, "total_fea.npy"), big_npy)
-
-    n_ivf = min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39)
-    n_ivf = max(n_ivf, 1)  # safety floor
-
-    index = faiss.index_factory(768, f"IVF{n_ivf},Flat")
-    index_ivf = faiss.extract_index_ivf(index)
-    index_ivf.nprobe = 1
-    index.train(big_npy)
-
-    trained_path = os.path.join(
-        exp_dir,
-        f"trained_IVF{n_ivf}_Flat_nprobe_{index_ivf.nprobe}_{exp_name}_v2.index",
+    result = _sp.run(
+        [_sys.executable, _INDEX_WORKER_SCRIPT, rvc_root],
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
-    faiss.write_index(index, trained_path)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2000:].strip() or "index worker exited non-zero")
 
-    # Add all vectors and save the searchable index
-    batch_size_add = 8192
-    for i in range(0, big_npy.shape[0], batch_size_add):
-        index.add(big_npy[i : i + batch_size_add])
-
-    added_path = os.path.join(
-        exp_dir,
-        f"added_IVF{n_ivf}_Flat_nprobe_{index_ivf.nprobe}_{exp_name}_v2.index",
-    )
-    faiss.write_index(index, added_path)
-
+    # Worker prints the added index path as last stdout line
+    added_path = result.stdout.strip().splitlines()[-1].strip()
+    if not os.path.exists(added_path):
+        raise RuntimeError(f"Index worker claimed {added_path} but file not found")
     return added_path
 
 
@@ -342,6 +325,27 @@ async def _run_pipeline(
     start_ts = time.monotonic()
     exp_name = "rvc_finetune_active"
     exp_dir = os.path.join(rvc_root, "logs", exp_name)
+
+    # ------------------------------------------------------------------
+    # Clean stale training artifacts before each run so we always start
+    # fresh (no accumulated checkpoints, tfevents, or stale logs).
+    # Preserve the feature extraction outputs (0_gt_wavs, 1_16k_wavs,
+    # 2a_f0, 2b-f0nsf, 3_feature768) so re-runs skip those phases fast
+    # when the audio hasn't changed.  Everything else is regenerated.
+    # ------------------------------------------------------------------
+    _KEEP_DIRS = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
+    if os.path.isdir(exp_dir):
+        for entry in os.listdir(exp_dir):
+            if entry in _KEEP_DIRS:
+                continue
+            full = os.path.join(exp_dir, entry)
+            try:
+                if os.path.isdir(full):
+                    shutil.rmtree(full, ignore_errors=True)
+                else:
+                    os.remove(full)
+            except OSError:
+                pass
     os.makedirs(exp_dir, exist_ok=True)
 
     n_cpu = multiprocessing.cpu_count()
@@ -519,6 +523,13 @@ async def _run_pipeline(
             err_msg += f"\n{stderr_tail}"
         await _fail("train", err_msg)
         return
+    else:
+        # Drain stderr even on success to prevent pipe buffer deadlock
+        if train_proc.stderr:
+            try:
+                await asyncio.wait_for(train_proc.stderr.read(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
 
     # ------------------------------------------------------------------
     # Phase 4: FAISS index (CPU-bound, run in thread executor)
@@ -529,8 +540,8 @@ async def _run_pipeline(
     try:
         added_index_path = await loop.run_in_executor(None, _build_index, rvc_root)
         await job.queue.put({
-            "type": "log",
-            "message": f"FAISS index saved: {added_index_path}",
+            "type": "index_done",
+            "message": f"FAISS index built: {os.path.basename(added_index_path)}",
             "phase": "index",
         })
     except Exception as exc:
@@ -617,7 +628,8 @@ class TrainingManager:
     def cancel_job(self, profile_id: str) -> None:
         """Cancel the training job for profile_id.
 
-        Kills the process group (covers train.py + its mp.Process children).
+        Kills only the subprocess (NOT the process group — killpg would kill
+        uvicorn since train.py inherits our process group on macOS).
         Sets job status to "cancelled" and updates DB to "failed".
         Silently no-ops if no job exists for profile_id.
         """
@@ -627,9 +639,21 @@ class TrainingManager:
 
         if job._proc is not None:
             try:
-                os.killpg(os.getpgid(job._proc.pid), signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                # Process may have already exited — not an error
+                # Kill only the direct subprocess and its children via psutil,
+                # NOT os.killpg which would kill uvicorn's process group too.
+                import psutil
+                try:
+                    parent = psutil.Process(job._proc.pid)
+                    for child in parent.children(recursive=True):
+                        try:
+                            child.kill()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    parent.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            except ImportError:
+                # psutil not available — fall back to direct kill (no killpg)
                 try:
                     job._proc.kill()
                 except (ProcessLookupError, OSError):

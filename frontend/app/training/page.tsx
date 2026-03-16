@@ -20,10 +20,11 @@ interface Profile {
 }
 
 interface TrainingMsg {
-  type: 'log' | 'phase' | 'done' | 'error' | 'keepalive';
+  type: 'log' | 'phase' | 'done' | 'error' | 'keepalive' | 'epoch' | 'epoch_done' | 'index_done';
   message?: string;
   phase?: string;
   elapsed_s?: number;
+  epoch?: number;
 }
 
 type JobState = 'idle' | 'running' | 'done' | 'failed';
@@ -47,18 +48,22 @@ const PHASE_LABELS: Record<string, string> = {
 // Phase Progress Bar
 // ---------------------------------------------------------------------------
 
-function PhaseBar({ currentPhase }: { currentPhase: string | null }) {
+function PhaseBar({ currentPhase, jobDone }: { currentPhase: string | null; jobDone: boolean }) {
   if (currentPhase === null) return null;
 
-  const currentIdx = PHASES.indexOf(currentPhase as (typeof PHASES)[number]);
+  const activePhase = jobDone ? 'done' : currentPhase;
+  const currentIdx = PHASES.indexOf(activePhase as (typeof PHASES)[number]);
 
   return (
     <div className="flex gap-1.5 items-center">
       {PHASES.map((phase, idx) => {
         let pillClass: string;
-        if (phase === currentPhase) {
-          pillClass =
-            'bg-cyan-600 text-white shadow-[0_0_8px_rgba(8,145,178,0.5)]';
+        if (phase === activePhase && phase === 'done') {
+          // Done — green
+          pillClass = 'bg-emerald-700 text-emerald-100 shadow-[0_0_8px_rgba(16,185,129,0.4)]';
+        } else if (phase === activePhase) {
+          // Active non-done phase — cyan
+          pillClass = 'bg-cyan-600 text-white shadow-[0_0_8px_rgba(8,145,178,0.5)]';
         } else if (idx < (currentIdx === -1 ? 0 : currentIdx)) {
           pillClass = 'bg-zinc-700 text-zinc-400';
         } else {
@@ -215,20 +220,29 @@ export default function TrainingPage() {
         try {
           const msg = JSON.parse(event.data as string) as TrainingMsg;
 
-          // Always update phase if present in message
-          if (msg.phase) {
+          // Always update phase bar if message carries a phase
+          if (msg.phase && msg.type !== 'done') {
             setCurrentPhase(msg.phase);
           }
 
           if (msg.type === 'log') {
-            if (msg.message) {
-              appendLog(msg.message);
-            }
+            if (msg.message) appendLog(msg.message);
+
           } else if (msg.type === 'phase') {
-            // Phase-only message — already handled above
-            if (msg.message) {
-              appendLog(`[${msg.phase ?? ''}] ${msg.message}`);
-            }
+            if (msg.message) appendLog(`[${msg.phase ?? ''}] ${msg.message}`);
+
+          } else if (msg.type === 'epoch') {
+            // New epoch started — show as prominent log entry
+            if (msg.message) appendLog(`▶ ${msg.message}`);
+
+          } else if (msg.type === 'epoch_done') {
+            // Epoch completed
+            if (msg.message) appendLog(`✓ ${msg.message}`);
+
+          } else if (msg.type === 'index_done') {
+            // FAISS index built — transition phase bar to done
+            if (msg.message) appendLog(`✓ ${msg.message}`);
+
           } else if (msg.type === 'keepalive') {
             // Replace the last keepalive line rather than appending a new one
             if (msg.message) {
@@ -240,12 +254,14 @@ export default function TrainingPage() {
                 return [...prev, msg.message!];
               });
             }
+
           } else if (msg.type === 'done') {
             setCurrentPhase('done');
             setJobState('done');
             jobStateRef.current = 'done';
-            if (msg.message) appendLog(msg.message);
+            if (msg.message) appendLog(`✓ ${msg.message}`);
             closeWs();
+
           } else if (msg.type === 'error') {
             setJobState('failed');
             jobStateRef.current = 'failed';
@@ -451,7 +467,7 @@ export default function TrainingPage() {
                            hover:bg-cyan-800/40 hover:border-cyan-500/60
                            disabled:opacity-30 disabled:cursor-not-allowed"
               >
-                ▶ Start Training
+                {jobState === 'done' ? '↺ Train Again' : '▶ Start Training'}
               </button>
 
               {isRunning && (
@@ -475,7 +491,7 @@ export default function TrainingPage() {
             <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500 mb-3">
               Progress
             </h2>
-            <PhaseBar currentPhase={currentPhase} />
+            <PhaseBar currentPhase={currentPhase} jobDone={jobState === 'done'} />
           </section>
         )}
 
