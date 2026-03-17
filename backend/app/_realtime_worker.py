@@ -30,10 +30,19 @@ Usage:
 
 import base64
 import json
+import logging
 import multiprocessing
 import os
 import sys
 import uuid
+
+# Silence numba DEBUG flood before any library imports it.
+# Numba JIT compiles on first call; the compilation trace goes to the 'numba'
+# logger. Without this the worker log is dominated by SSA/byteflow debug noise.
+logging.basicConfig(level=logging.WARNING)
+for _noisy in ("numba", "numba.core", "numba.core.ssa", "numba.core.byteflow",
+               "numba.core.interpreter", "numba.typed"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 import numpy as np
 import scipy.signal
