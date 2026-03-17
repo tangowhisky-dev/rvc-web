@@ -111,6 +111,9 @@ class RealtimeSession:
     # Stop signal for WebSocket handler
     _stop_event: threading.Event = field(default_factory=lambda: threading.Event(), repr=False)
 
+    # Background evt-drain thread
+    _drain_thread: Any = field(default=None, repr=False)
+
 
 # ---------------------------------------------------------------------------
 # RealtimeManager
@@ -244,7 +247,6 @@ class RealtimeManager:
         self._sessions[session_id] = session
 
         # Background task: drain waveform events from the queue into the deque
-        import threading  # noqa: PLC0415
         t = threading.Thread(
             target=self._drain_events,
             args=(session,),
@@ -252,6 +254,7 @@ class RealtimeManager:
             name=f"evt-drain-{session_id[:8]}",
         )
         t.start()
+        session._drain_thread = t
 
         print(json.dumps({
             "event": "session_start",
