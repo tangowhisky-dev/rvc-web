@@ -17,6 +17,8 @@ Protocol (multiprocessing.Queue messages):
     {"event": "waveform_in",     "samples": <b64 float32>, "sr": 48000}
     {"event": "waveform_out",    "samples": <b64 float32>, "sr": 48000}
     {"event": "waveform_overflow", "detail": str}
+    {"event": "save_complete",   "path": str, "duration_s": float}
+    {"event": "save_error",      "error": str}
 
 Device selection:
   - Prefers MPS (Metal Performance Shaders) on Apple Silicon for inference
@@ -33,7 +35,9 @@ import json
 import logging
 import multiprocessing
 import os
+import queue
 import sys
+import threading
 import uuid
 
 # Silence numba DEBUG flood before any library imports it.
@@ -81,6 +85,60 @@ def _compute_block_params(block_48k: int = _BLOCK_48K) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# MP3 save thread — drains audio_q and writes to mp3 on stop
+# ---------------------------------------------------------------------------
+
+_SAVE_SENTINEL = None  # signals the save thread to flush and exit
+
+
+def _save_thread(audio_q: queue.Queue, save_path: str, sr: int, evt_q: multiprocessing.Queue) -> None:
+    """Background thread: accumulate PCM blocks from audio_q, encode to MP3 on sentinel."""
+    chunks = []
+    total_samples = 0
+
+    # Expand ~ in save_path (may happen if the browser fallback sends ~/... paths)
+    save_path = os.path.expanduser(save_path)
+
+    try:
+        while True:
+            block = audio_q.get()
+            if block is _SAVE_SENTINEL:
+                break
+            chunks.append(block)
+            total_samples += len(block)
+
+        if not chunks:
+            evt_q.put({"event": "save_error", "error": "no audio captured"})
+            return
+
+        # Concatenate, normalise to int16, encode via pydub
+        pcm = np.concatenate(chunks).astype(np.float32)
+        # Normalise to [-1, 1] if clipping
+        peak = np.abs(pcm).max()
+        if peak > 1.0:
+            pcm /= peak
+
+        from pydub import AudioSegment  # noqa: PLC0415
+        seg = AudioSegment(
+            pcm.tobytes(),
+            frame_rate=sr,
+            sample_width=4,   # float32 = 4 bytes
+            channels=1,
+        )
+        # Ensure parent directory exists (os.path.dirname returns '' for bare filenames,
+        # so guard against that before calling makedirs).
+        parent_dir = os.path.dirname(os.path.abspath(save_path))
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        seg.export(save_path, format="mp3", bitrate="128k")
+        duration_s = total_samples / sr
+        evt_q.put({"event": "save_complete", "path": save_path, "duration_s": round(duration_s, 2)})
+
+    except Exception as exc:
+        evt_q.put({"event": "save_error", "error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
 # Worker entry point
 # ---------------------------------------------------------------------------
 
@@ -94,6 +152,7 @@ def run_worker(
     pitch: float,
     index_rate: float,
     protect: float,
+    save_path: str | None = None,
 ) -> None:
     """Run in isolated child process. Owns all native code (fairseq, sounddevice, MPS)."""
 
@@ -112,6 +171,20 @@ def run_worker(
         sys.path.insert(0, rvc_root)
 
     session_id = uuid.uuid4().hex
+
+    # If save_path requested, start the save thread immediately so it's ready
+    # before the audio loop. Uses an in-process queue (thread-safe, not mp.Queue).
+    audio_save_q: queue.Queue | None = None
+    save_t: threading.Thread | None = None
+    if save_path:
+        audio_save_q = queue.Queue(maxsize=0)  # unbounded — save thread drains async
+        save_t = threading.Thread(
+            target=_save_thread,
+            args=(audio_save_q, save_path, _SR_48K, evt_q),
+            daemon=True,
+            name="mp3-save",
+        )
+        save_t.start()
 
     try:
         # Import torch first, then faiss with nthreads=1, before fairseq.
@@ -251,6 +324,13 @@ def run_worker(
             except Exception:
                 pass
 
+            # Enqueue block for MP3 save (non-blocking — save thread drains independently)
+            if audio_save_q is not None:
+                try:
+                    audio_save_q.put_nowait(out_48k.copy())
+                except queue.Full:
+                    pass  # drop block if save queue is somehow full
+
             # Waveform snapshots (~800 pts)
             evt_q.put({
                 "event": "waveform_in",
@@ -265,17 +345,27 @@ def run_worker(
 
     except Exception as exc:
         evt_q.put({"event": "error", "error": str(exc)})
-        return
 
     finally:
-        # Clean up streams
+        # Signal save thread to flush and encode — happens after audio loop exits
+        if audio_save_q is not None:
+            evt_q.put({"event": "debug", "message": f"Sending sentinel to save queue, items waiting: {audio_save_q.qsize()}"})
+            audio_save_q.put(_SAVE_SENTINEL)
+            if save_t is not None:
+                evt_q.put({"event": "debug", "message": f"Waiting for save thread to finish..."})
+                save_t.join(timeout=30)  # up to 30s for pydub/ffmpeg to encode
+                evt_q.put({"event": "debug", "message": f"Save thread finished"})
+
+        # Clean up streams — guard against NameError if streams were never assigned
+        # (exception during model loading, before sd.InputStream was created).
         try:
-            stream_in.stop(); stream_in.close()
+            stream_in.stop(); stream_in.close()  # noqa: F821
         except Exception:
             pass
         try:
-            stream_out.stop(); stream_out.close()
+            stream_out.stop(); stream_out.close()  # noqa: F821
         except Exception:
             pass
 
     evt_q.put({"event": "stopped"})
+

@@ -138,6 +138,7 @@ class RealtimeManager:
         index_rate: float = 0.75,
         protect: float = 0.33,
         rvc_root: Optional[str] = None,
+        save_path: Optional[str] = None,
     ) -> RealtimeSession:
         """Spawn isolated worker process and return a RealtimeSession.
 
@@ -187,6 +188,7 @@ class RealtimeManager:
                 pitch=pitch,
                 index_rate=index_rate,
                 protect=protect,
+                save_path=save_path,
             ),
             daemon=True,
         )
@@ -267,11 +269,24 @@ class RealtimeManager:
         return session
 
     def _drain_events(self, session: RealtimeSession) -> None:
-        """Background thread: read events from evt_q and push waveforms into deque."""
-        while session.status == "active":
+        """Background thread: read events from evt_q and push waveforms into deque.
+
+        Runs until the worker emits a 'stopped' event (which only fires after the
+        save thread has finished encoding). Does NOT exit early when session.status
+        changes to 'stopped' — that would drop save_complete/save_error events that
+        arrive after the stop command is sent but before the worker finalises.
+        """
+        while True:
+            # Use a short timeout so we can detect if the worker process has died
+            # without sending a 'stopped' event (crash / SIGKILL).
             try:
                 msg = session._evt_q.get(timeout=0.5)
             except Exception:
+                # Empty queue — check if the worker process is still alive.
+                # If the process is gone and the session is not active, we're done.
+                if session._proc is not None and not session._proc.is_alive():
+                    if session.status != "active":
+                        break
                 continue
 
             event = msg.get("event", "")
@@ -281,53 +296,56 @@ class RealtimeManager:
                     "samples": msg["samples"],
                     "sr": msg["sr"],
                 })
+            elif event in ("save_complete", "save_error"):
+                # Forward to frontend so UI can show save status
+                session._waveform_deque.append({
+                    "type": event,
+                    **{k: v for k, v in msg.items() if k != "event"},
+                })
             elif event == "error":
                 session.status = "error"
                 session.error = msg.get("error", "unknown")
                 session._waveform_deque.append(None)
                 break
-            elif event in ("stopped", "waveform_overflow"):
-                if event == "stopped":
-                    break
+            elif event == "stopped":
+                # Worker's finally block is complete — safe to exit drain loop
+                break
+            # waveform_overflow and debug events are silently dropped
 
-        # Push sentinel so WS handler exits
+        # Push sentinel so WS handler exits cleanly
         session._waveform_deque.append(None)
 
     def stop_session(self, session_id: str) -> None:
-        """Send stop command to the worker and wait for it to exit."""
+        """Send stop command to the worker and return immediately.
+
+        The audio loop (in the worker subprocess) will exit cleanly, wait for the
+        save thread to finish encoding, then emit 'stopped'. The drain thread picks
+        up that event, appends None to the deque, and exits. The WS handler drains
+        the deque until it sees None and then sends 'done' to the browser.
+
+        This function does NOT wait for the worker to finish — the HTTP response
+        returns promptly and the drain chain completes in the background.
+        """
         session = self._sessions.get(session_id)
         if session is None:
             return
 
         session.status = "stopped"
 
-        # Signal WebSocket handler to exit
-        session._stop_event.set()
-
-        # Send stop command
+        # Send stop command to the worker's audio loop
         try:
             session._cmd_q.put({"cmd": "stop"})
         except Exception:
             pass
 
-        # Give the worker 3s to stop cleanly, then kill
-        if session._proc is not None:
-            session._proc.join(timeout=3.0)
-            if session._proc.is_alive():
-                session._proc.terminate()
-                session._proc.join(timeout=1.0)
-
-        # Wait for drain thread to finish
-        if session._drain_thread is not None:
-            session._drain_thread.join(timeout=1.0)
+        # Remove from sessions dict immediately so active_session() returns None.
+        # The drain thread, WS handler, and stop_event lifecycle continues independently.
+        self._sessions.pop(session_id, None)
 
         print(json.dumps({
             "event": "session_stop",
             "session_id": session_id,
         }), flush=True)
-
-        # Clean up from sessions dict
-        self._sessions.pop(session_id, None)
 
     def get_session(self, session_id: str) -> Optional[RealtimeSession]:
         return self._sessions.get(session_id)

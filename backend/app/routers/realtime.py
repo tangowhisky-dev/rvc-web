@@ -43,6 +43,7 @@ class StartSessionRequest(BaseModel):
     pitch: float = 0.0
     index_rate: float = 0.75
     protect: float = 0.33
+    save_path: Optional[str] = None
 
 
 class StopSessionRequest(BaseModel):
@@ -125,6 +126,7 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
             index_rate=request.index_rate,
             protect=request.protect,
             rvc_root=rvc_root,
+            save_path=request.save_path,
         )
         # start_session is async on the real manager; MagicMock returns sync in tests
         session = await result if asyncio.iscoroutine(result) else result
@@ -319,3 +321,15 @@ async def realtime_websocket(websocket: WebSocket, session_id: str) -> None:
                 "session_id": session_id,
             })
         )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/realtime/default-save-dir
+# ---------------------------------------------------------------------------
+
+@router.get("/default-save-dir")
+async def default_save_dir() -> dict:
+    """Return the user's Downloads directory as the default save location."""
+    import pathlib  # noqa: PLC0415
+    downloads = pathlib.Path.home() / "Downloads"
+    return {"path": str(downloads)}

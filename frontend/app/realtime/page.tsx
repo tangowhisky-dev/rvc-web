@@ -147,15 +147,44 @@ export default function RealtimePage() {
 
   // Session
   const [sessionState, setSessionState] = useState<SessionState>('idle');
+
+  // Save audio
+  const [saveEnabled, setSaveEnabled] = useState(false);
+  const [savePath, setSavePath] = useState('');
+  const [saveStatus, setSaveStatus] = useState<string | null>(null); // e.g. "Saved: /path/file.mp3"
+
+  // Resolve default save path on mount
+  useEffect(() => {
+    // Ask backend for the user's Downloads directory as default
+    fetch(`${API}/api/realtime/default-save-dir`)
+      .then((r) => r.json())
+      .then((d) => setSavePath(d.path + '/rvc_output.mp3'))
+      .catch(() => setSavePath('~/Downloads/rvc_output.mp3'));
+  }, []);
+
+  // The backend default-save-dir endpoint returns a full absolute path, so savePath
+  // is always absolute in the normal flow. expandedSavePath is only needed if the user
+  // manually types ~/... (error-fallback case). Keep it as the text-field display value.
+  const expandedSavePath = savePath;
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
 
   // Params
   const [params, setParams] = useState<SessionParams>(DEFAULT_PARAMS);
 
+  // Canvas key — incremented on each session start to force fresh DOM canvas elements.
+  // Once transferControlToOffscreen() is called, the canvas cannot be re-transferred.
+  // Incrementing this key causes React to unmount + remount the canvas elements,
+  // giving us brand-new nodes that have never been transferred.
+  const [canvasKey, setCanvasKey] = useState(0);
+
   // Canvas refs — NOT transferred (we draw on them directly via the worker messaging)
   const canvasInRef = useRef<HTMLCanvasElement | null>(null);
   const canvasOutRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Track whether the canvas has been transferred to an OffscreenCanvas.
+  // After transfer, we must NOT call transferControlToOffscreen again on the same node.
+  const canvasTransferredRef = useRef(false);
 
   // Refs for cleanup
   const workerRef = useRef<Worker | null>(null);
@@ -249,6 +278,9 @@ export default function RealtimePage() {
       workerRef.current.terminate();
       workerRef.current = null;
     }
+    // Reset canvas-transferred flag so the next session can re-transfer fresh canvas nodes.
+    // The actual canvas remount is triggered by bumping canvasKey in handleStart.
+    canvasTransferredRef.current = false;
   }, []);
 
   // ---------------------------------------------------------------------------
@@ -342,8 +374,18 @@ export default function RealtimePage() {
 
     setSessionState('starting');
     setSessionError(null);
+    setSaveStatus(null);
+
+    // Bump canvas key BEFORE the async work so React remounts the canvas elements.
+    // This gives us fresh DOM nodes that haven't had transferControlToOffscreen called yet.
+    setCanvasKey((k) => k + 1);
 
     try {
+      // savePath is loaded from the backend (full absolute path via /api/realtime/default-save-dir).
+      // In the normal flow it's already absolute. Pass it as-is — the Python backend will handle
+      // any remaining ~ via os.path.expanduser if the user typed it manually.
+      const resolvedSavePath = savePath;
+
       // POST /api/realtime/start
       const startRes = await fetch(`${API}/api/realtime/start`, {
         method: 'POST',
@@ -353,6 +395,7 @@ export default function RealtimePage() {
           input_device_id: inputDeviceId,
           output_device_id: outputDeviceId,
           ...params,
+          ...(saveEnabled && resolvedSavePath ? { save_path: resolvedSavePath } : {}),
         }),
       });
 
@@ -366,24 +409,23 @@ export default function RealtimePage() {
       sessionIdRef.current = session_id;
       // Don't set to 'active' yet — let polling detect it
 
-
       // ---------------------------------------------------------------------------
       // Launch Web Worker
       // ---------------------------------------------------------------------------
       const worker = new Worker('/waveform-worker.js');
       workerRef.current = worker;
 
-      // Send canvas refs to worker for drawing (non-OffscreenCanvas path as fallback)
-      // The worker draws by receiving waveform data messages directly.
-      // We keep canvas refs on main thread and draw from worker messages via postMessage.
-      // Note: OffscreenCanvas transfer is attempted; if not supported, worker uses
-      // ImageBitmap messages (handled in worker).
+      // Wait one microtask tick so React can flush the canvasKey state update
+      // and the refs point to the newly-mounted canvas DOM nodes.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
       const canvasIn = canvasInRef.current;
       const canvasOut = canvasOutRef.current;
 
-      if (canvasIn && canvasOut) {
+      if (canvasIn && canvasOut && !canvasTransferredRef.current) {
         try {
-          // Attempt OffscreenCanvas transfer
+          // Attempt OffscreenCanvas transfer. Guard with canvasTransferredRef so we
+          // never call transferControlToOffscreen twice on the same node (InvalidStateError).
           const offscreenIn = (canvasIn as HTMLCanvasElement & {
             transferControlToOffscreen: () => OffscreenCanvas;
           }).transferControlToOffscreen();
@@ -391,11 +433,14 @@ export default function RealtimePage() {
             transferControlToOffscreen: () => OffscreenCanvas;
           }).transferControlToOffscreen();
 
+          canvasTransferredRef.current = true;
+
           worker.postMessage(
             { type: 'init', canvases: [offscreenIn, offscreenOut] },
             [offscreenIn as unknown as Transferable, offscreenOut as unknown as Transferable]
           );
-        } catch (_) {
+        } catch (err) {
+          console.warn('[realtime] OffscreenCanvas transfer failed, using fallback:', err);
           // OffscreenCanvas not supported in this context — send dimensions only
           worker.postMessage({
             type: 'init_fallback',
@@ -423,6 +468,10 @@ export default function RealtimePage() {
             setSessionId(null);
             sessionIdRef.current = null;
             cleanup();
+          } else if (msg.type === 'save_complete') {
+            setSaveStatus(`✓ Saved: ${msg.path} (${msg.duration_s}s)`);
+          } else if (msg.type === 'save_error') {
+            setSaveStatus(`✗ Save failed: ${msg.error}`);
           }
         } catch (_) {
           // Malformed message — ignore
@@ -448,7 +497,7 @@ export default function RealtimePage() {
       setSessionState('idle');
       cleanup();
     }
-  }, [inputDeviceId, outputDeviceId, profileId, params, cleanup]);
+  }, [inputDeviceId, outputDeviceId, profileId, params, saveEnabled, savePath, cleanup]);
 
   // ---------------------------------------------------------------------------
   // Stop session
@@ -470,10 +519,20 @@ export default function RealtimePage() {
       // Best-effort — cleanup regardless
     }
 
-    cleanup();
-    setSessionState('idle');
-    setSessionId(null);
-    sessionIdRef.current = null;
+    // Do NOT close the WS or terminate the worker here.
+    // The backend worker will finish (including the save thread), the drain thread
+    // will push None into the deque, and the WS will receive 'done' — which triggers
+    // cleanup + idle transition in the ws.onmessage handler.
+    //
+    // If the WS is already closed or the backend is unreachable, fall back to force-cleanup.
+    const ws = wsRef.current;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      cleanup();
+      setSessionState('idle');
+      setSessionId(null);
+      sessionIdRef.current = null;
+    }
+    // Otherwise: let ws.onmessage({ type: 'done' }) do the cleanup.
   }, [cleanup]);
 
   // ---------------------------------------------------------------------------
@@ -648,7 +707,9 @@ export default function RealtimePage() {
           <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500 mb-4">
             Waveform Monitor
           </h2>
-          <div className="flex flex-col gap-3">
+          {/* canvasKey forces React to unmount+remount canvas elements on each session start,
+              ensuring transferControlToOffscreen can be called on fresh DOM nodes. */}
+          <div key={canvasKey} className="flex flex-col gap-3">
             <WaveformCanvas
               label="Input — Mic"
               color="#3b82f6"
@@ -659,6 +720,48 @@ export default function RealtimePage() {
               color="#10b981"
               canvasRef={canvasOutRef}
             />
+
+            {/* Save Audio */}
+            <div className="flex flex-col gap-3 pt-3 border-t border-zinc-800">
+              <label className={`flex items-center gap-2 cursor-pointer select-none ${isBusy || isActive ? 'opacity-40 cursor-not-allowed' : ''}`}>
+                <input
+                  type="checkbox"
+                  checked={saveEnabled}
+                  disabled={isBusy || isActive}
+                  onChange={(e) => setSaveEnabled(e.target.checked)}
+                  className="w-4 h-4 rounded border border-zinc-600 bg-zinc-900
+                             accent-cyan-400 cursor-pointer disabled:cursor-not-allowed"
+                />
+                <span className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+                  Save Audio
+                </span>
+              </label>
+
+              {saveEnabled && (
+                <div className="flex flex-col gap-1">
+                  <input
+                    type="text"
+                    value={expandedSavePath}
+                    disabled={isBusy || isActive}
+                    onChange={(e) => setSavePath(e.target.value)}
+                    placeholder="/Users/tango16/Downloads/rvc_output.mp3"
+                    className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-1.5
+                               text-[12px] font-mono text-zinc-200 focus:outline-none
+                               focus:border-cyan-600 disabled:opacity-40 disabled:cursor-not-allowed
+                               hover:border-zinc-600 transition-colors"
+                  />
+                  <p className="text-[10px] font-mono text-zinc-600">
+                    Full absolute path — audio is written by the backend process
+                  </p>
+                </div>
+              )}
+
+              {saveStatus && (
+                <p className={`text-[11px] font-mono ${saveStatus.startsWith('✓') ? 'text-emerald-400' : 'text-red-400'}`}>
+                  {saveStatus}
+                </p>
+              )}
+            </div>
           </div>
         </section>
 
