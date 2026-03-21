@@ -234,6 +234,11 @@ export default function LibraryPage() {
                   <span className="text-[11px] font-mono text-zinc-600 truncate">
                     {profile.id}
                   </span>
+                  {profile.sample_path && (
+                    <span className="text-[11px] font-mono text-zinc-500 truncate" title={profile.sample_path}>
+                      📁 {profile.sample_path}
+                    </span>
+                  )}
                 </div>
 
                 <button
