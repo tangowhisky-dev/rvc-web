@@ -30,6 +30,15 @@ interface TrainingMsg {
 type JobState = 'idle' | 'running' | 'done' | 'failed';
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Returns HH:MM:SS timestamp in local time */
+function nowStamp(): string {
+  return new Date().toLocaleTimeString('en-GB', { hour12: false });
+}
+
+// ---------------------------------------------------------------------------
 // Phase definitions
 // ---------------------------------------------------------------------------
 
@@ -170,9 +179,11 @@ export default function TrainingPage() {
   // Helpers
   // ---------------------------------------------------------------------------
 
-  function appendLog(line: string) {
+  function appendLog(line: string, ts?: string) {
+    const stamp = ts ?? nowStamp();
+    const stamped = `[${stamp}] ${line}`;
     setLogLines((prev) => {
-      const next = [...prev, line];
+      const next = [...prev, stamped];
       return next.length > 500 ? next.slice(next.length - 500) : next;
     });
   }
@@ -229,7 +240,7 @@ export default function TrainingPage() {
             if (msg.message) appendLog(msg.message);
 
           } else if (msg.type === 'phase') {
-            if (msg.message) appendLog(`[${msg.phase ?? ''}] ${msg.message}`);
+            if (msg.message) appendLog(`── ${msg.phase?.toUpperCase() ?? ''}: ${msg.message}`);
 
           } else if (msg.type === 'epoch') {
             // New epoch started — show as prominent log entry
@@ -244,14 +255,16 @@ export default function TrainingPage() {
             if (msg.message) appendLog(`✓ ${msg.message}`);
 
           } else if (msg.type === 'keepalive') {
-            // Replace the last keepalive line rather than appending a new one
+            // Replace the last keepalive line (identified by prefix after timestamp)
             if (msg.message) {
+              const stamp = nowStamp();
+              const stamped = `[${stamp}] ${msg.message}`;
               setLogLines((prev) => {
                 const last = prev[prev.length - 1] ?? '';
-                if (last.startsWith('Training in progress…')) {
-                  return [...prev.slice(0, -1), msg.message!];
+                if (last.includes('Training in progress…')) {
+                  return [...prev.slice(0, -1), stamped];
                 }
-                return [...prev, msg.message!];
+                return [...prev, stamped];
               });
             }
 
@@ -517,20 +530,39 @@ export default function TrainingPage() {
                 {isRunning ? 'Waiting for log output…' : 'No training output yet. Start a job to see logs.'}
               </div>
             ) : (
-              logLines.map((line, i) => (
-                <div
-                  key={i}
-                  className={`leading-relaxed whitespace-pre-wrap break-all ${
-                    line.startsWith('ERROR:')
-                      ? 'text-red-400'
-                      : line.startsWith('(')
-                      ? 'text-zinc-500 italic'
-                      : 'text-zinc-300'
-                  }`}
-                >
-                  {line}
-                </div>
-              ))
+              logLines.map((line, i) => {
+                // Split "[HH:MM:SS] rest of message" for distinct timestamp styling
+                const tsMatch = line.match(/^(\[\d{2}:\d{2}:\d{2}\]) ([\s\S]*)$/);
+                const ts = tsMatch ? tsMatch[1] : null;
+                const content = tsMatch ? tsMatch[2] : line;
+
+                const isError = content.startsWith('ERROR:') || content.startsWith('[stderr]');
+                const isMuted = content.startsWith('(');
+                const isPhase = content.startsWith('──');
+                const isEpoch = content.startsWith('▶') || content.startsWith('✓');
+
+                return (
+                  <div
+                    key={i}
+                    className={`leading-relaxed whitespace-pre-wrap break-all flex gap-2 ${
+                      isError
+                        ? 'text-red-400'
+                        : isMuted
+                        ? 'text-zinc-500 italic'
+                        : isPhase
+                        ? 'text-cyan-400 font-medium'
+                        : isEpoch
+                        ? 'text-emerald-400'
+                        : 'text-zinc-300'
+                    }`}
+                  >
+                    {ts && (
+                      <span className="shrink-0 text-zinc-600 select-none">{ts}</span>
+                    )}
+                    <span>{content}</span>
+                  </div>
+                );
+              })
             )}
           </div>
         </section>

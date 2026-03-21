@@ -348,6 +348,29 @@ async def _run_pipeline(
                 pass
     os.makedirs(exp_dir, exist_ok=True)
 
+    # Delete stale .spec.pt cache files inside 0_gt_wavs.
+    # These are auto-generated from .wav files by the DataLoader, but if the audio
+    # was re-preprocessed (different length segments), old .spec.pt files cause a
+    # spec/wav length mismatch that makes `ids_str_max` go negative inside
+    # rand_slice_segments_on_last_dim, wrapping around as a long and producing a
+    # zero-size tensor — crashing the training loop immediately with RuntimeError.
+    gt_wavs_dir = os.path.join(exp_dir, "0_gt_wavs")
+    if os.path.isdir(gt_wavs_dir):
+        removed_specs = 0
+        for fname in os.listdir(gt_wavs_dir):
+            if fname.endswith(".spec.pt"):
+                try:
+                    os.remove(os.path.join(gt_wavs_dir, fname))
+                    removed_specs += 1
+                except OSError:
+                    pass
+        if removed_specs:
+            await job.queue.put({
+                "type": "log",
+                "message": f"Cleared {removed_specs} stale .spec.pt cache files from 0_gt_wavs",
+                "phase": "setup",
+            })
+
     n_cpu = multiprocessing.cpu_count()
     python = sys.executable
 
@@ -491,8 +514,8 @@ async def _run_pipeline(
 
     train_proc = await asyncio.create_subprocess_exec(
         *train_args,
-        stdout=asyncio_subprocess.DEVNULL,   # train.py has no stdout; logs go to train.log
-        stderr=asyncio_subprocess.PIPE,       # capture stderr so crashes surface in job error
+        stdout=asyncio_subprocess.PIPE,    # capture stdout — root logger writes here (basicConfig)
+        stderr=asyncio_subprocess.PIPE,    # capture stderr so crashes surface in job error
         env=train_env,
         cwd=rvc_root,
     )
@@ -500,36 +523,88 @@ async def _run_pipeline(
 
     log_path = os.path.join(exp_dir, "train.log")
 
-    # Tail the log file concurrently while train.py runs
+    # Tail train.log concurrently while train.py runs (belt + suspenders —
+    # in case the FileHandler works in some configurations)
     tail_task = asyncio.create_task(_tail_train_log(job, log_path))
+
+    # Stream stdout into job queue — the root logger's StreamHandler (basicConfig)
+    # writes all INFO/DEBUG lines here. This is the primary log source since the
+    # FileHandler's file handle is lost when the logger is pickled into mp.Process.
+    # Parse epoch markers to emit structured epoch/epoch_done events.
+    async def _drain_stdout() -> None:
+        if train_proc.stdout is None:
+            return
+        import re as _re
+        async for raw_line in train_proc.stdout:
+            line = raw_line.decode(errors="replace").rstrip()
+            if not line:
+                continue
+            # Filter out faiss loader debug spam
+            if line.startswith("DEBUG:faiss") or line.startswith("INFO:faiss"):
+                continue
+            # Detect epoch-start: "INFO:name:Train Epoch: N [N%]"
+            if "Train Epoch:" in line:
+                m = _re.search(r"Train Epoch:\s*(\d+)", line)
+                if m:
+                    epoch_num = int(m.group(1))
+                    await job.queue.put({
+                        "type": "epoch",
+                        "message": f"Epoch {epoch_num} started",
+                        "phase": "train",
+                        "epoch": epoch_num,
+                    })
+                    continue
+            # Detect epoch-done: "INFO:name:====> Epoch: N [timestamp] | (elapsed)"
+            if "====> Epoch:" in line:
+                m = _re.search(r"====> Epoch:\s*(\d+)", line)
+                if m:
+                    epoch_num = int(m.group(1))
+                    # Extract the timestamp/elapsed from the line for the message
+                    suffix = line.split(f"====> Epoch: {epoch_num}")[-1].strip()
+                    await job.queue.put({
+                        "type": "epoch_done",
+                        "message": f"Epoch {epoch_num} complete {suffix}",
+                        "phase": "train",
+                        "epoch": epoch_num,
+                    })
+                    continue
+            await job.queue.put({"type": "log", "message": line, "phase": "train"})
+
+    stdout_task = asyncio.create_task(_drain_stdout())
+
+    # Also stream stderr lines into the job queue so crash tracebacks are visible
+    # in the UI in real time (train.py child process errors go to stderr).
+    async def _drain_stderr() -> None:
+        if train_proc.stderr is None:
+            return
+        async for raw_line in train_proc.stderr:
+            line = raw_line.decode(errors="replace").rstrip()
+            if line:
+                await job.queue.put({"type": "log", "message": f"[stderr] {line}", "phase": "train"})
+
+    stderr_task = asyncio.create_task(_drain_stderr())
 
     await train_proc.wait()
     job._proc = None
 
-    # Cancel the tail task after the process exits (it may still have
-    # unread lines — give it a brief moment to drain before cancelling)
+    # Give the readers a moment to drain remaining lines
     await asyncio.sleep(0.5)
+
     tail_task.cancel()
-    try:
-        await tail_task
-    except asyncio.CancelledError:
-        pass
+    stdout_task.cancel()
+    stderr_task.cancel()
+    for task in (tail_task, stdout_task, stderr_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     if train_proc.returncode != 0:
-        stderr_bytes = await train_proc.stderr.read() if train_proc.stderr else b""
-        stderr_tail = stderr_bytes.decode(errors="replace")[-2000:].strip()
-        err_msg = f"Train phase failed (exit code {train_proc.returncode})"
-        if stderr_tail:
-            err_msg += f"\n{stderr_tail}"
+        # stderr already drained into job queue by _drain_stderr above
+        err_msg = f"Train phase failed (exit code {train_proc.returncode}) — see [stderr] lines above"
         await _fail("train", err_msg)
         return
-    else:
-        # Drain stderr even on success to prevent pipe buffer deadlock
-        if train_proc.stderr:
-            try:
-                await asyncio.wait_for(train_proc.stderr.read(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
+    # On success: stderr was already drained by the concurrent _drain_stderr task
 
     # ------------------------------------------------------------------
     # Phase 4: FAISS index (CPU-bound, run in thread executor)
