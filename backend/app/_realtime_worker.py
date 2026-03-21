@@ -60,27 +60,55 @@ import torch
 _SR_16K = 16000
 _SR_48K = 48000
 _WINDOW = 160
-_BLOCK_48K = 9600
+_BLOCK_48K = 9600          # 200ms output block at 48kHz
+_EXTRA_TIME = 2.0          # seconds of lookahead context (matches Vonovox/RVC-WebUI-MacOS)
+_ZC = _SR_48K // 100       # zero-crossing unit = 10ms at 48kHz = 480 samples
+_SOLA_BUF_48K = 4 * _ZC   # 40ms SOLA crossfade buffer (RVC-WebUI-MacOS default)
+_SOLA_SEARCH_48K = _ZC     # 10ms search window for best alignment offset
 
 
-def _compute_block_params(block_48k: int = _BLOCK_48K) -> dict:
+def _compute_block_params(block_48k: int = _BLOCK_48K, extra_time: float = _EXTRA_TIME) -> dict:
+    """Compute all buffer sizes needed by the audio loop.
+
+    The RVC model (HuBERT + RMVPE + net_g) needs substantial historical context
+    to produce good pitch and feature estimates. In practice 2s of lookahead
+    produces clearly intelligible output (Vonovox: "recommended 2.0 for best
+    quality/latency ratio"; RVC-WebUI-MacOS default extra_time=2.5s).
+
+    We satisfy the rtrvc.py constraint (total_16k must equal f0_extractor_frame)
+    by making total_16k = extra_16k + f0_extractor_frame and deriving skip_head
+    so the model discards the extra context internally — only the last
+    return_length_frames are used as output.
+    """
     block_16k = int(block_48k * _SR_16K / _SR_48K)
-    f0_extractor_frame = block_16k + 800
-    f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - _WINDOW
-    total_16k_samples = f0_extractor_frame
+
+    # Minimum valid buffer for rtrvc.py RMVPE frame constraint
+    f0_min = block_16k + 800
+    f0_extractor_frame = 5120 * ((f0_min - 1) // 5120 + 1) - _WINDOW
+
+    # Extra context rounded to WINDOW boundary so p_len stays integer
+    extra_16k = (int(extra_time * _SR_16K) // _WINDOW) * _WINDOW
+
+    total_16k_samples = extra_16k + f0_extractor_frame
     p_len = total_16k_samples // _WINDOW
+
     return_length_frames = block_16k // _WINDOW
     skip_head_frames = p_len - return_length_frames
+
     block_44k = int(block_48k * 44100 / _SR_48K)
+
     return {
         "block_48k": block_48k,
         "block_44k": block_44k,
         "block_16k": block_16k,
         "f0_extractor_frame": f0_extractor_frame,
         "total_16k_samples": total_16k_samples,
+        "extra_16k": extra_16k,
         "p_len": p_len,
         "return_length_frames": return_length_frames,
         "skip_head_frames": skip_head_frames,
+        "sola_buf_48k": _SOLA_BUF_48K,
+        "sola_search_48k": _SOLA_SEARCH_48K,
     }
 
 
@@ -291,38 +319,49 @@ def run_worker(
 
         evt_q.put({"event": "ready", "session_id": session_id, "device": infer_device})
 
-        # Audio loop
+        # Audio loop locals
         block_44k = block_params["block_44k"]
         block_48k = block_params["block_48k"]
         block_16k = block_params["block_16k"]
         total_16k_samples = block_params["total_16k_samples"]
         skip_head_frames = block_params["skip_head_frames"]
         return_length_frames = block_params["return_length_frames"]
+        sola_buf_48k = block_params["sola_buf_48k"]
+        sola_search_48k = block_params["sola_search_48k"]
         decim = max(1, block_48k // 800)
 
-        # Silence gate: RMS below this linear threshold → gate closes.
+        # Silence gate
         _silence_rms = 10 ** (silence_threshold_db / 20.0)
 
-        # Hold/release gate (inspired by Vonovox VAD 400ms release window).
-        # Prevents clipping on quiet consonants and word endings.
-        # At 200ms blocks: HOLD_BLOCKS=3 → 600ms hold, RELEASE_BLOCKS=2 → 400ms fade.
+        # Hold/release gate (Vonovox 400ms release window concept).
+        # At 200ms blocks: HOLD=3→600ms, RELEASE=2→400ms fade.
         _HOLD_BLOCKS = 3
         _RELEASE_BLOCKS = 2
-        _hold_count = 0     # blocks remaining in hold phase
-        _release_count = 0  # blocks remaining in release fade
-        _gate_gain = 0.0    # current gate gain [0.0 → 1.0]
+        _hold_count = 0
+        _release_count = 0
+        _gate_gain = 0.0
 
-        # Rolling context buffer on the inference device.
+        # Rolling 16k context buffer — holds extra_16k + f0_extractor_frame samples.
+        # This is the key fix: 2s of lookahead gives HuBERT and RMVPE enough
+        # historical context to produce intelligible output (was only 110ms before).
         rolling_buf = _torch.zeros(total_16k_samples, dtype=_torch.float32,
                                    device=infer_device)
 
+        # SOLA crossfade state (RVC-WebUI-MacOS algorithm).
+        # Eliminates clicks at block boundaries by finding the best alignment
+        # offset between the previous block's tail and the new block's head.
+        sola_buf = _torch.zeros(sola_buf_48k, dtype=_torch.float32, device=infer_device)
+        fade_in  = _torch.sin(0.5 * np.pi * _torch.linspace(0., 1., sola_buf_48k,
+                                                              device=infer_device)) ** 2
+        fade_out = 1.0 - fade_in
+        import torch.nn.functional as _F  # noqa: PLC0415
+
         while True:
-            # Check for stop command (non-blocking)
+            # Non-blocking command check
             try:
                 msg = cmd_q.get_nowait()
                 if isinstance(msg, dict) and msg.get("cmd") == "stop":
                     break
-                # Handle hot-update params
                 if isinstance(msg, dict) and msg.get("cmd") == "update_params":
                     if "pitch" in msg:
                         rvc.set_key(msg["pitch"])
@@ -333,51 +372,40 @@ def run_worker(
                     if "silence_threshold_db" in msg:
                         _silence_rms = 10 ** (msg["silence_threshold_db"] / 20.0)
             except Exception:
-                pass  # Empty queue — continue
+                pass
 
             try:
                 data, overflowed = stream_in.read(block_44k)
             except Exception as e:
                 evt_q.put({"event": "waveform_overflow", "detail": str(e)})
                 continue
-
             if overflowed:
                 evt_q.put({"event": "waveform_overflow", "detail": "overflow"})
 
-            # Keep raw 44k numpy for waveform snapshot
-            x_44k = data.squeeze()  # np.float32 [block_44k]
-
-            # Resample 44100→16000 on-device with torchaudio (avoids scipy CPU round-trip)
+            x_44k = data.squeeze()
             x_44k_t = _torch.from_numpy(x_44k).to(infer_device)
-            x_16k_t = _resample_44_16(x_44k_t.unsqueeze(0)).squeeze(0)  # [block_16k]
+            x_16k_t = _resample_44_16(x_44k_t.unsqueeze(0)).squeeze(0)
 
-            # Slide rolling buffer in-place: shift left by block_16k samples.
-            # Use roll+zero rather than clone to avoid a temporary allocation.
+            # Slide rolling buffer: shift left, append new block at end
             rolling_buf = _torch.roll(rolling_buf, -block_16k)
             rolling_buf[-block_16k:] = x_16k_t[:block_16k]
 
-            # --- Hold/release gate + RMS volume envelope ---
-            # input_rms: RMS of current 200ms block at 16kHz.
+            # --- Hold/release gate ---
             input_rms = float(_torch.sqrt(_torch.mean(x_16k_t ** 2)).item())
-
             if input_rms >= _silence_rms:
-                # Speech detected — open gate, reset hold timer
                 _gate_gain = 1.0
                 _hold_count = _HOLD_BLOCKS
                 _release_count = _RELEASE_BLOCKS
             elif _hold_count > 0:
-                # Hold phase: gate stays fully open for N blocks after speech ends.
-                # Prevents clipping on quiet consonants mid-word.
                 _hold_count -= 1
                 _gate_gain = 1.0
             elif _release_count > 0:
-                # Release phase: linear fade to zero over M blocks.
-                # Prevents hard cutoff on trailing sibilants / word endings.
                 _release_count -= 1
                 _gate_gain = _release_count / _RELEASE_BLOCKS
             else:
                 _gate_gain = 0.0
 
+            # --- RVC inference (always runs to keep MPS kernels warm) ---
             out = rvc.infer(
                 rolling_buf,
                 block_16k,
@@ -386,37 +414,63 @@ def run_worker(
                 "rmvpe",
                 protect,
             )
-            if isinstance(out, _torch.Tensor):
-                out_48k = out.cpu().numpy().astype(np.float32)
-            else:
-                out_48k = out.astype(np.float32)
+            infer_wav = out if isinstance(out, _torch.Tensor) else _torch.from_numpy(out)
+            infer_wav = infer_wav.to(infer_device)
 
             if _gate_gain == 0.0:
-                out_48k = np.zeros_like(out_48k)
+                # Silent: output zeros, reset SOLA buffer to avoid crossfade bleed
+                out_48k = np.zeros(block_48k, dtype=np.float32)
+                sola_buf.zero_()
             else:
-                # RMS volume envelope (RVC-WebUI-MacOS rms_mix_rate approach):
-                # Scale output so its energy matches the input energy.
-                # This prevents the model from outputting at full volume during
-                # quiet speech, and makes the converted voice feel natural.
-                out_rms = float(np.sqrt(np.mean(out_48k ** 2))) + 1e-8
-                # Target: output should have same RMS as input (adjusted for sr ratio)
-                target_rms = input_rms
-                rms_scale = min(target_rms / out_rms, 1.0)  # never amplify beyond input
-                out_48k = out_48k * (rms_scale * _gate_gain)
+                # --- RMS volume envelope ---
+                # Scale output RMS to match input RMS (capped at 1.0x gain).
+                # Prevents the model from outputting at full volume during quiet speech.
+                out_rms = float(_torch.sqrt(_torch.mean(infer_wav ** 2)).item()) + 1e-8
+                rms_scale = min(input_rms / out_rms, 1.0)
+                infer_wav = infer_wav * (rms_scale * _gate_gain)
+
+                # --- SOLA crossfade (RVC-WebUI-MacOS algorithm) ---
+                # Find offset in infer_wav[0:sola_buf+sola_search] that best
+                # correlates with sola_buf (previous block's tail). This alignment
+                # removes the block-boundary click caused by async inference drift.
+                search_len = sola_buf_48k + sola_search_48k
+                if infer_wav.shape[0] >= search_len:
+                    conv_in = infer_wav[None, None, :search_len]
+                    cor_nom = _F.conv1d(conv_in, sola_buf[None, None, :])
+                    cor_den = _torch.sqrt(
+                        _F.conv1d(conv_in ** 2,
+                                  _torch.ones(1, 1, sola_buf_48k, device=infer_device))
+                        + 1e-8
+                    )
+                    sola_offset = int(_torch.argmax(cor_nom[0, 0] / cor_den[0, 0]).item())
+                else:
+                    sola_offset = 0
+
+                infer_wav = infer_wav[sola_offset:]
+
+                # Crossfade: blend previous tail (fade_out) with new head (fade_in)
+                if infer_wav.shape[0] >= sola_buf_48k:
+                    infer_wav[:sola_buf_48k] = (infer_wav[:sola_buf_48k] * fade_in
+                                                + sola_buf * fade_out)
+                    # Store new tail for next block's crossfade
+                    end = sola_buf_48k + block_48k
+                    if infer_wav.shape[0] >= end:
+                        sola_buf[:] = infer_wav[block_48k:end]
+
+                out_block = infer_wav[:block_48k]
+                out_48k = out_block.cpu().numpy().astype(np.float32)
 
             try:
                 stream_out.write(out_48k.reshape(-1, 1))
             except Exception:
                 pass
 
-            # Enqueue block for MP3 save (non-blocking — save thread drains independently)
             if audio_save_q is not None:
                 try:
                     audio_save_q.put_nowait(out_48k.copy())
                 except queue.Full:
-                    pass  # drop block if save queue is somehow full
+                    pass
 
-            # Enqueue raw input (44→48k) for input MP3 save
             if audio_in_save_q is not None:
                 try:
                     x_48k = _resample_44_48(x_44k_t.unsqueeze(0)).squeeze(0).cpu().numpy().astype(np.float32)
@@ -424,7 +478,6 @@ def run_worker(
                 except queue.Full:
                     pass
 
-            # Waveform snapshots (~800 pts)
             evt_q.put({
                 "event": "waveform_in",
                 "samples": base64.b64encode(x_44k[::decim].tobytes()).decode(),
