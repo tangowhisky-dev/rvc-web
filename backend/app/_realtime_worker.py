@@ -284,12 +284,19 @@ def run_worker(
         return_length_frames = block_params["return_length_frames"]
         decim = max(1, block_48k // 800)
 
-        # Silence gate: RMS below this linear threshold → zero output.
-        # Default -45 dBFS keeps MPS kernels warm while suppressing phantom voice.
+        # Silence gate: RMS below this linear threshold → gate closes.
         _silence_rms = 10 ** (silence_threshold_db / 20.0)
 
-        # Rolling context buffer on the inference device — avoids torch.from_numpy()
-        # + .to(device) allocation every block.
+        # Hold/release gate (inspired by Vonovox VAD 400ms release window).
+        # Prevents clipping on quiet consonants and word endings.
+        # At 200ms blocks: HOLD_BLOCKS=3 → 600ms hold, RELEASE_BLOCKS=2 → 400ms fade.
+        _HOLD_BLOCKS = 3
+        _RELEASE_BLOCKS = 2
+        _hold_count = 0     # blocks remaining in hold phase
+        _release_count = 0  # blocks remaining in release fade
+        _gate_gain = 0.0    # current gate gain [0.0 → 1.0]
+
+        # Rolling context buffer on the inference device.
         rolling_buf = _torch.zeros(total_16k_samples, dtype=_torch.float32,
                                    device=infer_device)
 
@@ -333,12 +340,27 @@ def run_worker(
             rolling_buf = _torch.roll(rolling_buf, -block_16k)
             rolling_buf[-block_16k:] = x_16k_t[:block_16k]
 
-            # --- Silence gate ---
-            # Compute RMS of the current input block (16k, already on device).
-            # We still run inference to keep MPS kernels warm (cold restart causes
-            # a latency spike when voice resumes), but zero the output if silent.
+            # --- Hold/release gate + RMS volume envelope ---
+            # input_rms: RMS of current 200ms block at 16kHz.
             input_rms = float(_torch.sqrt(_torch.mean(x_16k_t ** 2)).item())
-            is_silent = input_rms < _silence_rms
+
+            if input_rms >= _silence_rms:
+                # Speech detected — open gate, reset hold timer
+                _gate_gain = 1.0
+                _hold_count = _HOLD_BLOCKS
+                _release_count = _RELEASE_BLOCKS
+            elif _hold_count > 0:
+                # Hold phase: gate stays fully open for N blocks after speech ends.
+                # Prevents clipping on quiet consonants mid-word.
+                _hold_count -= 1
+                _gate_gain = 1.0
+            elif _release_count > 0:
+                # Release phase: linear fade to zero over M blocks.
+                # Prevents hard cutoff on trailing sibilants / word endings.
+                _release_count -= 1
+                _gate_gain = _release_count / _RELEASE_BLOCKS
+            else:
+                _gate_gain = 0.0
 
             out = rvc.infer(
                 rolling_buf,
@@ -353,13 +375,18 @@ def run_worker(
             else:
                 out_48k = out.astype(np.float32)
 
-            if is_silent:
-                # Suppress phantom voice — output silence
+            if _gate_gain == 0.0:
                 out_48k = np.zeros_like(out_48k)
             else:
-                # Volume envelope: scale output amplitude to track input energy.
-                # Prevents the model from amplifying quiet input to full volume.
-                out_48k *= min(1.0, input_rms / max(_silence_rms, 1e-8)) ** 0.5
+                # RMS volume envelope (RVC-WebUI-MacOS rms_mix_rate approach):
+                # Scale output so its energy matches the input energy.
+                # This prevents the model from outputting at full volume during
+                # quiet speech, and makes the converted voice feel natural.
+                out_rms = float(np.sqrt(np.mean(out_48k ** 2))) + 1e-8
+                # Target: output should have same RMS as input (adjusted for sr ratio)
+                target_rms = input_rms
+                rms_scale = min(target_rms / out_rms, 1.0)  # never amplify beyond input
+                out_48k = out_48k * (rms_scale * _gate_gain)
 
             try:
                 stream_out.write(out_48k.reshape(-1, 1))
