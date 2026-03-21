@@ -49,7 +49,7 @@ for _noisy in ("numba", "numba.core", "numba.core.ssa", "numba.core.byteflow",
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 import numpy as np
-import scipy.signal
+import scipy.signal  # kept as CPU fallback; primary resample is torchaudio on-device
 import torch
 
 
@@ -233,7 +233,7 @@ def run_worker(
         # This ensures the "ready" signal only fires after real-time latency
         # is stable (first call is ~2s on MPS, subsequent calls ~50ms).
         evt_q.put({"event": "warming_up", "device": infer_device})
-        silence = _torch.zeros(block_params["total_16k_samples"])
+        silence = _torch.zeros(block_params["total_16k_samples"], device=infer_device)
         rvc.infer(
             silence,
             block_params["block_16k"],
@@ -244,6 +244,13 @@ def run_worker(
         )
 
         import sounddevice as sd  # noqa: PLC0415
+        from torchaudio.transforms import Resample as _Resample  # noqa: PLC0415
+
+        # Build on-device resampler: 44100 → 16000 using torchaudio (MPS/CPU).
+        # Much faster than scipy.signal.resample_poly for small blocks since
+        # it avoids the CPU↔device round-trip.
+        _resample_44_16 = _Resample(orig_freq=44100, new_freq=16000,
+                                    dtype=torch.float32).to(infer_device)
 
         stream_in = sd.InputStream(
             device=input_device_id,
@@ -251,6 +258,7 @@ def run_worker(
             channels=1,
             dtype="float32",
             blocksize=block_params["block_44k"],
+            latency="low",
         )
         stream_out = sd.OutputStream(
             device=output_device_id,
@@ -258,6 +266,7 @@ def run_worker(
             channels=1,
             dtype="float32",
             blocksize=block_params["block_48k"],
+            latency="low",   # was 'high' (sounddevice global default) — key stutter fix
         )
 
         stream_in.start()
@@ -274,7 +283,10 @@ def run_worker(
         return_length_frames = block_params["return_length_frames"]
         decim = max(1, block_48k // 800)
 
-        rolling_buf = np.zeros(total_16k_samples, dtype=np.float32)
+        # Rolling context buffer on the inference device — avoids torch.from_numpy()
+        # + .to(device) allocation every block.
+        rolling_buf = _torch.zeros(total_16k_samples, dtype=_torch.float32,
+                                   device=infer_device)
 
         while True:
             # Check for stop command (non-blocking)
@@ -302,24 +314,30 @@ def run_worker(
             if overflowed:
                 evt_q.put({"event": "waveform_overflow", "detail": "overflow"})
 
-            x_44k = data.squeeze()
-            x_16k = scipy.signal.resample_poly(x_44k, 160, 441).astype(np.float32)
+            # Keep raw 44k numpy for waveform snapshot
+            x_44k = data.squeeze()  # np.float32 [block_44k]
 
-            rolling_buf[:-block_16k] = rolling_buf[block_16k:]
-            rolling_buf[-block_16k:] = x_16k[:block_16k]
+            # Resample 44100→16000 on-device with torchaudio (avoids scipy CPU round-trip)
+            x_44k_t = _torch.from_numpy(x_44k).to(infer_device)
+            x_16k_t = _resample_44_16(x_44k_t.unsqueeze(0)).squeeze(0)  # [block_16k]
 
-            input_tensor = _torch.from_numpy(rolling_buf).float()
+            # Slide rolling buffer in-place: shift left by block_16k samples.
+            # Use roll+zero rather than clone to avoid a temporary allocation.
+            rolling_buf = _torch.roll(rolling_buf, -block_16k)
+            rolling_buf[-block_16k:] = x_16k_t[:block_16k]
+
             out = rvc.infer(
-                input_tensor,
+                rolling_buf,
                 block_16k,
                 skip_head_frames,
                 return_length_frames,
                 "rmvpe",
                 protect,
             )
-            if isinstance(out, torch.Tensor):
-                out = out.cpu().numpy()
-            out_48k = out.astype(np.float32)
+            if isinstance(out, _torch.Tensor):
+                out_48k = out.cpu().numpy().astype(np.float32)
+            else:
+                out_48k = out.astype(np.float32)
 
             try:
                 stream_out.write(out_48k.reshape(-1, 1))
@@ -336,12 +354,12 @@ def run_worker(
             # Waveform snapshots (~800 pts)
             evt_q.put({
                 "event": "waveform_in",
-                "samples": base64.b64encode(x_44k[::decim].astype(np.float32).tobytes()).decode(),
+                "samples": base64.b64encode(x_44k[::decim].tobytes()).decode(),
                 "sr": 48000,
             })
             evt_q.put({
                 "event": "waveform_out",
-                "samples": base64.b64encode(out_48k[::decim].astype(np.float32).tobytes()).decode(),
+                "samples": base64.b64encode(out_48k[::decim].tobytes()).decode(),
                 "sr": 48000,
             })
 
