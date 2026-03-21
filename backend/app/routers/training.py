@@ -233,13 +233,12 @@ async def training_websocket(websocket: WebSocket, profile_id: str) -> None:
                     else:
                         await websocket.send_json({"type": "done", "phase": job.phase})
                     break
-                # Still running — send a keepalive with elapsed seconds
-                elapsed = int(time.monotonic() - ws_start)
+                # Still running — send a silent keepalive so the browser WS
+                # doesn't time out. No message: frontend skips it.
                 await websocket.send_json({
                     "type": "keepalive",
-                    "message": f"Training in progress… ({elapsed}s elapsed)",
                     "phase": job.phase,
-                    "elapsed_s": elapsed,
+                    "elapsed_s": int(time.monotonic() - ws_start),
                 })
                 continue
 

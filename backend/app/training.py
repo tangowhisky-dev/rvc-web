@@ -252,38 +252,24 @@ def _build_filelist(rvc_root: str, exp_dir: str) -> None:
 # config.json writer (idempotent)
 # ---------------------------------------------------------------------------
 
-def _write_config(rvc_root: str, exp_dir: str, batch_size: int = 4) -> None:
+def _write_config(rvc_root: str, exp_dir: str, batch_size: int = 16) -> None:
     """Copy configs/inuse/v2/48k.json into exp_dir/config.json, then patch
-    log_interval so that loss stats are logged exactly once per epoch.
+    log_interval=1 so every batch emits loss stats to stdout.
 
-    log_interval is set to the estimated number of batches per epoch based on
-    the filelist.  With log_interval=200 (default) and only ~65 batches/epoch,
-    stats only print once every 3 epochs — which is too coarse.
-
-    Skips if config.json already exists and has the right log_interval.
+    _drain_stdout buffers loss lines per epoch and only attaches the final
+    batch's loss to the epoch_done event, keeping the UI clean while ensuring
+    every epoch shows accurate end-of-epoch loss.
     """
     import json as _json
 
     config_save_path = os.path.join(exp_dir, "config.json")
     src = os.path.join(rvc_root, "configs", "inuse", "v2", "48k.json")
 
-    # Estimate batches-per-epoch from filelist length
-    filelist_path = os.path.join(exp_dir, "filelist.txt")
-    log_interval = 200  # safe fallback if filelist not yet written
-    if os.path.exists(filelist_path):
-        try:
-            with open(filelist_path) as _f:
-                n_samples = sum(1 for line in _f if line.strip())
-            # DistributedBucketSampler discards items outside [100,900] spec-frame
-            # boundaries; estimate 90% survive.  batch_size=4, num_replicas=1.
-            est_batches = max(1, int(n_samples * 0.9) // batch_size)
-            log_interval = est_batches
-        except OSError:
-            pass
-
     with open(src) as _f:
         cfg = _json.load(_f)
-    cfg["train"]["log_interval"] = log_interval
+    # log_interval=1: every batch logs. _drain_stdout keeps only the last loss
+    # line per epoch (attached to epoch_done) and discards the rest.
+    cfg["train"]["log_interval"] = 1
     with open(config_save_path, "w") as _f:
         _json.dump(cfg, _f, indent=2)
 
@@ -498,7 +484,7 @@ async def _run_pipeline(
     # Pre-phase 3 setup: config.json and filelist.txt
     # ------------------------------------------------------------------
     try:
-        _write_config(rvc_root, exp_dir, batch_size=16)
+        _write_config(rvc_root, exp_dir)
         _build_filelist(rvc_root, exp_dir)
     except Exception as exc:
         await _fail("setup", f"Pre-train setup failed: {exc}")
@@ -557,7 +543,10 @@ async def _run_pipeline(
         if train_proc.stdout is None:
             return
         import re as _re
-        last_loss_line: str = ""  # buffer most recent loss stats line
+        # With log_interval=1, every batch emits "Train Epoch:" + loss line.
+        # Buffer only the latest loss line and attach it to epoch_done.
+        # All mid-epoch log noise is suppressed.
+        last_loss_line: str = ""
 
         async for raw_line in train_proc.stdout:
             line = raw_line.decode(errors="replace").rstrip()
@@ -566,50 +555,40 @@ async def _run_pipeline(
             # Filter faiss loader spam
             if line.startswith("DEBUG:faiss") or line.startswith("INFO:faiss"):
                 continue
-            # Strip logger prefix "INFO:name:" / "DEBUG:name:" for cleaner display
+            # Strip logger prefix "INFO:name:" / "DEBUG:name:"
             clean = _re.sub(r"^(INFO|DEBUG|WARNING|ERROR):[^:]+:", "", line).strip()
-
-            # Capture loss stats line to attach to epoch_done event
-            if "loss_disc=" in clean or "loss_gen=" in clean:
-                last_loss_line = clean
-                # Also emit as a regular log line so it's visible
-                await job.queue.put({"type": "log", "message": clean, "phase": "train"})
+            if not clean:
                 continue
 
-            # Detect epoch-start: "Train Epoch: N [pct%]"
-            if "Train Epoch:" in clean:
-                m = _re.search(r"Train Epoch:\s*(\d+)\s*\[(\d+(?:\.\d+)?)%\]", clean)
-                if m:
-                    epoch_num = int(m.group(1))
-                    await job.queue.put({
-                        "type": "epoch",
-                        "message": f"Epoch {epoch_num}",
-                        "phase": "train",
-                        "epoch": epoch_num,
-                    })
-                    continue
+            # Loss line — buffer silently; shown once at epoch_done
+            if "loss_disc=" in clean or "loss_gen=" in clean:
+                last_loss_line = clean
+                continue
 
-            # Detect epoch-done: "====> Epoch: N [timestamp] | (elapsed)"
+            # "Train Epoch: N [pct%]" — suppress (fires every batch with log_interval=1)
+            if "Train Epoch:" in clean:
+                continue
+
+            # "[step, lr]" list line — suppress
+            if clean.startswith("[") and "," in clean:
+                continue
+
+            # Epoch done: "====> Epoch: N [timestamp] | (elapsed)"
             if "====> Epoch:" in clean:
                 m = _re.search(r"====> Epoch:\s*(\d+)", clean)
                 if m:
                     epoch_num = int(m.group(1))
-                    # Extract elapsed portion if present
                     elapsed_m = _re.search(r"\(([^)]+)\)", clean)
                     elapsed = elapsed_m.group(1) if elapsed_m else ""
                     loss_suffix = f" | {last_loss_line}" if last_loss_line else ""
                     await job.queue.put({
                         "type": "epoch_done",
-                        "message": f"Epoch {epoch_num} done ({elapsed}){loss_suffix}",
+                        "message": f"Epoch {epoch_num} ({elapsed}){loss_suffix}",
                         "phase": "train",
                         "epoch": epoch_num,
                     })
-                    last_loss_line = ""  # reset after consuming
+                    last_loss_line = ""
                     continue
-
-            # Skip the raw [step, lr] list line and tensorboard lines
-            if clean.startswith("[") and "," in clean:
-                continue
 
             await job.queue.put({"type": "log", "message": clean, "phase": "train"})
 

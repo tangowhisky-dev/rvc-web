@@ -243,11 +243,11 @@ export default function TrainingPage() {
             if (msg.message) appendLog(`── ${msg.phase?.toUpperCase() ?? ''}: ${msg.message}`);
 
           } else if (msg.type === 'epoch') {
-            // New epoch started — show as prominent log entry
+            // epoch-start events no longer emitted by backend (suppressed at log_interval=1)
+            // kept here for forward-compat in case backend adds them back
             if (msg.message) appendLog(`▶ ${msg.message}`);
 
           } else if (msg.type === 'epoch_done') {
-            // Epoch completed
             if (msg.message) appendLog(`✓ ${msg.message}`);
 
           } else if (msg.type === 'index_done') {
@@ -255,18 +255,7 @@ export default function TrainingPage() {
             if (msg.message) appendLog(`✓ ${msg.message}`);
 
           } else if (msg.type === 'keepalive') {
-            // Replace the last keepalive line (identified by prefix after timestamp)
-            if (msg.message) {
-              const stamp = nowStamp();
-              const stamped = `[${stamp}] ${msg.message}`;
-              setLogLines((prev) => {
-                const last = prev[prev.length - 1] ?? '';
-                if (last.includes('Training in progress…')) {
-                  return [...prev.slice(0, -1), stamped];
-                }
-                return [...prev, stamped];
-              });
-            }
+            // Silent keepalive — just keeps the WS alive, nothing to display
 
           } else if (msg.type === 'done') {
             setCurrentPhase('done');
