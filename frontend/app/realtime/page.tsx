@@ -23,6 +23,7 @@ interface SessionParams {
   pitch: number;
   index_rate: number;
   protect: number;
+  silence_threshold_db: number;
 }
 
 type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
@@ -32,7 +33,7 @@ type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
 // ---------------------------------------------------------------------------
 
 const API = 'http://localhost:8000';
-const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.75, protect: 0.33 };
+const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.75, protect: 0.33, silence_threshold_db: -45 };
 
 // ---------------------------------------------------------------------------
 // Utility: find default device by name fragment
@@ -798,6 +799,17 @@ export default function RealtimePage() {
                 step={0.05}
                 disabled={false}
                 onChange={(v) => handleParamChange('protect', v)}
+              />
+            </div>
+            <div className="grid grid-cols-1 gap-6">
+              <ParamSlider
+                label={`Silence Gate (${params.silence_threshold_db} dBFS)`}
+                value={params.silence_threshold_db}
+                min={-70}
+                max={-10}
+                step={1}
+                disabled={false}
+                onChange={(v) => handleParamChange('silence_threshold_db', v)}
               />
             </div>
 

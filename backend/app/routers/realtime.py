@@ -43,6 +43,7 @@ class StartSessionRequest(BaseModel):
     pitch: float = 0.0
     index_rate: float = 0.75
     protect: float = 0.33
+    silence_threshold_db: float = -45.0
     save_path: Optional[str] = None
 
 
@@ -55,6 +56,7 @@ class UpdateParamsRequest(BaseModel):
     pitch: Optional[float] = None
     index_rate: Optional[float] = None
     protect: Optional[float] = None
+    silence_threshold_db: Optional[float] = None
 
 
 class StartSessionResponse(BaseModel):
@@ -125,6 +127,7 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
             pitch=request.pitch,
             index_rate=request.index_rate,
             protect=request.protect,
+            silence_threshold_db=request.silence_threshold_db,
             rvc_root=rvc_root,
             save_path=request.save_path,
         )
@@ -217,6 +220,7 @@ async def update_params(request: UpdateParamsRequest) -> dict:
         pitch=request.pitch,
         index_rate=request.index_rate,
         protect=request.protect,
+        silence_threshold_db=request.silence_threshold_db,
     )
     return {"ok": True}
 

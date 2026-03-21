@@ -154,6 +154,7 @@ def run_worker(
     pitch: float,
     index_rate: float,
     protect: float,
+    silence_threshold_db: float = -45.0,
     save_path: str | None = None,
 ) -> None:
     """Run in isolated child process. Owns all native code (fairseq, sounddevice, MPS)."""
@@ -283,6 +284,10 @@ def run_worker(
         return_length_frames = block_params["return_length_frames"]
         decim = max(1, block_48k // 800)
 
+        # Silence gate: RMS below this linear threshold → zero output.
+        # Default -45 dBFS keeps MPS kernels warm while suppressing phantom voice.
+        _silence_rms = 10 ** (silence_threshold_db / 20.0)
+
         # Rolling context buffer on the inference device — avoids torch.from_numpy()
         # + .to(device) allocation every block.
         rolling_buf = _torch.zeros(total_16k_samples, dtype=_torch.float32,
@@ -302,6 +307,8 @@ def run_worker(
                         rvc.set_index_rate(msg["index_rate"])
                     if "protect" in msg:
                         protect = msg["protect"]
+                    if "silence_threshold_db" in msg:
+                        _silence_rms = 10 ** (msg["silence_threshold_db"] / 20.0)
             except Exception:
                 pass  # Empty queue — continue
 
@@ -326,6 +333,13 @@ def run_worker(
             rolling_buf = _torch.roll(rolling_buf, -block_16k)
             rolling_buf[-block_16k:] = x_16k_t[:block_16k]
 
+            # --- Silence gate ---
+            # Compute RMS of the current input block (16k, already on device).
+            # We still run inference to keep MPS kernels warm (cold restart causes
+            # a latency spike when voice resumes), but zero the output if silent.
+            input_rms = float(_torch.sqrt(_torch.mean(x_16k_t ** 2)).item())
+            is_silent = input_rms < _silence_rms
+
             out = rvc.infer(
                 rolling_buf,
                 block_16k,
@@ -338,6 +352,14 @@ def run_worker(
                 out_48k = out.cpu().numpy().astype(np.float32)
             else:
                 out_48k = out.astype(np.float32)
+
+            if is_silent:
+                # Suppress phantom voice — output silence
+                out_48k = np.zeros_like(out_48k)
+            else:
+                # Volume envelope: scale output amplitude to track input energy.
+                # Prevents the model from amplifying quiet input to full volume.
+                out_48k *= min(1.0, input_rms / max(_silence_rms, 1e-8)) ** 0.5
 
             try:
                 stream_out.write(out_48k.reshape(-1, 1))
