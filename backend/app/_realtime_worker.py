@@ -119,10 +119,12 @@ def _save_thread(audio_q: queue.Queue, save_path: str, sr: int, evt_q: multiproc
             pcm /= peak
 
         from pydub import AudioSegment  # noqa: PLC0415
+        # pydub expects integer PCM; convert float32 [-1, 1] → int16
+        pcm_int16 = (pcm * 32767).clip(-32768, 32767).astype(np.int16)
         seg = AudioSegment(
-            pcm.tobytes(),
+            pcm_int16.tobytes(),
             frame_rate=sr,
-            sample_width=4,   # float32 = 4 bytes
+            sample_width=2,   # int16 = 2 bytes
             channels=1,
         )
         # Ensure parent directory exists (os.path.dirname returns '' for bare filenames,
