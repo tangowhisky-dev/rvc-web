@@ -498,7 +498,7 @@ async def _run_pipeline(
     # Pre-phase 3 setup: config.json and filelist.txt
     # ------------------------------------------------------------------
     try:
-        _write_config(rvc_root, exp_dir, batch_size=4)
+        _write_config(rvc_root, exp_dir, batch_size=16)
         _build_filelist(rvc_root, exp_dir)
     except Exception as exc:
         await _fail("setup", f"Pre-train setup failed: {exc}")
@@ -522,13 +522,13 @@ async def _run_pipeline(
         "-e", exp_name,
         "-sr", "48k",
         "-f0", "1",
-        "-bs", "4",
+        "-bs", "16",  # M4 Max has 48 GB unified memory — larger batch amortises MPS dispatch overhead
         "-te", str(total_epoch),
         "-se", str(save_every),
         "-pg", "assets/pretrained_v2/f0G48k.pth",
         "-pd", "assets/pretrained_v2/f0D48k.pth",
         "-l", "1",    # save latest only
-        "-c", "0",    # no cache GPU
+        "-c", "1",    # cache dataset in GPU memory — eliminates DataLoader round-trip per batch
         "-sw", "0",   # no save every weights
         "-v", "v2",
         "-a", "",
