@@ -179,6 +179,8 @@ def run_worker(
     # before the audio loop. Uses an in-process queue (thread-safe, not mp.Queue).
     audio_save_q: queue.Queue | None = None
     save_t: threading.Thread | None = None
+    audio_in_save_q: queue.Queue | None = None
+    save_in_t: threading.Thread | None = None
     if save_path:
         audio_save_q = queue.Queue(maxsize=0)  # unbounded — save thread drains async
         save_t = threading.Thread(
@@ -188,6 +190,18 @@ def run_worker(
             name="mp3-save",
         )
         save_t.start()
+
+        # Input save: same dir as output, named rvc_input.mp3
+        _save_dir = os.path.dirname(os.path.abspath(os.path.expanduser(save_path)))
+        input_save_path = os.path.join(_save_dir, "rvc_input.mp3")
+        audio_in_save_q = queue.Queue(maxsize=0)
+        save_in_t = threading.Thread(
+            target=_save_thread,
+            args=(audio_in_save_q, input_save_path, _SR_48K, evt_q),
+            daemon=True,
+            name="mp3-save-input",
+        )
+        save_in_t.start()
 
     try:
         # Import torch first, then faiss with nthreads=1, before fairseq.
@@ -251,6 +265,8 @@ def run_worker(
         # Much faster than scipy.signal.resample_poly for small blocks since
         # it avoids the CPU↔device round-trip.
         _resample_44_16 = _Resample(orig_freq=44100, new_freq=16000,
+                                    dtype=torch.float32).to(infer_device)
+        _resample_44_48 = _Resample(orig_freq=44100, new_freq=_SR_48K,
                                     dtype=torch.float32).to(infer_device)
 
         stream_in = sd.InputStream(
@@ -400,6 +416,14 @@ def run_worker(
                 except queue.Full:
                     pass  # drop block if save queue is somehow full
 
+            # Enqueue raw input (44→48k) for input MP3 save
+            if audio_in_save_q is not None:
+                try:
+                    x_48k = _resample_44_48(x_44k_t.unsqueeze(0)).squeeze(0).cpu().numpy().astype(np.float32)
+                    audio_in_save_q.put_nowait(x_48k.copy())
+                except queue.Full:
+                    pass
+
             # Waveform snapshots (~800 pts)
             evt_q.put({
                 "event": "waveform_in",
@@ -424,6 +448,11 @@ def run_worker(
                 evt_q.put({"event": "debug", "message": f"Waiting for save thread to finish..."})
                 save_t.join(timeout=30)  # up to 30s for pydub/ffmpeg to encode
                 evt_q.put({"event": "debug", "message": f"Save thread finished"})
+
+        if audio_in_save_q is not None:
+            audio_in_save_q.put(_SAVE_SENTINEL)
+            if save_in_t is not None:
+                save_in_t.join(timeout=30)
 
         # Clean up streams — guard against NameError if streams were never assigned
         # (exception during model loading, before sd.InputStream was created).
