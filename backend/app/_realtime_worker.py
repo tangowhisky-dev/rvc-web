@@ -200,6 +200,10 @@ def run_worker(
     os.environ["rmvpe_root"] = f"{rvc_root}/assets/rmvpe"
     os.environ["hubert_path"] = f"{rvc_root}/assets/hubert/hubert_base.pt"
 
+    # fairseq loads assets via relative paths (e.g. "assets/hubert/hubert_base.pt")
+    # so the working directory must be rvc_root before any import happens.
+    os.chdir(rvc_root)
+
     if rvc_root not in sys.path:
         sys.path.insert(0, rvc_root)
 
@@ -256,11 +260,10 @@ def run_worker(
         from infer.lib.rtrvc import RVC  # noqa: PLC0415
 
         # Resolve model and index paths.
-        # Prefer explicitly passed paths (new per-profile layout:
-        #   data/profiles/{id}/model.pth + model.index).
-        # Fall back to legacy locations for profiles trained before the
-        # per-profile artifact store was introduced.
-        import os as _os  # noqa: PLC0415
+        # Prefer explicitly passed per-profile paths (data/profiles/{id}/model_infer.pth
+        # + model.index).  Fall back to legacy symlink locations for profiles trained
+        # before the per-profile artifact store was introduced.
+        import os as _os  # noqa: PLC0415  (re-import needed — chdir happened above)
 
         resolved_model_path = model_path
         resolved_index_path = index_path
@@ -271,7 +274,7 @@ def run_worker(
                 resolved_model_path = legacy_model
             else:
                 raise RuntimeError(
-                    f"model.pth not found — checked {model_path!r} and legacy {legacy_model!r}"
+                    f"model not found — checked {model_path!r} and legacy {legacy_model!r}"
                 )
 
         if not resolved_index_path or not _os.path.exists(resolved_index_path):
@@ -279,8 +282,8 @@ def run_worker(
             matches = _glob.glob(index_pattern)
             if not matches:
                 raise RuntimeError(
-                    f"model.index not found — checked {index_path!r} "
-                    "and legacy logs/rvc_finetune_active/added_IVF*.index"
+                    f"index not found — checked {index_path!r} and "
+                    f"legacy logs/rvc_finetune_active/added_IVF*_Flat*.index"
                 )
             resolved_index_path = matches[0]
 
@@ -326,6 +329,14 @@ def run_worker(
             return c, f
 
         rvc._get_f0 = _patched_get_f0
+
+        # FAISS segfault fix: index.search requires C-contiguous float32 input.
+        # MPS tensors converted via .cpu().numpy() can produce non-contiguous arrays
+        # which trigger a silent SIGSEGV inside libomp on macOS.
+        _orig_search = rvc.index.search
+        def _safe_search(npy, k):
+            return _orig_search(np.ascontiguousarray(npy, dtype=np.float32), k=k)
+        rvc.index.search = _safe_search
 
         # Warmup: run one full infer pass so MPS compiles its kernels.
         # This ensures the "ready" signal only fires after real-time latency
