@@ -508,8 +508,8 @@ def run_worker(
                 # spectral centroid +800 Hz above input). Apply ~-3 dB shelf above
                 # ~3 kHz by subtracting 50% of the high-pass filtered signal.
                 # Coefficients pre-computed above; no cross-block IIR state needed.
-                infer_np = infer_wav.cpu().numpy()
-                _lp_component = scipy.signal.lfilter(_hs_b, _hs_a, infer_np)
+                infer_np = infer_wav.cpu().numpy().astype(np.float32)
+                _lp_component = scipy.signal.lfilter(_hs_b, _hs_a, infer_np).astype(np.float32)
                 infer_np = infer_np - 0.50 * _lp_component
                 infer_wav = _torch.from_numpy(infer_np).to(infer_device)
 
