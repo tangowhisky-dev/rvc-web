@@ -141,6 +141,10 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
         if "already active" in msg:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        # Worker startup failure — log full message (includes traceback from worker)
+        logger.error("worker startup error:\n%s", str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     logger.info(
         json.dumps({

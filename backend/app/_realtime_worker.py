@@ -272,6 +272,36 @@ def run_worker(
 
         block_params = _compute_block_params(_BLOCK_48K)
 
+        # ---------------------------------------------------------------
+        # Patch rvc.infer to fix the pitchf/p_len mismatch that occurs when
+        # total_16k_samples > f0_extractor_frame (our 2s-context design).
+        #
+        # rtrvc.py computes pitch via _get_f0(input_wav[-f0_extractor_frame:])
+        # which returns pitch.shape[0] = f0_extractor_frame // window = 31 frames.
+        # But p_len = total_16k_samples // window = 231 frames.
+        # When protect < 0.5 the code does:
+        #   pitchff = pitchf.clone()          # [1, 31]
+        #   pitchff = pitchff.unsqueeze(-1)   # [1, 31, 1]
+        #   feats = feats * pitchff + ...     # [1, 231, 256] * [1, 31, 1] → CRASH
+        #
+        # Fix: wrap infer to pad pitch/pitchf at the head with zeros (unvoiced)
+        # so they match p_len. The head frames are discarded by skip_head anyway.
+        # ---------------------------------------------------------------
+        _orig_get_f0 = rvc._get_f0
+        _p_len_expected = block_params["p_len"]  # 231
+
+        def _patched_get_f0(x, f0_up_key, filter_radius=None, method="fcpe"):
+            c, f = _orig_get_f0(x, f0_up_key, filter_radius=filter_radius, method=method)
+            # c, f shape: [frames] where frames = f0_extractor_frame // window (31)
+            # Pad head to p_len so pitchff broadcast with feats [1, p_len, H] succeeds
+            if c.shape[-1] < _p_len_expected:
+                pad = _p_len_expected - c.shape[-1]
+                c = _torch.cat([_torch.zeros(pad, dtype=c.dtype, device=c.device), c])
+                f = _torch.cat([_torch.zeros(pad, dtype=f.dtype, device=f.device), f])
+            return c, f
+
+        rvc._get_f0 = _patched_get_f0
+
         # Warmup: run one full infer pass so MPS compiles its kernels.
         # This ensures the "ready" signal only fires after real-time latency
         # is stable (first call is ~2s on MPS, subsequent calls ~50ms).
@@ -490,7 +520,8 @@ def run_worker(
             })
 
     except Exception as exc:
-        evt_q.put({"event": "error", "error": str(exc)})
+        import traceback as _tb
+        evt_q.put({"event": "error", "error": str(exc) + "\n" + _tb.format_exc()})
 
     finally:
         # Signal save thread to flush and encode — happens after audio loop exits
