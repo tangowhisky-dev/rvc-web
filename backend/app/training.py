@@ -22,6 +22,7 @@ The WebSocket handler (T03) drains the queue and forwards to connected clients.
 """
 
 import asyncio
+import glob
 import json
 import multiprocessing
 import os
@@ -521,6 +522,11 @@ async def _run_pipeline(
     train_env.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     train_env.setdefault("PYTORCH_MPS_PREFER_SHARED_MEMORY", "1")
 
+    # Clamp save_every so at least one checkpoint fires even for short test runs.
+    # If total_epoch=5 and save_every=10, the save condition (epoch % save_every == 0)
+    # never triggers and no G_latest.pth is written.
+    effective_save_every = min(save_every, total_epoch)
+
     train_args = [
         python,
         "infer/modules/train/train.py",
@@ -529,7 +535,7 @@ async def _run_pipeline(
         "-f0", "1",
         "-bs", str(batch_size),
         "-te", str(total_epoch),
-        "-se", str(save_every),
+        "-se", str(effective_save_every),
         "-pg", "assets/pretrained_v2/f0G48k.pth",
         "-pd", "assets/pretrained_v2/f0D48k.pth",
         "-l", "1",    # save latest only
@@ -688,6 +694,17 @@ async def _run_pipeline(
     dest_index_path: Optional[str] = None
 
     g_latest = os.path.join(exp_dir, "G_latest.pth")
+
+    if not os.path.exists(g_latest):
+        # Fallback: find any G_{step}.pth; pick the one with the highest step
+        g_candidates = sorted(glob.glob(os.path.join(exp_dir, "G_*.pth")))
+        if g_candidates:
+            g_latest = g_candidates[-1]
+            await job.queue.put({
+                "type": "log",
+                "message": f"G_latest.pth not found; using {os.path.basename(g_latest)}",
+                "phase": "index",
+            })
 
     if profile_dir:
         os.makedirs(profile_dir, exist_ok=True)
