@@ -252,7 +252,7 @@ def _build_filelist(rvc_root: str, exp_dir: str) -> None:
 # config.json writer (idempotent)
 # ---------------------------------------------------------------------------
 
-def _write_config(rvc_root: str, exp_dir: str, batch_size: int = 16) -> None:
+def _write_config(rvc_root: str, exp_dir: str, batch_size: int = 8) -> None:
     """Copy configs/inuse/v2/48k.json into exp_dir/config.json, then patch
     log_interval=1 so every batch emits loss stats to stdout.
 
@@ -320,6 +320,7 @@ async def _run_pipeline(
     rvc_root: str,
     total_epoch: int = 200,
     save_every: int = 10,
+    batch_size: int = 8,
 ) -> None:
     """Orchestrate the full training pipeline for one TrainingJob.
 
@@ -484,7 +485,7 @@ async def _run_pipeline(
     # Pre-phase 3 setup: config.json and filelist.txt
     # ------------------------------------------------------------------
     try:
-        _write_config(rvc_root, exp_dir)
+        _write_config(rvc_root, exp_dir, batch_size=batch_size)
         _build_filelist(rvc_root, exp_dir)
     except Exception as exc:
         await _fail("setup", f"Pre-train setup failed: {exc}")
@@ -508,7 +509,7 @@ async def _run_pipeline(
         "-e", exp_name,
         "-sr", "48k",
         "-f0", "1",
-        "-bs", "16",  # M4 Max has 48 GB unified memory — larger batch amortises MPS dispatch overhead
+        "-bs", str(batch_size),
         "-te", str(total_epoch),
         "-se", str(save_every),
         "-pg", "assets/pretrained_v2/f0G48k.pth",
@@ -689,6 +690,7 @@ class TrainingManager:
         rvc_root: str,
         total_epoch: int = 200,
         save_every: int = 10,
+        batch_size: int = 8,
     ) -> TrainingJob:
         """Create and launch a training job for profile_id.
 
@@ -707,7 +709,7 @@ class TrainingManager:
         self._jobs[profile_id] = job
 
         asyncio.create_task(
-            _run_pipeline(job, sample_dir, rvc_root, total_epoch, save_every)
+            _run_pipeline(job, sample_dir, rvc_root, total_epoch, save_every, batch_size)
         )
 
         print(

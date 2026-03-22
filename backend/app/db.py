@@ -2,7 +2,7 @@
 
 Provides:
   - DB_PATH: canonical path for the SQLite database file
-  - init_db(): idempotent schema creation + required directory setup
+  - init_db(): idempotent schema creation + column migrations
   - get_db(): async context manager yielding an aiosqlite.Connection
 """
 
@@ -16,15 +16,27 @@ DB_PATH = "backend/data/rvc.db"
 
 _CREATE_PROFILES = """
 CREATE TABLE IF NOT EXISTS profiles (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'untrained',
-    sample_path TEXT,
-    model_path  TEXT,
-    index_path  TEXT,
-    created_at  TEXT NOT NULL
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'untrained',
+    sample_path       TEXT,
+    model_path        TEXT,
+    index_path        TEXT,
+    created_at        TEXT NOT NULL,
+    batch_size        INTEGER NOT NULL DEFAULT 8,
+    audio_duration    REAL,
+    preprocessed_path TEXT
 )
 """
+
+# Columns added after the initial schema was shipped.
+# Each entry: (column_name, column_definition)
+# init_db() runs ALTER TABLE for any that are missing.
+_MIGRATIONS: list[tuple[str, str]] = [
+    ("batch_size",        "INTEGER NOT NULL DEFAULT 8"),
+    ("audio_duration",    "REAL"),
+    ("preprocessed_path", "TEXT"),
+]
 
 
 async def init_db() -> None:
@@ -35,12 +47,25 @@ async def init_db() -> None:
       - backend/data/      (SQLite DB directory)
       - data/samples/      (uploaded audio storage root)
       - profiles table     (CREATE TABLE IF NOT EXISTS)
+      - applies _MIGRATIONS for any columns missing from an existing table
     """
     os.makedirs("backend/data", exist_ok=True)
     os.makedirs("data/samples", exist_ok=True)
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(_CREATE_PROFILES)
+        await db.commit()
+
+        # Column-level migrations (idempotent — skips columns that already exist)
+        cursor = await db.execute("PRAGMA table_info(profiles)")
+        existing = {row[1] for row in await cursor.fetchall()}
+
+        for col_name, col_def in _MIGRATIONS:
+            if col_name not in existing:
+                await db.execute(
+                    f"ALTER TABLE profiles ADD COLUMN {col_name} {col_def}"
+                )
+
         await db.commit()
 
 

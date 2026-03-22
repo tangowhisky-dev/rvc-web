@@ -1,6 +1,7 @@
 """Training REST + WebSocket router.
 
 Endpoints:
+  GET    /api/training/hardware           — hardware info + batch size sweet spot
   POST   /api/training/start              — start a training job
   POST   /api/training/cancel             — cancel a running training job
   GET    /api/training/status/{profile_id} — poll job status
@@ -36,6 +37,7 @@ class StartTrainingRequest(BaseModel):
     profile_id: str
     epochs: int = 200
     save_every: int = 10
+    batch_size: int = 8
 
 
 class CancelTrainingRequest(BaseModel):
@@ -51,6 +53,65 @@ class StatusResponse(BaseModel):
     progress_pct: int
     status: str
     error: Optional[str] = None
+
+
+class HardwareInfo(BaseModel):
+    total_ram_gb: float
+    available_ram_gb: float
+    ram_used_pct: float
+    cpu_cores: int
+    mps_available: bool
+    mps_allocated_mb: float
+    sweet_spot_batch_size: int
+    max_safe_batch_size: int
+
+
+# ---------------------------------------------------------------------------
+# GET /api/training/hardware
+# ---------------------------------------------------------------------------
+
+@router.get("/hardware", response_model=HardwareInfo)
+async def get_hardware() -> HardwareInfo:
+    """Return live hardware metrics and recommended batch size sweet spot.
+
+    Sweet spot heuristic for Apple Silicon MPS:
+      - RVC v2 training with 48k keeps roughly 1.5 GB per batch in unified mem
+        (model params ~500 MB + feature cache + gradients + activations)
+      - Reserve 40% of total RAM for OS + frontend + backend processes
+      - sweet_spot = floor((total_ram * 0.60) / 1.5)  clamped to [1, 32]
+    """
+    import psutil  # noqa: PLC0415
+    import torch   # noqa: PLC0415
+
+    mem = psutil.virtual_memory()
+    total_gb = mem.total / 1024 ** 3
+    avail_gb = mem.available / 1024 ** 3
+
+    mps_available = torch.backends.mps.is_available()
+    mps_alloc_mb = 0.0
+    if mps_available:
+        try:
+            mps_alloc_mb = torch.mps.current_allocated_memory() / 1024 ** 2
+        except Exception:
+            pass
+
+    # Sweet spot: 60% of total RAM headroom, 1.5 GB per batch step
+    mem_for_training_gb = total_gb * 0.60
+    sweet_spot = max(1, min(32, int(mem_for_training_gb / 1.5)))
+
+    # Max safe: use currently *available* RAM
+    max_safe = max(1, min(32, int(avail_gb * 0.80 / 1.5)))
+
+    return HardwareInfo(
+        total_ram_gb=round(total_gb, 1),
+        available_ram_gb=round(avail_gb, 1),
+        ram_used_pct=round(mem.percent, 1),
+        cpu_cores=psutil.cpu_count(logical=False) or 1,
+        mps_available=mps_available,
+        mps_allocated_mb=round(mps_alloc_mb, 1),
+        sweet_spot_batch_size=sweet_spot,
+        max_safe_batch_size=max_safe,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +136,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     # Look up profile
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT id, name, status, sample_path FROM profiles WHERE id = ?",
+            "SELECT id, name, status, sample_path, batch_size FROM profiles WHERE id = ?",
             (request.profile_id,),
         )
         row = await cursor.fetchone()
@@ -89,9 +150,13 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     rvc_root = os.environ.get("RVC_ROOT", "")
     if not rvc_root:
         raise HTTPException(status_code=400, detail="RVC_ROOT not set")
-    rvc_root = os.path.abspath(rvc_root)  # ensure absolute so subprocess paths resolve correctly
+    rvc_root = os.path.abspath(rvc_root)
 
-    # Derive absolute sample directory from sample_path (which is the file path)
+    # Use batch_size from request; fall back to profile's stored value
+    batch_size = request.batch_size
+    if row["batch_size"] is not None:
+        batch_size = row["batch_size"]
+
     sample_dir = os.path.dirname(os.path.abspath(row["sample_path"]))
 
     try:
@@ -101,6 +166,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
             rvc_root,
             total_epoch=request.epochs,
             save_every=request.save_every,
+            batch_size=batch_size,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
