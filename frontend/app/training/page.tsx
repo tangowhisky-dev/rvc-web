@@ -80,8 +80,17 @@ function PhaseBar({ currentPhase, jobDone }: { currentPhase: string | null; jobD
 // Batch Size Selector — slider with sweet-spot and max-safe markers
 // ---------------------------------------------------------------------------
 
-const BATCH_MIN = 1;
-const BATCH_MAX = 32;
+// Batch size must be a power of two — RVC's data loader expects 2^n
+const POW2 = [1, 2, 4, 8, 16, 32] as const;
+type Pow2 = typeof POW2[number];
+
+function nearestPow2Index(v: number): number {
+  let best = 0;
+  for (let i = 0; i < POW2.length; i++) {
+    if (POW2[i] <= v) best = i;
+  }
+  return best;
+}
 
 function BatchSizeSelector({
   value, onChange, disabled, hw,
@@ -92,23 +101,29 @@ function BatchSizeSelector({
   hw: HardwareInfo | null;
 }) {
   const sweet   = hw?.sweet_spot_batch_size ?? 8;
-  const maxSafe = hw?.max_safe_batch_size   ?? 32;
+  const maxSafe = hw?.max_safe_batch_size   ?? 16;
 
-  // Convert a batch value to 0–100% track position
-  const toPct = (v: number) => ((v - BATCH_MIN) / (BATCH_MAX - BATCH_MIN)) * 100;
+  // Slider index (0–5) → actual pow2 value
+  const idx       = nearestPow2Index(value);
+  const maxIdx    = POW2.length - 1;
+  const sweetIdx  = nearestPow2Index(sweet);
+  const safeIdx   = nearestPow2Index(maxSafe);
 
-  function statusLabel(v: number): { text: string; cls: string } | null {
-    if (v === sweet)  return { text: 'sweet spot', cls: 'bg-emerald-900/50 text-emerald-300' };
-    if (v > maxSafe)  return { text: 'risky',      cls: 'bg-red-900/50 text-red-300' };
-    if (v <= 4)       return { text: 'safe / slow', cls: 'bg-zinc-800 text-zinc-500' };
+  // Map index to 0–100% position on the track
+  const idxPct = (i: number) => (i / maxIdx) * 100;
+
+  const isRisky = idx > safeIdx;
+  const isSweet = POW2[idx] === sweet;
+  const fillColor = isRisky ? '#ef4444' : '#06b6d4';
+  const fillPct   = idxPct(idx);
+
+  function badge() {
+    if (isSweet)  return { text: 'sweet spot', cls: 'bg-emerald-900/50 text-emerald-300' };
+    if (isRisky)  return { text: 'risky',      cls: 'bg-red-900/50 text-red-300' };
+    if (idx <= 1) return { text: 'safe / slow', cls: 'bg-zinc-800 text-zinc-400' };
     return null;
   }
-
-  const status      = statusLabel(value);
-  const fillColor   = value > maxSafe ? '#ef4444' : '#06b6d4';
-  const fillPct     = toPct(value);
-  const sweetPct    = toPct(Math.min(sweet, BATCH_MAX));
-  const maxSafePct  = toPct(Math.min(maxSafe, BATCH_MAX));
+  const b = badge();
 
   return (
     <div className="flex flex-col gap-3">
@@ -127,12 +142,12 @@ function BatchSizeSelector({
 
       {/* Slider row */}
       <div className="flex items-center gap-4">
-        {/* Track wrapper — markers sit relative to this */}
         <div className="relative flex-1 pt-5">
+
           {/* Sweet-spot pin */}
           <div
             className="absolute top-0 -translate-x-1/2 flex flex-col items-center gap-0.5 pointer-events-none"
-            style={{ left: `${sweetPct}%` }}
+            style={{ left: `${idxPct(sweetIdx)}%` }}
           >
             <span className="text-[9px] font-mono text-emerald-400 whitespace-nowrap leading-none">
               {sweet}
@@ -140,45 +155,59 @@ function BatchSizeSelector({
             <div className="w-1 h-1 rounded-full bg-emerald-500" />
           </div>
 
-          {/* Max-safe boundary line */}
-          {maxSafe < BATCH_MAX && (
+          {/* Max-safe boundary line — only shown when not already at max */}
+          {safeIdx < maxIdx && (
             <div
               className="absolute top-3.5 bottom-0 w-px bg-amber-500/40 pointer-events-none"
-              style={{ left: `${maxSafePct}%` }}
+              style={{ left: `${idxPct(safeIdx)}%` }}
             />
           )}
 
+          {/* The slider moves by index; snap to POW2 on change */}
           <input
             type="range"
-            min={BATCH_MIN}
-            max={BATCH_MAX}
+            min={0}
+            max={maxIdx}
             step={1}
-            value={value}
+            value={idx}
             disabled={disabled}
-            onChange={(e) => onChange(Number(e.target.value))}
+            onChange={(e) => onChange(POW2[Number(e.target.value)])}
             className="w-full h-1.5 rounded-full appearance-none cursor-pointer
                        disabled:opacity-40 disabled:cursor-not-allowed"
             style={{
               accentColor: fillColor,
-              background: `linear-gradient(to right,
-                ${fillColor} ${fillPct}%,
-                #27272a ${fillPct}%)`,
+              background: `linear-gradient(to right, ${fillColor} ${fillPct}%, #27272a ${fillPct}%)`,
             }}
           />
+
+          {/* Tick marks — one per POW2 value */}
+          <div className="flex justify-between mt-1 pointer-events-none">
+            {POW2.map((p, i) => (
+              <span
+                key={p}
+                className={`text-[9px] font-mono -translate-x-1/2 ${
+                  i === idx ? (isRisky ? 'text-red-400' : isSweet ? 'text-emerald-400' : 'text-zinc-200')
+                  : i <= idx ? 'text-zinc-500'
+                  : 'text-zinc-700'
+                }`}
+                style={{ width: 0, textAlign: 'center', display: 'inline-block' }}
+              >
+                {p}
+              </span>
+            ))}
+          </div>
         </div>
 
-        {/* Value + status badge */}
+        {/* Value + badge */}
         <div className="flex items-center gap-2 shrink-0">
-          <span className={`text-2xl font-mono font-bold tabular-nums w-8 text-right ${
-            value > maxSafe ? 'text-red-400'
-            : value === sweet ? 'text-emerald-400'
-            : 'text-zinc-100'
+          <span className={`text-2xl font-mono font-bold tabular-nums w-10 text-right ${
+            isRisky ? 'text-red-400' : isSweet ? 'text-emerald-400' : 'text-zinc-100'
           }`}>
-            {value}
+            {POW2[idx]}
           </span>
-          {status && (
-            <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wide font-mono ${status.cls}`}>
-              {status.text}
+          {b && (
+            <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wide font-mono ${b.cls}`}>
+              {b.text}
             </span>
           )}
         </div>
@@ -191,13 +220,11 @@ function BatchSizeSelector({
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block shrink-0" />
             sweet spot: <span className="text-emerald-400 ml-0.5">{sweet}</span>
           </span>
-          {maxSafe < BATCH_MAX && (
-            <span className="flex items-center gap-1.5">
-              <span className="w-px h-3 bg-amber-500/60 inline-block shrink-0" />
-              max safe now: <span className={`ml-0.5 ${value > maxSafe ? 'text-amber-400' : 'text-zinc-500'}`}>{maxSafe}</span>
-            </span>
-          )}
-          <span className="ml-auto">{BATCH_MIN}–{BATCH_MAX}</span>
+          <span className="flex items-center gap-1.5">
+            <span className="w-px h-3 bg-amber-500/60 inline-block shrink-0" />
+            max safe: <span className="text-zinc-400 ml-0.5">{maxSafe}</span>
+            {isRisky && <span className="text-red-400 ml-1">↑ over limit</span>}
+          </span>
         </div>
       )}
     </div>
@@ -251,7 +278,7 @@ export default function TrainingPage() {
           const hwData: HardwareInfo = await hwRes.json();
           if (!cancelled) {
             setHw(hwData);
-            setBatchSize(Math.min(hwData.sweet_spot_batch_size, BATCH_MAX));
+            setBatchSize(hwData.sweet_spot_batch_size);
           }
         }
       } catch (err) {

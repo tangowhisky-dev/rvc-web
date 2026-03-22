@@ -95,12 +95,23 @@ async def get_hardware() -> HardwareInfo:
         except Exception:
             pass
 
-    # Sweet spot: 60% of total RAM headroom, 1.5 GB per batch step
-    mem_for_training_gb = total_gb * 0.60
-    sweet_spot = max(1, min(32, int(mem_for_training_gb / 1.5)))
+    # All batch sizes must be powers of two — RVC's data loader and gradient
+    # accumulation behave correctly only on 2^n values.
+    POW2 = [1, 2, 4, 8, 16, 32]
 
-    # Max safe: use currently *available* RAM
-    max_safe = max(1, min(32, int(avail_gb * 0.80 / 1.5)))
+    def nearest_pow2(x: float) -> int:
+        """Largest power-of-two that does not exceed x, clamped to [1, 32]."""
+        best = 1
+        for p in POW2:
+            if p <= x:
+                best = p
+        return best
+
+    # Sweet spot: 60% of total RAM, ~1.5 GB per batch (model + grads + cache)
+    sweet_spot = nearest_pow2(total_gb * 0.60 / 1.5)
+
+    # Max safe: 80% of *currently available* RAM — must be ≥ sweet_spot
+    max_safe = max(sweet_spot, nearest_pow2(avail_gb * 0.80 / 1.5))
 
     return HardwareInfo(
         total_ram_gb=round(total_gb, 1),
