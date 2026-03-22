@@ -55,11 +55,6 @@ class ProfileOut(BaseModel):
     preprocessed_path: Optional[str] = None
 
 
-class PreprocessRequest(BaseModel):
-    start_sec: float = 0.0
-    end_sec: Optional[float] = None
-
-
 class PreprocessResponse(BaseModel):
     ok: bool
     message: str
@@ -99,14 +94,18 @@ def _row_to_out(row) -> ProfileOut:
 async def create_profile(
     name: str = Form(...),
     file: UploadFile = ...,
+    seg_start: float = Form(0.0),
+    seg_end: Optional[float] = Form(None),
 ) -> ProfileOut:
-    """Upload an audio file and create a voice profile record.
+    """Upload an audio file, clip to the selected segment, and create a profile.
 
     Enforces:
       - 200 MiB upload cap (byte-level, before duration check)
-      - 30-minute duration cap (after write — checked via torchaudio header)
+      - 30-minute duration cap on the full file
 
-    On success the profile is stored with status='untrained'.
+    The selected segment (seg_start..seg_end) is clipped and saved as
+    ``sample.wav`` — that file becomes sample_path.  Noise removal later runs
+    on sample.wav without needing to know the original segment boundaries.
     """
     profile_id = uuid.uuid4().hex
     samples_root = _samples_root()
@@ -149,6 +148,30 @@ async def create_profile(
             detail=f"Audio is {duration/60:.1f} min — max allowed is 30 min",
         )
 
+    # Clip to selected segment and save as sample.wav
+    from backend.app.audio_preprocessing import remove_noise  # noqa: PLC0415 — clip-only call
+    import soundfile as sf  # noqa: PLC0415
+    import numpy as np      # noqa: PLC0415
+
+    clip_path = os.path.join(dest_dir, "sample.wav")
+    end_for_clip = seg_end if seg_end is not None else duration
+    clip_dur: Optional[float] = None
+
+    try:
+        raw, sr = sf.read(dest_path, always_2d=True, dtype="float32")
+        s_frame = int(round((seg_start or 0.0) * sr))
+        e_frame = int(round(end_for_clip * sr)) if end_for_clip is not None else raw.shape[0]
+        s_frame = max(0, min(s_frame, raw.shape[0]))
+        e_frame = max(s_frame, min(e_frame, raw.shape[0]))
+        clipped = raw[s_frame:e_frame, :]
+        sf.write(clip_path, clipped, sr, subtype="PCM_16")
+        clip_dur = round(clipped.shape[0] / sr, 3)
+        sample_path_final = clip_path
+    except Exception as exc:
+        logger.warning("clip failed (%s) — keeping original: %s", dest_path, exc)
+        sample_path_final = dest_path
+        clip_dur = duration
+
     created_at = datetime.now(timezone.utc).isoformat()
 
     async with get_db() as db:
@@ -156,20 +179,21 @@ async def create_profile(
             """INSERT INTO profiles
                (id, name, status, sample_path, batch_size, audio_duration, preprocessed_path, created_at)
                VALUES (?, ?, 'untrained', ?, 8, ?, NULL, ?)""",
-            (profile_id, name, dest_path, duration, created_at),
+            (profile_id, name, sample_path_final, clip_dur, created_at),
         )
         await db.commit()
 
-    logger.info("profile created id=%s name=%s duration=%.1fs", profile_id, name, duration or 0)
+    logger.info("profile created id=%s name=%s clip=%.1f–%.1fs dur=%.1fs",
+                profile_id, name, seg_start or 0.0, end_for_clip or 0.0, clip_dur or 0)
 
     return ProfileOut(
         id=profile_id,
         name=name,
         status="untrained",
         created_at=created_at,
-        sample_path=dest_path,
+        sample_path=sample_path_final,
         batch_size=8,
-        audio_duration=duration,
+        audio_duration=clip_dur,
         preprocessed_path=None,
     )
 
@@ -235,19 +259,15 @@ async def delete_profile(profile_id: str) -> Response:
 # ---------------------------------------------------------------------------
 
 @router.post("/{profile_id}/preprocess", response_model=PreprocessResponse)
-async def preprocess_audio(
-    profile_id: str,
-    req: PreprocessRequest,
-) -> PreprocessResponse:
-    """Run noise removal on the selected segment of the profile's audio file.
+async def preprocess_audio(profile_id: str) -> PreprocessResponse:
+    """Run noise removal on the profile's audio sample.
 
-    The cleaned audio is saved as ``cleaned.wav`` in the profile's sample dir.
-    The profile's ``preprocessed_path`` DB column is updated on success.
+    The sample_path is already clipped to the selected segment at upload time.
+    This endpoint just denoises the whole sample and saves cleaned.wav.
     """
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT sample_path, audio_duration FROM profiles WHERE id = ?",
-            (profile_id,),
+            "SELECT sample_path FROM profiles WHERE id = ?", (profile_id,)
         )
         row = await cursor.fetchone()
 
@@ -258,38 +278,16 @@ async def preprocess_audio(
     if not input_path or not os.path.exists(input_path):
         raise HTTPException(status_code=400, detail="No audio file on disk for this profile")
 
-    # Validate selected segment length
-    total_dur = row["audio_duration"] or 0.0
-    start = req.start_sec
-    end   = req.end_sec if req.end_sec is not None else total_dur
-    seg_len = end - start
-
-    MIN_SEG = 10 * 60   # 10 minutes
-    MAX_SEG = 15 * 60   # 15 minutes
-
-    if seg_len < MIN_SEG:
-        return PreprocessResponse(
-            ok=False,
-            message=f"Selected segment is {seg_len/60:.1f} min — minimum is 10 min",
-        )
-    if seg_len > MAX_SEG:
-        return PreprocessResponse(
-            ok=False,
-            message=f"Selected segment is {seg_len/60:.1f} min — maximum is 15 min",
-        )
-
-    # Output path
     out_dir  = os.path.dirname(input_path)
     out_path = os.path.join(out_dir, "cleaned.wav")
 
-    # Run noise removal in thread pool so we don't block the event loop
     from backend.app.audio_preprocessing import remove_noise  # noqa: PLC0415
 
     loop = asyncio.get_event_loop()
     try:
         await loop.run_in_executor(
             None,
-            lambda: remove_noise(input_path, out_path, start, end),
+            lambda: remove_noise(input_path, out_path),
         )
     except RuntimeError as exc:
         return PreprocessResponse(ok=False, message=str(exc))

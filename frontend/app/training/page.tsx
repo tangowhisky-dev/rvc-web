@@ -58,10 +58,14 @@ function PhaseBar({ currentPhase, jobDone }: { currentPhase: string | null; jobD
     <div className="flex gap-1.5">
       {PHASES.map((p, i) => {
         let cls: string;
-        if (p === active && p === 'done')    cls = 'bg-emerald-700 text-emerald-100 shadow-[0_0_8px_rgba(16,185,129,0.4)]';
-        else if (p === active)               cls = 'bg-cyan-600 text-white shadow-[0_0_8px_rgba(8,145,178,0.5)]';
-        else if (i < (activeIdx < 0 ? 0 : activeIdx)) cls = 'bg-zinc-700 text-zinc-400';
-        else                                 cls = 'bg-zinc-900 text-zinc-600 border border-zinc-800';
+        if (p === active && p === 'done')
+          cls = 'bg-emerald-700 text-emerald-100 shadow-[0_0_8px_rgba(16,185,129,0.4)]';
+        else if (p === active)
+          cls = 'bg-cyan-600 text-white shadow-[0_0_8px_rgba(8,145,178,0.5)]';
+        else if (i < (activeIdx < 0 ? 0 : activeIdx))
+          cls = 'bg-zinc-700 text-zinc-400';
+        else
+          cls = 'bg-zinc-900 text-zinc-600 border border-zinc-800';
         return (
           <div key={p} className={`flex-1 py-1.5 rounded text-center text-[10px] font-mono font-medium uppercase tracking-wider transition-all ${cls}`}>
             {PHASE_LABELS[p]}
@@ -73,8 +77,11 @@ function PhaseBar({ currentPhase, jobDone }: { currentPhase: string | null; jobD
 }
 
 // ---------------------------------------------------------------------------
-// Batch Size Selector
+// Batch Size Selector — slider with sweet-spot and max-safe markers
 // ---------------------------------------------------------------------------
+
+const BATCH_MIN = 1;
+const BATCH_MAX = 32;
 
 function BatchSizeSelector({
   value, onChange, disabled, hw,
@@ -84,92 +91,113 @@ function BatchSizeSelector({
   disabled: boolean;
   hw: HardwareInfo | null;
 }) {
-  const sweet = hw?.sweet_spot_batch_size ?? 8;
-  const maxSafe = hw?.max_safe_batch_size ?? 32;
+  const sweet   = hw?.sweet_spot_batch_size ?? 8;
+  const maxSafe = hw?.max_safe_batch_size   ?? 32;
 
-  // Candidate batch sizes to show as quick-select pills
-  const PRESETS = [1, 2, 4, 6, 8, 12, 16, 24, 32];
+  // Convert a batch value to 0–100% track position
+  const toPct = (v: number) => ((v - BATCH_MIN) / (BATCH_MAX - BATCH_MIN)) * 100;
 
-  function label(v: number) {
-    if (v === sweet) return 'sweet spot';
-    if (v > maxSafe) return 'risky';
-    if (v <= 4)      return 'safe / slow';
-    return '';
+  function statusLabel(v: number): { text: string; cls: string } | null {
+    if (v === sweet)  return { text: 'sweet spot', cls: 'bg-emerald-900/50 text-emerald-300' };
+    if (v > maxSafe)  return { text: 'risky',      cls: 'bg-red-900/50 text-red-300' };
+    if (v <= 4)       return { text: 'safe / slow', cls: 'bg-zinc-800 text-zinc-500' };
+    return null;
   }
 
-  function pillColor(v: number) {
-    if (v === sweet)  return 'border-emerald-500/60 bg-emerald-900/30 text-emerald-300';
-    if (v > maxSafe)  return 'border-red-700/50 bg-red-950/30 text-red-400';
-    if (v === value)  return 'border-cyan-500/60 bg-cyan-900/30 text-cyan-300';
-    return 'border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-500';
-  }
+  const status      = statusLabel(value);
+  const fillColor   = value > maxSafe ? '#ef4444' : '#06b6d4';
+  const fillPct     = toPct(value);
+  const sweetPct    = toPct(Math.min(sweet, BATCH_MAX));
+  const maxSafePct  = toPct(Math.min(maxSafe, BATCH_MAX));
 
   return (
     <div className="flex flex-col gap-3">
+      {/* Label row */}
       <div className="flex items-center justify-between">
         <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-1.5">
           <span className="text-cyan-400">▦</span> Batch Size
         </label>
         {hw && (
           <span className="text-[10px] font-mono text-zinc-500">
-            {hw.total_ram_gb} GB RAM · {hw.available_ram_gb} GB free · {hw.ram_used_pct}% used
+            {hw.total_ram_gb} GB RAM · {hw.available_ram_gb} GB free
             {hw.mps_available && ' · MPS ✓'}
           </span>
         )}
       </div>
 
-      {/* Preset pills */}
-      <div className="flex flex-wrap gap-1.5">
-        {PRESETS.map((v) => (
-          <button
-            key={v}
-            disabled={disabled}
-            onClick={() => onChange(v)}
-            className={`relative px-3 py-1.5 rounded-md border text-[12px] font-mono transition-all
-                        disabled:opacity-40 disabled:cursor-not-allowed
-                        ${v === value ? 'ring-1 ring-cyan-500/40' : ''}
-                        ${pillColor(v)}`}
+      {/* Slider row */}
+      <div className="flex items-center gap-4">
+        {/* Track wrapper — markers sit relative to this */}
+        <div className="relative flex-1 pt-5">
+          {/* Sweet-spot pin */}
+          <div
+            className="absolute top-0 -translate-x-1/2 flex flex-col items-center gap-0.5 pointer-events-none"
+            style={{ left: `${sweetPct}%` }}
           >
-            {v}
-            {v === sweet && (
-              <span className="absolute -top-1.5 -right-1.5 w-3 h-3 rounded-full bg-emerald-500 
-                               flex items-center justify-center">
-                <svg width="7" height="7" viewBox="0 0 8 8" fill="none">
-                  <path d="M1.5 4L3 5.5L6.5 2" stroke="white" strokeWidth="1.2" strokeLinecap="round"/>
-                </svg>
-              </span>
-            )}
-          </button>
-        ))}
+            <span className="text-[9px] font-mono text-emerald-400 whitespace-nowrap leading-none">
+              {sweet}
+            </span>
+            <div className="w-1 h-1 rounded-full bg-emerald-500" />
+          </div>
 
-        {/* Custom input for values not in presets */}
-        <input
-          type="number"
-          min={1} max={64}
-          value={value}
-          disabled={disabled}
-          onChange={(e) => onChange(Math.max(1, Math.min(64, Number(e.target.value))))}
-          className="w-16 px-2 py-1.5 rounded-md border border-zinc-700 bg-zinc-900 text-[12px]
-                     font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
-                     disabled:opacity-40 disabled:cursor-not-allowed"
-        />
-      </div>
+          {/* Max-safe boundary line */}
+          {maxSafe < BATCH_MAX && (
+            <div
+              className="absolute top-3.5 bottom-0 w-px bg-amber-500/40 pointer-events-none"
+              style={{ left: `${maxSafePct}%` }}
+            />
+          )}
 
-      {/* Hint line */}
-      {hw && (
-        <div className="text-[11px] font-mono flex items-center gap-2">
-          <span className="w-2 h-2 rounded-full bg-emerald-500 flex-shrink-0" />
-          <span className="text-zinc-500">
-            Sweet spot for your hardware:{' '}
-            <span className="text-emerald-400 font-semibold">{sweet}</span>
-            {' '}(max safe right now: <span className={maxSafe < sweet ? 'text-amber-400' : 'text-zinc-400'}>{maxSafe}</span>)
+          <input
+            type="range"
+            min={BATCH_MIN}
+            max={BATCH_MAX}
+            step={1}
+            value={value}
+            disabled={disabled}
+            onChange={(e) => onChange(Number(e.target.value))}
+            className="w-full h-1.5 rounded-full appearance-none cursor-pointer
+                       disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{
+              accentColor: fillColor,
+              background: `linear-gradient(to right,
+                ${fillColor} ${fillPct}%,
+                #27272a ${fillPct}%)`,
+            }}
+          />
+        </div>
+
+        {/* Value + status badge */}
+        <div className="flex items-center gap-2 shrink-0">
+          <span className={`text-2xl font-mono font-bold tabular-nums w-8 text-right ${
+            value > maxSafe ? 'text-red-400'
+            : value === sweet ? 'text-emerald-400'
+            : 'text-zinc-100'
+          }`}>
+            {value}
           </span>
-          {label(value) && (
-            <span className={`ml-auto px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide
-              ${value > maxSafe ? 'bg-red-900/40 text-red-300' : value === sweet ? 'bg-emerald-900/40 text-emerald-300' : 'bg-zinc-800 text-zinc-500'}`}>
-              {label(value)}
+          {status && (
+            <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wide font-mono ${status.cls}`}>
+              {status.text}
             </span>
           )}
+        </div>
+      </div>
+
+      {/* Legend */}
+      {hw && (
+        <div className="flex items-center gap-5 text-[10px] font-mono text-zinc-600">
+          <span className="flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block shrink-0" />
+            sweet spot: <span className="text-emerald-400 ml-0.5">{sweet}</span>
+          </span>
+          {maxSafe < BATCH_MAX && (
+            <span className="flex items-center gap-1.5">
+              <span className="w-px h-3 bg-amber-500/60 inline-block shrink-0" />
+              max safe now: <span className={`ml-0.5 ${value > maxSafe ? 'text-amber-400' : 'text-zinc-500'}`}>{maxSafe}</span>
+            </span>
+          )}
+          <span className="ml-auto">{BATCH_MIN}–{BATCH_MAX}</span>
         </div>
       )}
     </div>
@@ -214,16 +242,16 @@ export default function TrainingPage() {
           fetch(`${API}/api/training/hardware`),
         ]);
         if (!pRes.ok) throw new Error(`HTTP ${pRes.status}`);
-        const profiles: Profile[] = await pRes.json();
+        const data: Profile[] = await pRes.json();
         if (cancelled) return;
-        setProfiles(profiles);
-        if (profiles.length) setSelectedId(profiles[0].id);
+        setProfiles(data);
+        if (data.length) setSelectedId(data[0].id);
 
         if (hwRes.ok) {
           const hwData: HardwareInfo = await hwRes.json();
           if (!cancelled) {
             setHw(hwData);
-            setBatchSize(hwData.sweet_spot_batch_size);
+            setBatchSize(Math.min(hwData.sweet_spot_batch_size, BATCH_MAX));
           }
         }
       } catch (err) {
@@ -277,7 +305,6 @@ export default function TrainingPage() {
         try {
           const msg = JSON.parse(ev.data as string) as TrainingMsg;
           if (msg.phase && msg.type !== 'done') setCurrentPhase(msg.phase);
-
           if (msg.type === 'log') {
             if (msg.message) appendLog(msg.message);
           } else if (msg.type === 'phase') {
@@ -368,7 +395,9 @@ export default function TrainingPage() {
           <div className={`w-2 h-2 rounded-full transition-colors ${
             isRunning ? 'bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.6)] animate-pulse'
             : jobState === 'done' ? 'bg-emerald-400'
-            : jobState === 'failed' ? 'bg-red-400' : 'bg-zinc-600'}`}/>
+            : jobState === 'failed' ? 'bg-red-400'
+            : 'bg-zinc-600'
+          }`} />
           <span className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
             {isRunning ? 'training' : jobState === 'done' ? 'done' : jobState === 'failed' ? 'failed' : 'idle'}
           </span>
@@ -409,7 +438,8 @@ export default function TrainingPage() {
                   >
                     {profiles.map((p) => (
                       <option key={p.id} value={p.id}>
-                        {p.name}{p.status === 'trained' ? ' ✓' : p.status === 'training' ? ' ⟳' : p.status === 'failed' ? ' ✗' : ''}
+                        {p.name}
+                        {p.status === 'trained' ? ' ✓' : p.status === 'training' ? ' ⟳' : p.status === 'failed' ? ' ✗' : ''}
                       </option>
                     ))}
                   </select>
@@ -431,7 +461,7 @@ export default function TrainingPage() {
               </div>
             </div>
 
-            {/* Batch size selector */}
+            {/* Batch size slider */}
             <div className="border-t border-zinc-800/60 pt-4">
               <BatchSizeSelector
                 value={batchSize}
@@ -481,15 +511,17 @@ export default function TrainingPage() {
               <span className="text-[10px] font-mono text-zinc-600">{logLines.length} lines</span>
             )}
           </div>
-          <div ref={logRef}
-            className="overflow-y-auto max-h-80 bg-zinc-950 rounded-lg p-3 font-mono text-[11px] border border-zinc-800">
+          <div
+            ref={logRef}
+            className="overflow-y-auto max-h-80 bg-zinc-950 rounded-lg p-3 font-mono text-[11px] border border-zinc-800"
+          >
             {logLines.length === 0 ? (
               <div className="text-zinc-600 select-none">
                 {isRunning ? 'Waiting for log output…' : 'No training output yet. Start a job to see logs.'}
               </div>
             ) : logLines.map((line, i) => {
               const m = line.match(/^(\[\d{2}:\d{2}:\d{2}\]) ([\s\S]*)$/);
-              const ts = m ? m[1] : null;
+              const ts      = m ? m[1] : null;
               const content = m ? m[2] : line;
               const isError = content.startsWith('ERROR:') || content.startsWith('[stderr]');
               const isMuted = content.startsWith('(');
@@ -497,8 +529,11 @@ export default function TrainingPage() {
               const isEpoch = content.startsWith('✓');
               return (
                 <div key={i} className={`leading-relaxed whitespace-pre-wrap break-all flex gap-2 ${
-                  isError ? 'text-red-400' : isMuted ? 'text-zinc-500 italic'
-                  : isPhase ? 'text-cyan-400 font-medium' : isEpoch ? 'text-emerald-400' : 'text-zinc-300'
+                  isError ? 'text-red-400'
+                  : isMuted ? 'text-zinc-500 italic'
+                  : isPhase ? 'text-cyan-400 font-medium'
+                  : isEpoch ? 'text-emerald-400'
+                  : 'text-zinc-300'
                 }`}>
                   {ts && <span className="shrink-0 text-zinc-600 select-none">{ts}</span>}
                   <span>{content}</span>

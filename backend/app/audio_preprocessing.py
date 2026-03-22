@@ -55,7 +55,7 @@ def remove_noise(
     file is used.
 
     Args:
-        input_path:  Source audio file (any format torchaudio can read).
+        input_path:  Source audio file (any format soundfile can read: MP3, WAV, FLAC, OGG).
         output_path: Destination WAV file path.
         start_sec:   Start of the selected segment in seconds.
         end_sec:     End of the selected segment, or None for end of file.
@@ -65,14 +65,13 @@ def remove_noise(
     """
     import noisereduce as nr  # noqa: PLC0415
 
-    # --- load ---
+    # --- load via soundfile (handles MP3/WAV/FLAC/OGG without torchcodec) ---
     try:
-        import torchaudio  # noqa: PLC0415
-        waveform, sr = torchaudio.load(input_path)   # [C, N] float32 [-1,1]
+        raw, sr = sf.read(input_path, always_2d=True, dtype="float32")  # [N, C]
     except Exception as exc:
         raise RuntimeError(f"Could not load audio: {exc}") from exc
 
-    total_frames = waveform.shape[1]
+    total_frames = raw.shape[0]
 
     # --- slice ---
     start_frame = int(round(start_sec * sr))
@@ -80,14 +79,14 @@ def remove_noise(
     start_frame = max(0, min(start_frame, total_frames))
     end_frame   = max(start_frame, min(end_frame, total_frames))
 
-    sliced = waveform[:, start_frame:end_frame]   # [C, N']
+    sliced = raw[start_frame:end_frame, :]        # [N', C]
 
     # --- to numpy mono float32 ---
-    audio_np = sliced.mean(dim=0).numpy()         # [N']
+    audio_np = sliced.mean(axis=1)                # [N']
 
     # --- build noise profile from first 0.5 s of the file ---
     noise_frames = min(int(0.5 * sr), total_frames)
-    noise_profile = waveform[:, :noise_frames].mean(dim=0).numpy()
+    noise_profile = raw[:noise_frames, :].mean(axis=1)
 
     # --- noise reduction ---
     try:
