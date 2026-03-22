@@ -502,6 +502,15 @@ async def _run_pipeline(
     train_env["MASTER_PORT"] = str(master_port)
     # save_small_model calls model_hash_ckpt → Pipeline.__init__ which needs rmvpe_root
     train_env["rmvpe_root"] = os.path.join(rvc_root, "assets", "rmvpe")
+    # MPS memory tuning for Apple Silicon.
+    # High watermark 0.0 = no limit (MPS manages all of unified memory).
+    # This avoids spurious OOM kills on 48GB machines where the allocator
+    # would otherwise cap itself at a fraction of available memory.
+    # PYTORCH_MPS_PREFER_SHARED_MEMORY keeps tensors in shared (CPU-visible)
+    # memory, reducing copy overhead for host-device transfers during checkpoint
+    # saves and gradient norm computation.
+    train_env.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+    train_env.setdefault("PYTORCH_MPS_PREFER_SHARED_MEMORY", "1")
 
     train_args = [
         python,
