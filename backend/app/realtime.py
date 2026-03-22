@@ -157,10 +157,11 @@ class RealtimeManager:
             rvc_root = os.environ.get("RVC_ROOT", "Retrieval-based-Voice-Conversion-WebUI")
         rvc_root = os.path.abspath(rvc_root)
 
-        # Validate profile in DB
+        # Validate profile in DB and fetch artifact paths
         async with get_db() as db:
             row = await db.execute_fetchall(
-                "SELECT id, status FROM profiles WHERE id = ?",
+                """SELECT id, status, model_path, index_path, profile_dir
+                   FROM profiles WHERE id = ?""",
                 (profile_id,),
             )
         if not row:
@@ -168,6 +169,20 @@ class RealtimeManager:
         profile_status = row[0][1]
         if profile_status != "trained":
             raise ValueError(f"profile_not_trained:{profile_status}")
+
+        # Resolve model and index paths from DB (new layout) with legacy fallback
+        db_model_path: Optional[str] = row[0][2] or None
+        db_index_path: Optional[str] = row[0][3] or None
+        stored_profile_dir: Optional[str] = row[0][4] or None
+
+        # Check for per-profile canonical paths first
+        if stored_profile_dir:
+            candidate_model = os.path.join(stored_profile_dir, "model.pth")
+            candidate_index = os.path.join(stored_profile_dir, "model.index")
+            if os.path.exists(candidate_model):
+                db_model_path = candidate_model
+            if os.path.exists(candidate_index):
+                db_index_path = candidate_index
 
         # Spawn the worker
         ctx = multiprocessing.get_context("spawn")
@@ -192,6 +207,8 @@ class RealtimeManager:
                 protect=protect,
                 silence_threshold_db=silence_threshold_db,
                 save_path=save_path,
+                model_path=db_model_path,
+                index_path=db_index_path,
             ),
             daemon=True,
         )

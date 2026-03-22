@@ -16,6 +16,20 @@ interface Profile {
   sample_path: string;
   audio_duration: number | null;
   preprocessed_path: string | null;
+  model_path: string | null;
+  index_path: string | null;
+  profile_dir: string | null;
+}
+
+interface HealthStatus {
+  profile_id: string;
+  audio_ok: boolean;
+  preprocessed_ok: boolean;
+  model_ok: boolean;
+  index_ok: boolean;
+  can_train: boolean;
+  can_infer: boolean;
+  errors: string[];
 }
 
 interface RealtimeStatus { active: boolean; }
@@ -46,6 +60,19 @@ function StatusBadge({ status }: { status: string }) {
   return (
     <span className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-mono uppercase tracking-wider ${cls[status] ?? 'bg-zinc-700 text-zinc-400'}`}>
       {status}
+    </span>
+  );
+}
+
+function HealthPill({ ok, label, loading }: { ok: boolean; label: string; loading: boolean }) {
+  if (loading) return null;
+  return (
+    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono border ${
+      ok
+        ? 'bg-emerald-950/40 border-emerald-800/50 text-emerald-400'
+        : 'bg-red-950/40 border-red-800/50 text-red-400'
+    }`}>
+      {ok ? '✓' : '✗'} {label}
     </span>
   );
 }
@@ -564,6 +591,20 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
   const origAudioRef  = useRef<HTMLAudioElement | null>(null);
   const cleanAudioRef = useRef<HTMLAudioElement | null>(null);
 
+  // Health check state — loaded async on mount
+  const [health, setHealth]           = useState<HealthStatus | null>(null);
+  const [healthLoading, setHealthLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setHealthLoading(true);
+    fetch(`${API}/api/profiles/${profile.id}/health`)
+      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+      .then((h: HealthStatus) => { if (!cancelled) { setHealth(h); setHealthLoading(false); } })
+      .catch(() => { if (!cancelled) setHealthLoading(false); });
+    return () => { cancelled = true; };
+  }, [profile.id, profile.status]);
+
   function stopAllAudio() {
     origAudioRef.current?.pause();
     cleanAudioRef.current?.pause();
@@ -607,7 +648,6 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
     setPreprocessMsg(null);
     setPreprocessOk(null);
     try {
-      // No body — endpoint processes the already-clipped sample_path
       const res = await fetch(`${API}/api/profiles/${profile.id}/preprocess`, {
         method: 'POST',
       });
@@ -642,8 +682,16 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
     }
   }
 
+  // Derived health display
+  const hasErrors = health && health.errors.length > 0;
+  const isCorrupted = health && !health.can_train && !health.can_infer && profile.status !== 'untrained';
+
   return (
-    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden">
+    <div className={`rounded-xl border overflow-hidden ${
+      hasErrors
+        ? 'border-red-800/60 bg-zinc-900/60'
+        : 'border-zinc-800 bg-zinc-900/60'
+    }`}>
       {/* Header */}
       <div className="px-5 py-4 flex items-center justify-between gap-4">
         <div className="flex flex-col gap-1 min-w-0">
@@ -652,6 +700,17 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
               {profile.name}
             </span>
             <StatusBadge status={profile.status} />
+
+            {/* Health indicators */}
+            {!healthLoading && health && (
+              <div className="flex items-center gap-1.5">
+                <HealthPill ok={health.can_train} label="train" loading={false} />
+                <HealthPill ok={health.can_infer} label="infer" loading={false} />
+              </div>
+            )}
+            {healthLoading && (
+              <span className="text-[10px] font-mono text-zinc-600 animate-pulse">checking…</span>
+            )}
           </div>
           <div className="flex items-center gap-3 text-[11px] font-mono text-zinc-500">
             <span>{profile.id.slice(0, 12)}…</span>
@@ -660,6 +719,11 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
             )}
             {profile.preprocessed_path && (
               <span className="text-emerald-500">✓ noise removed</span>
+            )}
+            {profile.profile_dir && (
+              <span title={profile.profile_dir} className="text-zinc-600 max-w-[200px] truncate">
+                📁 {profile.profile_dir.split('/').slice(-2).join('/')}
+              </span>
             )}
           </div>
         </div>
@@ -693,11 +757,37 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
         </div>
       </div>
 
+      {/* Health error strip — shown when files are missing */}
+      {health && health.errors.length > 0 && (
+        <div className="border-t border-red-800/40 bg-red-950/20 px-5 py-2.5 flex flex-col gap-1">
+          <span className="text-[10px] font-mono uppercase tracking-widest text-red-400 font-semibold">
+            ⚠ Profile integrity issues
+          </span>
+          {health.errors.map((err, i) => (
+            <span key={i} className="text-[11px] font-mono text-red-300/80">
+              · {err}
+            </span>
+          ))}
+          {!health.can_train && (
+            <span className="text-[10px] font-mono text-zinc-500 mt-0.5">
+              Training unavailable — audio file missing.
+              Re-upload audio to restore this profile.
+            </span>
+          )}
+          {health.can_train && !health.can_infer && (
+            <span className="text-[10px] font-mono text-zinc-500 mt-0.5">
+              Inference unavailable — model or index missing. Run training to generate them.
+            </span>
+          )}
+        </div>
+      )}
+
       {/* Noise removal strip */}
       <div className="border-t border-zinc-800 px-5 py-3 flex items-center gap-4">
         <button
           onClick={handlePreprocess}
-          disabled={preprocessing}
+          disabled={preprocessing || (health !== null && !health.can_train)}
+          title={health && !health.can_train ? 'Audio file missing — cannot preprocess' : undefined}
           className="px-4 py-2 rounded-lg font-mono text-[12px] font-medium uppercase tracking-wide
                      bg-indigo-900/40 border border-indigo-600/40 text-indigo-300
                      hover:bg-indigo-800/40 hover:border-indigo-500/60 transition-all

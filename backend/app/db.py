@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     created_at        TEXT NOT NULL,
     batch_size        INTEGER NOT NULL DEFAULT 8,
     audio_duration    REAL,
-    preprocessed_path TEXT
+    preprocessed_path TEXT,
+    profile_dir       TEXT
 )
 """
 
@@ -36,6 +37,7 @@ _MIGRATIONS: list[tuple[str, str]] = [
     ("batch_size",        "INTEGER NOT NULL DEFAULT 8"),
     ("audio_duration",    "REAL"),
     ("preprocessed_path", "TEXT"),
+    ("profile_dir",       "TEXT"),
 ]
 
 
@@ -45,12 +47,12 @@ async def init_db() -> None:
     Safe to call multiple times — all operations are idempotent.
     Creates:
       - backend/data/      (SQLite DB directory)
-      - data/samples/      (uploaded audio storage root)
+      - data/profiles/     (per-profile storage root)
       - profiles table     (CREATE TABLE IF NOT EXISTS)
       - applies _MIGRATIONS for any columns missing from an existing table
     """
     os.makedirs("backend/data", exist_ok=True)
-    os.makedirs("data/samples", exist_ok=True)
+    os.makedirs("data/profiles", exist_ok=True)
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(_CREATE_PROFILES)

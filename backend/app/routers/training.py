@@ -147,7 +147,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     # Look up profile
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT id, name, status, sample_path, batch_size FROM profiles WHERE id = ?",
+            "SELECT id, name, status, sample_path, batch_size, profile_dir FROM profiles WHERE id = ?",
             (request.profile_id,),
         )
         row = await cursor.fetchone()
@@ -175,6 +175,15 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
 
     sample_dir = os.path.dirname(os.path.abspath(row["sample_path"]))
 
+    # Resolve profile_dir — new profiles have it stored; legacy ones derive it
+    stored_profile_dir = row["profile_dir"] if "profile_dir" in row.keys() else None
+    if stored_profile_dir:
+        profile_dir = stored_profile_dir
+    else:
+        # Legacy: derive from DATA_DIR or default
+        data_dir = os.environ.get("DATA_DIR", "data")
+        profile_dir = os.path.join(data_dir, "profiles", request.profile_id)
+
     try:
         job = manager.start_job(
             request.profile_id,
@@ -183,6 +192,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
             total_epoch=request.epochs,
             save_every=request.save_every,
             batch_size=batch_size,
+            profile_dir=profile_dir,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

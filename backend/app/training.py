@@ -329,11 +329,12 @@ async def _run_pipeline(
     total_epoch: int = 200,
     save_every: int = 10,
     batch_size: int = 8,
+    profile_dir: str = "",
 ) -> None:
     """Orchestrate the full training pipeline for one TrainingJob.
 
     Chains: preprocess → f0 extract → feature extract → (config+filelist setup)
-            → train (with log tailing) → FAISS index build.
+            → train (with log tailing) → FAISS index build → copy to profile_dir.
 
     All output is funnelled into job.queue as JSON messages.
     Sets job.status to "done" or "failed" on completion.
@@ -677,13 +678,73 @@ async def _run_pipeline(
         return
 
     # ------------------------------------------------------------------
-    # Success
+    # Phase 5: Copy model + index to profile directory
+    # ------------------------------------------------------------------
+    # G_latest.pth → data/profiles/{id}/model.pth
+    # added_IVF*.index → data/profiles/{id}/model.index
+    # This is the canonical per-profile artifact store. Inference always
+    # loads from here, not from the shared logs/rvc_finetune_active/ dir.
+    dest_model_path: Optional[str] = None
+    dest_index_path: Optional[str] = None
+
+    g_latest = os.path.join(exp_dir, "G_latest.pth")
+
+    if profile_dir:
+        os.makedirs(profile_dir, exist_ok=True)
+        dest_model_path = os.path.join(profile_dir, "model.pth")
+        dest_index_path = os.path.join(profile_dir, "model.index")
+
+        try:
+            if os.path.exists(g_latest):
+                shutil.copy2(g_latest, dest_model_path)
+                await job.queue.put({
+                    "type": "log",
+                    "message": f"Saved model → {dest_model_path}",
+                    "phase": "index",
+                })
+            else:
+                await job.queue.put({
+                    "type": "log",
+                    "message": f"Warning: G_latest.pth not found at {g_latest}",
+                    "phase": "index",
+                })
+                dest_model_path = None
+
+            shutil.copy2(added_index_path, dest_index_path)
+            await job.queue.put({
+                "type": "log",
+                "message": f"Saved index → {dest_index_path}",
+                "phase": "index",
+            })
+        except Exception as exc:
+            # Non-fatal — model is still in exp_dir; log the warning but continue
+            await job.queue.put({
+                "type": "log",
+                "message": f"Warning: failed to copy artifacts to profile dir: {exc}",
+                "phase": "index",
+            })
+            dest_model_path = None
+            dest_index_path = None
+    else:
+        # No profile_dir — legacy path, just write the G_latest path directly
+        dest_model_path = g_latest if os.path.exists(g_latest) else None
+        dest_index_path = added_index_path
+
+    # ------------------------------------------------------------------
+    # Success — update DB
     # ------------------------------------------------------------------
     job.phase = "done"
     job.progress_pct = 100
     job.status = "done"
 
-    await _update_db_status(job.profile_id, "trained")
+    async with get_db() as db:
+        await db.execute(
+            """UPDATE profiles
+               SET status = 'trained', model_path = ?, index_path = ?
+               WHERE id = ?""",
+            (dest_model_path, dest_index_path, job.profile_id),
+        )
+        await db.commit()
 
     elapsed = time.monotonic() - start_ts
     await job.queue.put({"type": "done", "message": "Training complete", "phase": "done"})
@@ -721,8 +782,12 @@ class TrainingManager:
         total_epoch: int = 200,
         save_every: int = 10,
         batch_size: int = 8,
+        profile_dir: str = "",
     ) -> TrainingJob:
         """Create and launch a training job for profile_id.
+
+        profile_dir: absolute path to data/profiles/{id}/ — model.pth and
+        model.index are copied here on training completion.
 
         Raises ValueError("job already running") if any job is currently
         in status=="training" (HTTP 409 in the router layer).
@@ -739,7 +804,7 @@ class TrainingManager:
         self._jobs[profile_id] = job
 
         asyncio.create_task(
-            _run_pipeline(job, sample_dir, rvc_root, total_epoch, save_every, batch_size)
+            _run_pipeline(job, sample_dir, rvc_root, total_epoch, save_every, batch_size, profile_dir)
         )
 
         print(

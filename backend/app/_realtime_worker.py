@@ -184,6 +184,8 @@ def run_worker(
     protect: float,
     silence_threshold_db: float = -45.0,
     save_path: str | None = None,
+    model_path: str | None = None,
+    index_path: str | None = None,
 ) -> None:
     """Run in isolated child process. Owns all native code (fairseq, sounddevice, MPS)."""
 
@@ -253,18 +255,41 @@ def run_worker(
 
         from infer.lib.rtrvc import RVC  # noqa: PLC0415
 
-        index_pattern = f"{rvc_root}/logs/rvc_finetune_active/added_IVF*_Flat*.index"
-        matches = _glob.glob(index_pattern)
-        if not matches:
-            raise RuntimeError("no index file found — run training first")
-        index_path = matches[0]
+        # Resolve model and index paths.
+        # Prefer explicitly passed paths (new per-profile layout:
+        #   data/profiles/{id}/model.pth + model.index).
+        # Fall back to legacy locations for profiles trained before the
+        # per-profile artifact store was introduced.
+        import os as _os  # noqa: PLC0415
+
+        resolved_model_path = model_path
+        resolved_index_path = index_path
+
+        if not resolved_model_path or not _os.path.exists(resolved_model_path):
+            legacy_model = f"{rvc_root}/assets/weights/rvc_finetune_active.pth"
+            if _os.path.exists(legacy_model):
+                resolved_model_path = legacy_model
+            else:
+                raise RuntimeError(
+                    f"model.pth not found — checked {model_path!r} and legacy {legacy_model!r}"
+                )
+
+        if not resolved_index_path or not _os.path.exists(resolved_index_path):
+            index_pattern = f"{rvc_root}/logs/rvc_finetune_active/added_IVF*_Flat*.index"
+            matches = _glob.glob(index_pattern)
+            if not matches:
+                raise RuntimeError(
+                    f"model.index not found — checked {index_path!r} "
+                    "and legacy logs/rvc_finetune_active/added_IVF*.index"
+                )
+            resolved_index_path = matches[0]
 
         # is_half=False: MPS doesn't support float16 in all ops reliably
         rvc = RVC(
             key=pitch,
             formant=0,
-            pth_path=f"{rvc_root}/assets/weights/rvc_finetune_active.pth",
-            index_path=index_path,
+            pth_path=resolved_model_path,
+            index_path=resolved_index_path,
             index_rate=index_rate,
             device=infer_device,
             is_half=False,
