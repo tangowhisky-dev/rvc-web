@@ -51,11 +51,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// Waveform Canvas + dual-handle segment selector
-//
-// Canvas is the only interaction surface for the segment range — no separate
-// sliders are rendered. Handles can be dragged; the selection body can be
-// dragged to slide the whole window.
+// Waveform Canvas + dual-handle segment selector + preview playback
 // ---------------------------------------------------------------------------
 
 const MIN_SEG_SEC = 10 * 60;  // 10 min
@@ -72,13 +68,36 @@ interface WaveformProps {
 function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: WaveformProps) {
   const canvasRef    = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [peaks, setPeaks]     = useState<Float32Array | null>(null);
-  const [loading, setLoading] = useState(true);
+  const audioRef     = useRef<HTMLAudioElement | null>(null);
+  const rafRef       = useRef<number>(0);
 
-  const dragging     = useRef<'start' | 'end' | 'body' | null>(null);
-  const dragOriginPx = useRef(0);
+  const [peaks, setPeaks]       = useState<Float32Array | null>(null);
+  const [loading, setLoading]   = useState(true);
+  const [playing, setPlaying]   = useState(false);
+  const [playheadSec, setPlayheadSec] = useState<number | null>(null);
+
+  const dragging        = useRef<'start' | 'end' | 'body' | null>(null);
+  const dragOriginPx    = useRef(0);
   const dragOriginStart = useRef(0);
   const dragOriginEnd   = useRef(0);
+
+  // Build object URL for the file once; revoke on unmount or file change
+  const objectUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+    objectUrlRef.current = URL.createObjectURL(file);
+    // Reset audio element when file changes
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = objectUrlRef.current;
+      setPlaying(false);
+      setPlayheadSec(null);
+    }
+    return () => {
+      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    };
+  }, [file]);
 
   // Decode audio + build peak envelope at 8 kHz
   useEffect(() => {
@@ -114,7 +133,7 @@ function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: Wav
     return () => { cancelled = true; };
   }, [file]);
 
-  // Draw
+  // Draw canvas
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !peaks) return;
@@ -123,14 +142,13 @@ function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: Wav
     const H = canvas.height;
     ctx.clearRect(0, 0, W, H);
 
-    // Background
     ctx.fillStyle = '#09090b';
     ctx.fillRect(0, 0, W, H);
 
     const sx = (startSec / duration) * W;
     const ex = (endSec   / duration) * W;
 
-    // Outside-selection dim
+    // Dim outside selection
     ctx.fillStyle = 'rgba(0,0,0,0.55)';
     ctx.fillRect(0,  0, sx, H);
     ctx.fillRect(ex, 0, W - ex, H);
@@ -139,7 +157,7 @@ function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: Wav
     ctx.fillStyle = 'rgba(8,145,178,0.10)';
     ctx.fillRect(sx, 0, ex - sx, H);
 
-    // Peak bars
+    // Peaks
     const mid = H / 2;
     for (let i = 0; i < peaks.length; i++) {
       const x    = (i / peaks.length) * W;
@@ -153,41 +171,93 @@ function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: Wav
       ctx.stroke();
     }
 
-    // Handles
+    // Selection handles
     const drawHandle = (x: number) => {
       ctx.strokeStyle = '#06b6d4';
       ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(x, 0); ctx.lineTo(x, H);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
       ctx.fillStyle = '#06b6d4';
-      ctx.beginPath();
-      ctx.arc(x, H / 2, 6, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.beginPath(); ctx.arc(x, H / 2, 6, 0, Math.PI * 2); ctx.fill();
     };
     drawHandle(sx);
     drawHandle(ex);
 
-    // Duration label centred in selection
+    // Playhead
+    if (playheadSec != null) {
+      const px = (playheadSec / duration) * W;
+      ctx.strokeStyle = '#fbbf24';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, H); ctx.stroke();
+    }
+
+    // Duration label
     const segDur = endSec - startSec;
     ctx.font = 'bold 11px monospace';
     ctx.fillStyle = '#22d3ee';
     const label = `${(segDur / 60).toFixed(1)} min`;
     ctx.fillText(label, sx + (ex - sx) / 2 - 18, H / 2 + 4);
 
-    // Edge time labels
+    // Edge time stamps
     ctx.font = '10px monospace';
     ctx.fillStyle = '#94a3b8';
-    ctx.fillText(fmtDuration(startSec), Math.max(4, sx + 4), 12);
+    ctx.fillText(fmtDuration(startSec), Math.max(4, sx + 4),   12);
     ctx.fillText(fmtDuration(endSec),   Math.min(W - 44, ex - 44), 12);
-  }, [peaks, startSec, endSec, duration]);
+  }, [peaks, startSec, endSec, duration, playheadSec]);
 
-  const xToSec = (clientX: number) => {
+  // Playback controls
+  function getOrCreateAudio(): HTMLAudioElement {
+    if (!audioRef.current) {
+      const a = new Audio();
+      a.src = objectUrlRef.current ?? '';
+      a.onended = () => { setPlaying(false); setPlayheadSec(null); cancelAnimationFrame(rafRef.current); };
+      audioRef.current = a;
+    }
+    return audioRef.current;
+  }
+
+  function tickPlayhead() {
+    const a = audioRef.current;
+    if (!a || a.paused) return;
+    setPlayheadSec(a.currentTime);
+    // Stop at endSec
+    if (a.currentTime >= endSec) {
+      a.pause();
+      setPlaying(false);
+      setPlayheadSec(null);
+      return;
+    }
+    rafRef.current = requestAnimationFrame(tickPlayhead);
+  }
+
+  function togglePlay() {
+    const a = getOrCreateAudio();
+    if (playing) {
+      a.pause();
+      setPlaying(false);
+      cancelAnimationFrame(rafRef.current);
+    } else {
+      // Start from startSec
+      a.currentTime = startSec;
+      a.play().then(() => {
+        setPlaying(true);
+        rafRef.current = requestAnimationFrame(tickPlayhead);
+      }).catch(() => {});
+    }
+  }
+
+  // Stop on unmount
+  useEffect(() => () => {
+    audioRef.current?.pause();
+    cancelAnimationFrame(rafRef.current);
+  }, []);
+
+  // Pointer drag for segment selection
+  const xToSec = useCallback((clientX: number) => {
     const rect = containerRef.current!.getBoundingClientRect();
     return Math.max(0, Math.min(duration, ((clientX - rect.left) / rect.width) * duration));
-  };
+  }, [duration]);
 
-  const THRESH = 10; // px near handle triggers drag
+  const THRESH = 10;
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     const rect = containerRef.current!.getBoundingClientRect();
@@ -234,44 +304,68 @@ function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: Wav
       if (ne > duration) { ns = duration - segLen; ne = duration; }
       onRangeChange(ns, ne);
     }
-  }, [startSec, endSec, duration, onRangeChange]);
+  }, [startSec, endSec, duration, onRangeChange, xToSec]);
 
   const onPointerUp = useCallback(() => { dragging.current = null; }, []);
 
+  const segLen   = endSec - startSec;
+  const segValid = segLen >= MIN_SEG_SEC && segLen <= MAX_SEG_SEC;
+
   return (
-    <div ref={containerRef} className="relative w-full select-none touch-none">
-      {loading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-zinc-950/80 rounded-lg z-10">
-          <span className="text-[11px] font-mono text-zinc-400 animate-pulse">Decoding waveform…</span>
+    <div className="flex flex-col gap-2">
+      <div ref={containerRef} className="relative w-full select-none touch-none">
+        {loading && (
+          <div className="absolute inset-0 flex items-center justify-center bg-zinc-950/80 rounded-lg z-10">
+            <span className="text-[11px] font-mono text-zinc-400 animate-pulse">Decoding waveform…</span>
+          </div>
+        )}
+        <canvas
+          ref={canvasRef}
+          width={1200} height={80}
+          className="w-full h-20 rounded-lg cursor-col-resize"
+          style={{ imageRendering: 'pixelated' }}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerUp}
+        />
+        {/* Time ruler */}
+        <div className="flex justify-between text-[9px] font-mono text-zinc-700 mt-0.5 px-0.5 pointer-events-none">
+          {[0, 0.25, 0.5, 0.75, 1].map((f) => (
+            <span key={f}>{fmtDuration(duration * f)}</span>
+          ))}
         </div>
-      )}
-      <canvas
-        ref={canvasRef}
-        width={1200} height={80}
-        className="w-full h-20 rounded-lg cursor-col-resize"
-        style={{ imageRendering: 'pixelated' }}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-      />
-      {/* Time ruler */}
-      <div className="flex justify-between text-[9px] font-mono text-zinc-700 mt-0.5 px-0.5">
-        {[0, 0.25, 0.5, 0.75, 1].map((f) => (
-          <span key={f}>{fmtDuration(duration * f)}</span>
-        ))}
       </div>
-      {/* Segment hint */}
-      <div className="flex justify-between items-center mt-1">
-        <span className="text-[10px] font-mono text-zinc-500">
-          Drag handles or body · 10–15 min segment required
+
+      {/* Controls row: play preview + validity + segment times */}
+      <div className="flex items-center gap-3">
+        {/* Play/pause preview from startSec */}
+        <button
+          onClick={togglePlay}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md border text-[11px] font-mono
+                      transition-colors shrink-0 ${
+            playing
+              ? 'bg-amber-900/40 border-amber-600/40 text-amber-300'
+              : 'bg-zinc-800 border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600'
+          }`}
+        >
+          {playing ? (
+            <><span>■</span><span>Stop</span></>
+          ) : (
+            <><span>▶</span><span>Preview from {fmtDuration(startSec)}</span></>
+          )}
+        </button>
+
+        <span className="text-[10px] font-mono text-zinc-600">
+          Drag handles or body to select segment
         </span>
-        <span className={`text-[10px] font-mono font-semibold ${
-          (endSec - startSec) >= MIN_SEG_SEC && (endSec - startSec) <= MAX_SEG_SEC
-            ? 'text-emerald-400' : 'text-amber-400'
+
+        <span className={`ml-auto text-[10px] font-mono font-semibold shrink-0 ${
+          segValid ? 'text-emerald-400' : 'text-amber-400'
         }`}>
           {fmtDuration(startSec)} – {fmtDuration(endSec)}
-          {' '}({((endSec - startSec) / 60).toFixed(1)} min)
+          {' '}({(segLen / 60).toFixed(1)} min
+          {!segValid ? ' · needs 10–15 min' : ''})
         </span>
       </div>
     </div>
@@ -279,7 +373,7 @@ function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: Wav
 }
 
 // ---------------------------------------------------------------------------
-// Upload + segment selection panel
+// Upload panel
 // ---------------------------------------------------------------------------
 
 interface UploadPanelProps {
@@ -326,10 +420,10 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
       URL.revokeObjectURL(url);
 
       if (!isFinite(dur) || dur <= 0) { setDurationError('Could not determine duration'); return; }
-      if (dur > 30 * 60)              { setDurationError(`${(dur/60).toFixed(1)} min — max is 30 min`); return; }
+      if (dur > 30 * 60)              { setDurationError(`${(dur / 60).toFixed(1)} min — max is 30 min`); return; }
 
       setFileDuration(dur);
-      // Default selection: clamp to 15 min window at start, or whole file if short
+      // Default: last 15 min (or whole file if shorter), anchored at start if < 15 min
       const defaultEnd   = Math.min(dur, MAX_SEG_SEC);
       const defaultStart = Math.max(0, defaultEnd - MIN_SEG_SEC);
       setStartSec(defaultStart);
@@ -381,7 +475,6 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
     <form onSubmit={handleUpload}
       className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5 flex flex-col gap-5">
 
-      {/* Name + file */}
       <div className="grid grid-cols-2 gap-4">
         <div className="flex flex-col gap-1.5">
           <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">Profile Name</label>
@@ -397,7 +490,7 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
           <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
             Audio Sample
             <span className="ml-2 font-normal text-zinc-600 normal-case tracking-normal">
-              max 30 min · select 10–15 min segment
+              max 30 min · select 10–15 min segment below
             </span>
           </label>
           <input
@@ -413,7 +506,7 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
           {file && !durationError && (
             <span className="text-[11px] font-mono text-zinc-500">
               {file.name} · {fmtSize(file.size)}
-              {fileDuration != null && ` · ${fmtDuration(fileDuration)}`}
+              {fileDuration != null && ` · ${fmtDuration(fileDuration)} total`}
             </span>
           )}
           {durationError && (
@@ -422,7 +515,7 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
         </div>
       </div>
 
-      {/* Waveform + handles — only interaction surface for segment selection */}
+      {/* Waveform — canvas drag handles are the only segment selection surface */}
       {file && fileDuration != null && !durationError && (
         <WaveformViewer
           file={file}
@@ -444,14 +537,14 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
                    transition-all bg-cyan-900/40 border border-cyan-600/40 text-cyan-300
                    hover:bg-cyan-800/40 hover:border-cyan-500/60
                    disabled:opacity-30 disabled:cursor-not-allowed">
-        {uploading ? '⟳  Uploading…' : '↑  Upload Profile'}
+        {uploading ? '⟳  Uploading…' : '↑  Upload & Clip to Selected Segment'}
       </button>
     </form>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Profile card — play buttons + one-click noise removal (no re-selection)
+// Profile card
 // ---------------------------------------------------------------------------
 
 interface ProfileCardProps {
@@ -504,7 +597,6 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
       setPlayingClean(false);
     } else {
       stopAllAudio();
-      // Re-point src to bust the cache after fresh preprocessing
       cleanAudioRef.current.src = `${API}/api/profiles/${profile.id}/audio/clean?t=${Date.now()}`;
       cleanAudioRef.current.play().then(() => setPlayingClean(true)).catch(() => {});
     }
@@ -515,9 +607,9 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
     setPreprocessMsg(null);
     setPreprocessOk(null);
     try {
+      // No body — endpoint processes the already-clipped sample_path
       const res = await fetch(`${API}/api/profiles/${profile.id}/preprocess`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail ?? `HTTP ${res.status}`);
@@ -573,7 +665,6 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
-          {/* Play original */}
           <button onClick={toggleOrig} title="Play clipped sample"
             className={`px-2.5 py-1.5 rounded-md text-[11px] font-mono border transition-colors ${
               playingOrig
@@ -582,7 +673,6 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
             {playingOrig ? '■' : '▶'} orig
           </button>
 
-          {/* Play cleaned */}
           {profile.preprocessed_path && (
             <button onClick={toggleClean} title="Play noise-removed audio"
               className={`px-2.5 py-1.5 rounded-md text-[11px] font-mono border transition-colors ${
@@ -628,7 +718,7 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
           </span>
         ) : (
           <span className="text-[10px] font-mono text-zinc-600">
-            Applies spectral noise gating to the clipped sample
+            Spectral noise gating on the clipped sample
           </span>
         )}
       </div>
@@ -641,10 +731,10 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
 // ---------------------------------------------------------------------------
 
 export default function LibraryPage() {
-  const [profiles, setProfiles]   = useState<Profile[]>([]);
-  const [loading, setLoading]     = useState(true);
+  const [profiles, setProfiles]     = useState<Profile[]>([]);
+  const [loading, setLoading]       = useState(true);
   const [sessionActive, setSessionActive] = useState(false);
-  const [error, setError]         = useState<string | null>(null);
+  const [error, setError]           = useState<string | null>(null);
   const [showUpload, setShowUpload] = useState(false);
 
   async function fetchProfiles() {
@@ -694,12 +784,11 @@ export default function LibraryPage() {
       )}
 
       <div className="max-w-4xl mx-auto px-6 py-8 flex flex-col gap-8">
-        {/* Page header */}
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-xl font-mono font-semibold text-zinc-100">Voice Profiles</h1>
             <p className="text-[13px] text-zinc-500 mt-1">
-              Upload voice samples, select a training segment, and remove background noise.
+              Upload a sample, select 10–15 min segment, upload to clip it, then optionally remove noise.
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -724,7 +813,6 @@ export default function LibraryPage() {
           </div>
         )}
 
-        {/* Upload panel */}
         {showUpload && (
           <section>
             <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500 mb-4">
@@ -734,25 +822,19 @@ export default function LibraryPage() {
           </section>
         )}
 
-        {/* Profile list */}
         <section>
           {loading ? (
             <div className="text-center py-16 text-[13px] font-mono text-zinc-500">Loading…</div>
           ) : profiles.length === 0 ? (
             <div className="rounded-xl border border-dashed border-zinc-800 flex items-center justify-center py-16">
               <p className="text-[13px] font-mono text-zinc-500">
-                No voice profiles yet — click <span className="text-cyan-400">+ New Profile</span> to add one.
+                No profiles yet — click <span className="text-cyan-400">+ New Profile</span> to add one.
               </p>
             </div>
           ) : (
             <div className="flex flex-col gap-4">
               {profiles.map((p) => (
-                <ProfileCard
-                  key={p.id}
-                  profile={p}
-                  onDeleted={fetchProfiles}
-                  onRefresh={fetchProfiles}
-                />
+                <ProfileCard key={p.id} profile={p} onDeleted={fetchProfiles} onRefresh={fetchProfiles} />
               ))}
             </div>
           )}
