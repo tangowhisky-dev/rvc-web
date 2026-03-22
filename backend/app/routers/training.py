@@ -163,10 +163,15 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
         raise HTTPException(status_code=400, detail="RVC_ROOT not set")
     rvc_root = os.path.abspath(rvc_root)
 
-    # Use batch_size from request; fall back to profile's stored value
+    # Request batch_size always wins over the profile's stored default.
+    # Persist it back so the DB stays in sync with what was actually used.
     batch_size = request.batch_size
-    if row["batch_size"] is not None:
-        batch_size = row["batch_size"]
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE profiles SET batch_size = ? WHERE id = ?",
+            (batch_size, request.profile_id),
+        )
+        await db.commit()
 
     sample_dir = os.path.dirname(os.path.abspath(row["sample_path"]))
 
