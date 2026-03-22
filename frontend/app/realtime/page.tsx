@@ -152,7 +152,8 @@ export default function RealtimePage() {
   // Save audio
   const [saveEnabled, setSaveEnabled] = useState(false);
   const [savePath, setSavePath] = useState('');
-  const [saveStatus, setSaveStatus] = useState<string | null>(null); // e.g. "Saved: /path/file.mp3"
+  const [saveStatus, setSaveStatus] = useState<string | null>(null);
+  const [savedPaths, setSavedPaths] = useState<{input?: string; output?: string; duration_s?: number}>({});
 
   // Resolve default save path on mount
   useEffect(() => {
@@ -376,6 +377,7 @@ export default function RealtimePage() {
     setSessionState('starting');
     setSessionError(null);
     setSaveStatus(null);
+    setSavedPaths({});
 
     // Bump canvas key BEFORE the async work so React remounts the canvas elements.
     // This gives us fresh DOM nodes that haven't had transferControlToOffscreen called yet.
@@ -470,7 +472,19 @@ export default function RealtimePage() {
             sessionIdRef.current = null;
             cleanup();
           } else if (msg.type === 'save_complete') {
-            setSaveStatus(`✓ Saved: ${msg.path} (${msg.duration_s}s)`);
+            // Two save_complete events arrive: one for output, one for input.
+            // Accumulate both so the UI shows both paths simultaneously.
+            setSavedPaths(prev => {
+              const isInput = msg.path?.includes('rvc_input');
+              const updated = isInput
+                ? { ...prev, input: msg.path }
+                : { ...prev, output: msg.path, duration_s: msg.duration_s };
+              const parts = [];
+              if (updated.output) parts.push(`Output: ${updated.output}`);
+              if (updated.input)  parts.push(`Input:  ${updated.input}`);
+              if (parts.length) setSaveStatus(`✓ Saved (${updated.duration_s ?? '?'}s)\n${parts.join('\n')}`);
+              return updated;
+            });
           } else if (msg.type === 'save_error') {
             setSaveStatus(`✗ Save failed: ${msg.error}`);
           }
@@ -758,9 +772,9 @@ export default function RealtimePage() {
               )}
 
               {saveStatus && (
-                <p className={`text-[11px] font-mono ${saveStatus.startsWith('✓') ? 'text-emerald-400' : 'text-red-400'}`}>
+                <div className={`text-[11px] font-mono ${saveStatus.startsWith('✓') ? 'text-emerald-400' : 'text-red-400'} whitespace-pre-wrap`}>
                   {saveStatus}
-                </p>
+                </div>
               )}
             </div>
           </div>
