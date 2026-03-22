@@ -686,25 +686,37 @@ async def _run_pipeline(
     # ------------------------------------------------------------------
     # Phase 5: Copy model + index to profile directory
     # ------------------------------------------------------------------
-    # G_latest.pth → data/profiles/{id}/model.pth
-    # added_IVF*.index → data/profiles/{id}/model.index
-    # This is the canonical per-profile artifact store. Inference always
-    # loads from here, not from the shared logs/rvc_finetune_active/ dir.
+    # train.py's save_small_model() writes the inference-ready fp16 weights
+    # (optimizer state stripped) to assets/weights/{exp_name}.pth at the
+    # end of every training run. That is the correct file for inference.
+    # G_latest.pth is the full resume checkpoint (431 MB with optimizer);
+    # it is NOT suitable for inference directly.
     dest_model_path: Optional[str] = None
     dest_index_path: Optional[str] = None
 
-    g_latest = os.path.join(exp_dir, "G_latest.pth")
+    # Primary: assets/weights/{exp_name}.pth (inference-ready, ~54 MB)
+    weights_pth = os.path.join(rvc_root, "assets", "weights", f"{exp_name}.pth")
 
-    if not os.path.exists(g_latest):
-        # Fallback: find any G_{step}.pth; pick the one with the highest step
-        g_candidates = sorted(glob.glob(os.path.join(exp_dir, "G_*.pth")))
-        if g_candidates:
-            g_latest = g_candidates[-1]
+    if not os.path.exists(weights_pth):
+        # Fallback 1: G_latest.pth (resume checkpoint — works for inference but large)
+        g_latest = os.path.join(exp_dir, "G_latest.pth")
+        if os.path.exists(g_latest):
+            weights_pth = g_latest
             await job.queue.put({
                 "type": "log",
-                "message": f"G_latest.pth not found; using {os.path.basename(g_latest)}",
+                "message": f"assets/weights not found; falling back to G_latest.pth",
                 "phase": "index",
             })
+        else:
+            # Fallback 2: highest G_{step}.pth in exp_dir
+            g_candidates = sorted(glob.glob(os.path.join(exp_dir, "G_*.pth")))
+            if g_candidates:
+                weights_pth = g_candidates[-1]
+                await job.queue.put({
+                    "type": "log",
+                    "message": f"Using fallback checkpoint: {os.path.basename(weights_pth)}",
+                    "phase": "index",
+                })
 
     if profile_dir:
         os.makedirs(profile_dir, exist_ok=True)
@@ -712,8 +724,8 @@ async def _run_pipeline(
         dest_index_path = os.path.join(profile_dir, "model.index")
 
         try:
-            if os.path.exists(g_latest):
-                shutil.copy2(g_latest, dest_model_path)
+            if os.path.exists(weights_pth):
+                shutil.copy2(weights_pth, dest_model_path)
                 await job.queue.put({
                     "type": "log",
                     "message": f"Saved model → {dest_model_path}",
@@ -722,7 +734,7 @@ async def _run_pipeline(
             else:
                 await job.queue.put({
                     "type": "log",
-                    "message": f"Warning: G_latest.pth not found at {g_latest}",
+                    "message": f"Warning: no model weights found (checked {weights_pth})",
                     "phase": "index",
                 })
                 dest_model_path = None
@@ -743,8 +755,8 @@ async def _run_pipeline(
             dest_model_path = None
             dest_index_path = None
     else:
-        # No profile_dir — legacy path, just write the G_latest path directly
-        dest_model_path = g_latest if os.path.exists(g_latest) else None
+        # No profile_dir — legacy path, just write the weights path directly
+        dest_model_path = weights_pth if os.path.exists(weights_pth) else None
         dest_index_path = added_index_path
 
     # ------------------------------------------------------------------
