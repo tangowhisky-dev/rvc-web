@@ -331,11 +331,18 @@ async def _run_pipeline(
     save_every: int = 10,
     batch_size: int = 8,
     profile_dir: str = "",
+    prior_epochs: int = 0,
 ) -> None:
     """Orchestrate the full training pipeline for one TrainingJob.
 
     Chains: preprocess → f0 extract → feature extract → (config+filelist setup)
             → train (with log tailing) → FAISS index build → copy to profile_dir.
+
+    prior_epochs: epochs already trained for this profile (from DB). Used to:
+      - compute cumulative -te target for train.py so resumed runs continue
+        from the right epoch number
+      - skip pretrain weights when prior_epochs > 0 (checkpoint in exp_dir
+        takes over)
 
     All output is funnelled into job.queue as JSON messages.
     Sets job.status to "done" or "failed" on completion.
@@ -346,16 +353,39 @@ async def _run_pipeline(
     exp_dir = os.path.join(rvc_root, "logs", exp_name)
 
     # ------------------------------------------------------------------
+    # Seed exp_dir with prior checkpoints (resume support).
+    # If the profile has checkpoints/ from a previous run, copy them into
+    # exp_dir before the cleanup pass so train.py auto-resumes from them.
+    # We do this BEFORE the cleanup so the files survive the wipe of the
+    # non-feature directories.
+    # ------------------------------------------------------------------
+    ckpt_dir = os.path.join(profile_dir, "checkpoints") if profile_dir else None
+    if ckpt_dir and os.path.isdir(ckpt_dir):
+        os.makedirs(exp_dir, exist_ok=True)
+        for ckpt_file in ("G_latest.pth", "D_latest.pth"):
+            src = os.path.join(ckpt_dir, ckpt_file)
+            dst = os.path.join(exp_dir, ckpt_file)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+                await job.queue.put({
+                    "type": "log",
+                    "message": f"Seeded {ckpt_file} from profile checkpoints (resuming from epoch {prior_epochs})",
+                    "phase": "setup",
+                })
+
+    # ------------------------------------------------------------------
     # Clean stale training artifacts before each run so we always start
     # fresh (no accumulated checkpoints, tfevents, or stale logs).
     # Preserve the feature extraction outputs (0_gt_wavs, 1_16k_wavs,
     # 2a_f0, 2b-f0nsf, 3_feature768) so re-runs skip those phases fast
-    # when the audio hasn't changed.  Everything else is regenerated.
+    # when the audio hasn't changed.
+    # Preserve G_latest.pth / D_latest.pth that were just seeded above.
     # ------------------------------------------------------------------
-    _KEEP_DIRS = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
+    _KEEP_DIRS  = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
+    _KEEP_FILES = {"G_latest.pth", "D_latest.pth"}
     if os.path.isdir(exp_dir):
         for entry in os.listdir(exp_dir):
-            if entry in _KEEP_DIRS:
+            if entry in _KEEP_DIRS or entry in _KEEP_FILES:
                 continue
             full = os.path.join(exp_dir, entry)
             try:
@@ -522,10 +552,29 @@ async def _run_pipeline(
     train_env.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     train_env.setdefault("PYTORCH_MPS_PREFER_SHARED_MEMORY", "1")
 
-    # Clamp save_every so at least one checkpoint fires even for short test runs.
-    # If total_epoch=5 and save_every=10, the save condition (epoch % save_every == 0)
-    # never triggers and no G_latest.pth is written.
-    effective_save_every = min(save_every, total_epoch)
+    # Checkpoint save schedule: every 25% of the run or every 10 epochs,
+    # whichever is smaller — ensures at least 4 saves and no more than
+    # one save per 10 epochs on longer runs.
+    effective_save_every = max(1, min(10, total_epoch // 4))
+
+    # Cumulative epoch target: train.py resumes from prior_epochs (loaded
+    # from G_latest.pth) and runs until it hits this number.
+    cumulative_epochs = prior_epochs + total_epoch
+
+    # Pretrain weights are only used on the first run for a profile.
+    # On resume, the loaded checkpoint takes over the LR schedule too.
+    pretrain_g = "assets/pretrained_v2/f0G48k.pth" if prior_epochs == 0 else ""
+    pretrain_d = "assets/pretrained_v2/f0D48k.pth" if prior_epochs == 0 else ""
+
+    await job.queue.put({
+        "type": "log",
+        "message": (
+            f"Training epochs {prior_epochs + 1}–{cumulative_epochs} "
+            f"(save every {effective_save_every})"
+            + (" [resume]" if prior_epochs > 0 else " [fresh]")
+        ),
+        "phase": "train",
+    })
 
     train_args = [
         python,
@@ -534,13 +583,13 @@ async def _run_pipeline(
         "-sr", "48k",
         "-f0", "1",
         "-bs", str(batch_size),
-        "-te", str(total_epoch),
+        "-te", str(cumulative_epochs),
         "-se", str(effective_save_every),
-        "-pg", "assets/pretrained_v2/f0G48k.pth",
-        "-pd", "assets/pretrained_v2/f0D48k.pth",
-        "-l", "1",    # save latest only
-        "-c", "1",    # cache dataset in GPU memory — eliminates DataLoader round-trip per batch
-        "-sw", "0",   # no save every weights
+        "-pg", pretrain_g,
+        "-pd", pretrain_d,
+        "-l", "1",    # save latest only (G_latest.pth / D_latest.pth)
+        "-c", "1",    # cache dataset in GPU memory
+        "-sw", "0",   # save_small_model at end only (we handle artifacts ourselves)
         "-v", "v2",
         "-a", "",
     ]
@@ -684,60 +733,80 @@ async def _run_pipeline(
         return
 
     # ------------------------------------------------------------------
-    # Phase 5: Copy model + index to profile directory
+    # Phase 5: Persist checkpoints + index to profile directory
     # ------------------------------------------------------------------
-    # train.py's save_small_model() writes the inference-ready fp16 weights
-    # (optimizer state stripped) to assets/weights/{exp_name}.pth at the
-    # end of every training run. That is the correct file for inference.
-    # G_latest.pth is the full resume checkpoint (431 MB with optimizer);
-    # it is NOT suitable for inference directly.
-    dest_model_path: Optional[str] = None
+    # G_latest.pth / D_latest.pth → profile_dir/checkpoints/  (resume, latest only)
+    # assets/weights/{exp}.pth    → profile_dir/model_infer.pth (inference, ~54 MB)
+    # added_IVF*.index            → profile_dir/model.index
+    #
+    # Two files serve two purposes:
+    #   - checkpoints/G_latest.pth: full resume checkpoint (431 MB, optimizer
+    #     state included). Seeded back into exp_dir before the next training run.
+    #   - model_infer.pth: inference-ready fp16 weights (~54 MB) written by
+    #     save_small_model() at the end of every completed run. This is what
+    #     rtrvc.py / load_synthesizer() expects (has 'weight', 'config', 'f0',
+    #     'sr', 'version' keys).
+    dest_model_path: Optional[str] = None    # → DB model_path (checkpoint for resume)
+    dest_infer_path: Optional[str] = None    # → DB inference_model_path
     dest_index_path: Optional[str] = None
 
-    # Primary: assets/weights/{exp_name}.pth (inference-ready, ~54 MB)
+    g_latest = os.path.join(exp_dir, "G_latest.pth")
+    d_latest = os.path.join(exp_dir, "D_latest.pth")
     weights_pth = os.path.join(rvc_root, "assets", "weights", f"{exp_name}.pth")
 
-    if not os.path.exists(weights_pth):
-        # Fallback 1: G_latest.pth (resume checkpoint — works for inference but large)
-        g_latest = os.path.join(exp_dir, "G_latest.pth")
-        if os.path.exists(g_latest):
-            weights_pth = g_latest
+    if not os.path.exists(g_latest):
+        # Fallback: find any G_{step}.pth; pick the highest step
+        g_candidates = sorted(glob.glob(os.path.join(exp_dir, "G_*.pth")))
+        if g_candidates:
+            g_latest = g_candidates[-1]
             await job.queue.put({
                 "type": "log",
-                "message": f"assets/weights not found; falling back to G_latest.pth",
+                "message": f"G_latest.pth not found; using {os.path.basename(g_latest)}",
                 "phase": "index",
             })
-        else:
-            # Fallback 2: highest G_{step}.pth in exp_dir
-            g_candidates = sorted(glob.glob(os.path.join(exp_dir, "G_*.pth")))
-            if g_candidates:
-                weights_pth = g_candidates[-1]
-                await job.queue.put({
-                    "type": "log",
-                    "message": f"Using fallback checkpoint: {os.path.basename(weights_pth)}",
-                    "phase": "index",
-                })
 
     if profile_dir:
-        os.makedirs(profile_dir, exist_ok=True)
-        dest_model_path = os.path.join(profile_dir, "model.pth")
+        dest_ckpt_dir = os.path.join(profile_dir, "checkpoints")
+        os.makedirs(dest_ckpt_dir, exist_ok=True)
+
+        dest_g = os.path.join(dest_ckpt_dir, "G_latest.pth")
+        dest_d = os.path.join(dest_ckpt_dir, "D_latest.pth")
+        dest_infer_path = os.path.join(profile_dir, "model_infer.pth")
         dest_index_path = os.path.join(profile_dir, "model.index")
 
         try:
-            if os.path.exists(weights_pth):
-                shutil.copy2(weights_pth, dest_model_path)
+            if os.path.exists(g_latest):
+                shutil.copy2(g_latest, dest_g)
+                dest_model_path = dest_g
                 await job.queue.put({
                     "type": "log",
-                    "message": f"Saved model → {dest_model_path}",
+                    "message": f"Saved resume checkpoint → {dest_g}",
                     "phase": "index",
                 })
             else:
                 await job.queue.put({
                     "type": "log",
-                    "message": f"Warning: no model weights found (checked {weights_pth})",
+                    "message": f"Warning: no checkpoint found at {g_latest}",
                     "phase": "index",
                 })
-                dest_model_path = None
+
+            if os.path.exists(d_latest):
+                shutil.copy2(d_latest, dest_d)
+
+            if os.path.exists(weights_pth):
+                shutil.copy2(weights_pth, dest_infer_path)
+                await job.queue.put({
+                    "type": "log",
+                    "message": f"Saved inference model → {dest_infer_path}",
+                    "phase": "index",
+                })
+            else:
+                await job.queue.put({
+                    "type": "log",
+                    "message": f"Warning: inference weights not found at {weights_pth}",
+                    "phase": "index",
+                })
+                dest_infer_path = None
 
             shutil.copy2(added_index_path, dest_index_path)
             await job.queue.put({
@@ -746,17 +815,18 @@ async def _run_pipeline(
                 "phase": "index",
             })
         except Exception as exc:
-            # Non-fatal — model is still in exp_dir; log the warning but continue
             await job.queue.put({
                 "type": "log",
                 "message": f"Warning: failed to copy artifacts to profile dir: {exc}",
                 "phase": "index",
             })
             dest_model_path = None
+            dest_infer_path = None
             dest_index_path = None
     else:
-        # No profile_dir — legacy path, just write the weights path directly
-        dest_model_path = weights_pth if os.path.exists(weights_pth) else None
+        # Legacy / no profile_dir
+        dest_model_path = g_latest if os.path.exists(g_latest) else None
+        dest_infer_path = weights_pth if os.path.exists(weights_pth) else None
         dest_index_path = added_index_path
 
     # ------------------------------------------------------------------
@@ -766,12 +836,18 @@ async def _run_pipeline(
     job.progress_pct = 100
     job.status = "done"
 
+    new_total_epochs = prior_epochs + total_epoch
+
     async with get_db() as db:
         await db.execute(
             """UPDATE profiles
-               SET status = 'trained', model_path = ?, index_path = ?
+               SET status = 'trained',
+                   model_path = ?,
+                   checkpoint_path = ?,
+                   index_path = ?,
+                   total_epochs_trained = ?
                WHERE id = ?""",
-            (dest_model_path, dest_index_path, job.profile_id),
+            (dest_infer_path, dest_model_path, dest_index_path, new_total_epochs, job.profile_id),
         )
         await db.commit()
 
@@ -812,11 +888,16 @@ class TrainingManager:
         save_every: int = 10,
         batch_size: int = 8,
         profile_dir: str = "",
+        prior_epochs: int = 0,
     ) -> TrainingJob:
         """Create and launch a training job for profile_id.
 
-        profile_dir: absolute path to data/profiles/{id}/ — model.pth and
-        model.index are copied here on training completion.
+        profile_dir: absolute path to data/profiles/{id}/ — checkpoints/
+        and model.index are stored here on training completion.
+
+        prior_epochs: total epochs already trained for this profile (from
+        DB total_epochs_trained). Used to compute cumulative -te target and
+        to skip pretrained weights on resume runs.
 
         Raises ValueError("job already running") if any job is currently
         in status=="training" (HTTP 409 in the router layer).
@@ -833,7 +914,7 @@ class TrainingManager:
         self._jobs[profile_id] = job
 
         asyncio.create_task(
-            _run_pipeline(job, sample_dir, rvc_root, total_epoch, save_every, batch_size, profile_dir)
+            _run_pipeline(job, sample_dir, rvc_root, total_epoch, save_every, batch_size, profile_dir, prior_epochs)
         )
 
         print(

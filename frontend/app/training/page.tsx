@@ -13,6 +13,7 @@ interface Profile {
   id: string;
   name: string;
   status: string;
+  total_epochs_trained: number;
 }
 
 interface HardwareInfo {
@@ -600,6 +601,7 @@ export default function TrainingPage() {
                     {profiles.map((p) => (
                       <option key={p.id} value={p.id}>
                         {p.name}
+                        {p.total_epochs_trained > 0 ? ` (${p.total_epochs_trained} ep)` : ''}
                         {p.status === 'trained' ? ' ✓' : p.status === 'training' ? ' ⟳' : p.status === 'failed' ? ' ✗' : ''}
                       </option>
                     ))}
@@ -619,6 +621,15 @@ export default function TrainingPage() {
                              font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
                              disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
                 />
+                {/* Resume indicator */}
+                {(() => {
+                  const sel = profiles.find(p => p.id === selectedId);
+                  return sel && sel.total_epochs_trained > 0 ? (
+                    <span className="text-[10px] font-mono text-amber-500/80">
+                      ↳ resume from epoch {sel.total_epochs_trained} → {sel.total_epochs_trained + epochs} total
+                    </span>
+                  ) : null;
+                })()}
               </div>
             </div>
 

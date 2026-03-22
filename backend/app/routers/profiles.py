@@ -66,8 +66,10 @@ class ProfileOut(BaseModel):
     audio_duration: Optional[float] = None
     preprocessed_path: Optional[str] = None
     profile_dir: Optional[str] = None
-    model_path: Optional[str] = None
+    model_path: Optional[str] = None        # inference-ready (~54 MB)
+    checkpoint_path: Optional[str] = None  # resume checkpoint (~431 MB)
     index_path: Optional[str] = None
+    total_epochs_trained: int = 0
 
 
 class PreprocessResponse(BaseModel):
@@ -141,10 +143,33 @@ def _resolve_sample_path(row) -> str:
 
 
 def _resolve_model_path(row) -> Optional[str]:
+    """Return the inference-ready model path for this profile.
+
+    New layout: profile_dir/model_infer.pth  (fp16 weights, ~54 MB)
+    Legacy layout: profile_dir/model.pth
+    Fallback: stored model_path from DB
+    """
     pdir = row["profile_dir"]
     stored = row["model_path"]
     if pdir:
-        candidate = os.path.join(pdir, "model.pth")
+        # New layout: model_infer.pth (inference-ready fp16 weights)
+        candidate = os.path.join(pdir, "model_infer.pth")
+        if os.path.exists(candidate):
+            return candidate
+        # Legacy layout: model.pth
+        candidate_legacy = os.path.join(pdir, "model.pth")
+        if os.path.exists(candidate_legacy):
+            return candidate_legacy
+    return stored or None
+
+
+def _resolve_checkpoint_path(row) -> Optional[str]:
+    """Return the resume checkpoint path (G_latest.pth) for this profile."""
+    pdir = row["profile_dir"]
+    keys = row.keys() if hasattr(row, "keys") else []
+    stored = row["checkpoint_path"] if "checkpoint_path" in keys else None
+    if pdir:
+        candidate = os.path.join(pdir, "checkpoints", "G_latest.pth")
         if os.path.exists(candidate):
             return candidate
     return stored or None
@@ -162,6 +187,7 @@ def _resolve_index_path(row) -> Optional[str]:
 
 def _row_to_out(row) -> ProfileOut:
     pdir = row["profile_dir"]
+    keys = row.keys() if hasattr(row, "keys") else []
     return ProfileOut(
         id=row["id"],
         name=row["name"],
@@ -173,7 +199,9 @@ def _row_to_out(row) -> ProfileOut:
         preprocessed_path=row["preprocessed_path"],
         profile_dir=pdir,
         model_path=_resolve_model_path(row),
+        checkpoint_path=_resolve_checkpoint_path(row),
         index_path=_resolve_index_path(row),
+        total_epochs_trained=int(row["total_epochs_trained"] or 0) if "total_epochs_trained" in keys else 0,
     )
 
 
@@ -348,7 +376,7 @@ async def profile_health(profile_id: str) -> HealthStatus:
     async with get_db() as db:
         cursor = await db.execute(
             """SELECT id, status, sample_path, preprocessed_path,
-                      profile_dir, model_path, index_path
+                      profile_dir, model_path, checkpoint_path, index_path
                FROM profiles WHERE id = ?""",
             (profile_id,),
         )
@@ -371,11 +399,11 @@ async def profile_health(profile_id: str) -> HealthStatus:
         if not preprocessed_ok:
             errors.append("cleaned audio referenced in DB but not found on disk")
 
-    # Model check
+    # Model check (inference-ready small model)
     model = _resolve_model_path(row)
     model_ok = bool(model and os.path.exists(model))
     if row["status"] == "trained" and not model_ok:
-        errors.append("model.pth missing — profile is marked trained but model file not found")
+        errors.append("model_infer.pth missing — profile is marked trained but inference model not found")
 
     # Index check
     index = _resolve_index_path(row)

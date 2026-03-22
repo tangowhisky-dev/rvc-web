@@ -17,8 +17,10 @@ interface Profile {
   audio_duration: number | null;
   preprocessed_path: string | null;
   model_path: string | null;
+  checkpoint_path: string | null;
   index_path: string | null;
   profile_dir: string | null;
+  total_epochs_trained: number;
 }
 
 interface HealthStatus {
@@ -719,6 +721,9 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
             )}
             {profile.preprocessed_path && (
               <span className="text-emerald-500">✓ noise removed</span>
+            )}
+            {profile.total_epochs_trained > 0 && (
+              <span className="text-cyan-600">{profile.total_epochs_trained} epochs</span>
             )}
             {profile.profile_dir && (
               <span title={profile.profile_dir} className="text-zinc-600 max-w-[200px] truncate">

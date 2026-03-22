@@ -147,7 +147,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     # Look up profile
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT id, name, status, sample_path, batch_size, profile_dir FROM profiles WHERE id = ?",
+            "SELECT id, name, status, sample_path, batch_size, profile_dir, total_epochs_trained FROM profiles WHERE id = ?",
             (request.profile_id,),
         )
         row = await cursor.fetchone()
@@ -193,6 +193,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
             save_every=request.save_every,
             batch_size=batch_size,
             profile_dir=profile_dir,
+            prior_epochs=int(row["total_epochs_trained"] or 0),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

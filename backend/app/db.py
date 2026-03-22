@@ -34,10 +34,12 @@ CREATE TABLE IF NOT EXISTS profiles (
 # Each entry: (column_name, column_definition)
 # init_db() runs ALTER TABLE for any that are missing.
 _MIGRATIONS: list[tuple[str, str]] = [
-    ("batch_size",        "INTEGER NOT NULL DEFAULT 8"),
-    ("audio_duration",    "REAL"),
-    ("preprocessed_path", "TEXT"),
-    ("profile_dir",       "TEXT"),
+    ("batch_size",          "INTEGER NOT NULL DEFAULT 8"),
+    ("audio_duration",      "REAL"),
+    ("preprocessed_path",   "TEXT"),
+    ("profile_dir",         "TEXT"),
+    ("total_epochs_trained", "INTEGER NOT NULL DEFAULT 0"),
+    ("checkpoint_path",     "TEXT"),   # G_latest.pth — resume checkpoint
 ]
 
 
