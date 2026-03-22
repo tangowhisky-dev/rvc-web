@@ -591,12 +591,25 @@ async def _run_pipeline(
                     elapsed_m = _re.search(r"\(([^)]+)\)", clean)
                     elapsed = elapsed_m.group(1) if elapsed_m else ""
                     loss_suffix = f" | {last_loss_line}" if last_loss_line else ""
-                    await job.queue.put({
+                    # Parse individual loss scalars from the buffered loss line
+                    # so the frontend can plot them without parsing log text.
+                    losses: dict = {}
+                    for key in ("loss_disc", "loss_gen", "loss_fm", "loss_mel", "loss_kl"):
+                        lm = _re.search(rf"{key}=([0-9.]+)", last_loss_line)
+                        if lm:
+                            try:
+                                losses[key] = float(lm.group(1))
+                            except ValueError:
+                                pass
+                    msg: dict = {
                         "type": "epoch_done",
                         "message": f"Epoch {epoch_num} ({elapsed}){loss_suffix}",
                         "phase": "train",
                         "epoch": epoch_num,
-                    })
+                    }
+                    if losses:
+                        msg["losses"] = losses
+                    await job.queue.put(msg)
                     last_loss_line = ""
                     continue
 

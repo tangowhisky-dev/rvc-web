@@ -32,6 +32,22 @@ interface TrainingMsg {
   phase?: string;
   elapsed_s?: number;
   epoch?: number;
+  losses?: {
+    loss_disc?: number;
+    loss_gen?: number;
+    loss_fm?: number;
+    loss_mel?: number;
+    loss_kl?: number;
+  };
+}
+
+interface EpochPoint {
+  epoch: number;
+  loss_mel: number;
+  loss_gen: number;
+  loss_disc: number;
+  loss_fm: number;
+  loss_kl: number;
 }
 
 type JobState = 'idle' | 'running' | 'done' | 'failed';
@@ -72,6 +88,110 @@ function PhaseBar({ currentPhase, jobDone }: { currentPhase: string | null; jobD
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Loss chart — SVG sparklines for key training signals
+// ---------------------------------------------------------------------------
+
+const LOSS_SERIES = [
+  { key: 'loss_mel',  label: 'Mel',   color: '#06b6d4' }, // cyan   — most important: audio quality
+  { key: 'loss_gen',  label: 'Gen',   color: '#a78bfa' }, // violet — generator adversarial
+  { key: 'loss_disc', label: 'Disc',  color: '#f59e0b' }, // amber  — discriminator health
+  { key: 'loss_fm',   label: 'FM',    color: '#34d399' }, // emerald — feature matching
+  { key: 'loss_kl',   label: 'KL',    color: '#f87171' }, // red    — latent regularisation
+] as const;
+
+function LossChart({ points, totalEpochs }: { points: EpochPoint[]; totalEpochs: number }) {
+  if (points.length < 2) {
+    return (
+      <div className="h-36 flex items-center justify-center text-zinc-600 font-mono text-[11px]">
+        {points.length === 0 ? 'Chart will appear after first epoch' : 'Waiting for second epoch…'}
+      </div>
+    );
+  }
+
+  const W = 560; // viewBox width
+  const H = 120; // viewBox height
+  const PAD = { top: 8, right: 8, bottom: 20, left: 38 };
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = H - PAD.top - PAD.bottom;
+
+  // Compute per-series paths
+  function polyline(key: string, color: string) {
+    const vals = points.map(p => p[key as keyof EpochPoint] as number);
+    const allVals = LOSS_SERIES.flatMap(s => points.map(p => p[s.key as keyof EpochPoint] as number));
+    const yMin = Math.min(...allVals) * 0.97;
+    const yMax = Math.max(...allVals) * 1.03;
+    const xScale = (i: number) => PAD.left + (i / (points.length - 1)) * plotW;
+    const yScale = (v: number) => PAD.top + (1 - (v - yMin) / (yMax - yMin)) * plotH;
+    const pts = vals.map((v, i) => `${xScale(i).toFixed(1)},${yScale(v).toFixed(1)}`).join(' ');
+    return <polyline key={key} points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" opacity="0.9" />;
+  }
+
+  // Y-axis ticks
+  const allVals = LOSS_SERIES.flatMap(s => points.map(p => p[s.key as keyof EpochPoint] as number));
+  const yMin = Math.min(...allVals) * 0.97;
+  const yMax = Math.max(...allVals) * 1.03;
+  const yTicks = [yMax, (yMax + yMin) / 2, yMin];
+  const yScale = (v: number) => PAD.top + (1 - (v - yMin) / (yMax - yMin)) * plotH;
+
+  // X-axis ticks (epochs)
+  const xScale = (i: number) => PAD.left + (i / Math.max(totalEpochs - 1, points.length - 1)) * plotW;
+  const epochTicks = [1, Math.round(totalEpochs / 2), totalEpochs];
+
+  return (
+    <div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" style={{ overflow: 'visible' }}>
+        {/* Grid lines */}
+        {yTicks.map((v, i) => (
+          <g key={i}>
+            <line x1={PAD.left} x2={W - PAD.right} y1={yScale(v)} y2={yScale(v)}
+              stroke="#3f3f46" strokeWidth="0.5" strokeDasharray="3,3" />
+            <text x={PAD.left - 5} y={yScale(v) + 4} textAnchor="end"
+              fill="#71717a" fontSize="9" fontFamily="monospace">
+              {v.toFixed(1)}
+            </text>
+          </g>
+        ))}
+        {/* X-axis epoch markers */}
+        {epochTicks.map(ep => (
+          <text key={ep} x={xScale(ep - 1)} y={H - 4} textAnchor="middle"
+            fill="#52525b" fontSize="9" fontFamily="monospace">
+            {ep}
+          </text>
+        ))}
+        {/* Current epoch progress line */}
+        {points.length < totalEpochs && (
+          <line x1={xScale(points.length - 1)} x2={xScale(points.length - 1)}
+            y1={PAD.top} y2={PAD.top + plotH}
+            stroke="#52525b" strokeWidth="0.75" strokeDasharray="2,2" />
+        )}
+        {/* Series lines */}
+        {LOSS_SERIES.map(s => polyline(s.key, s.color))}
+      </svg>
+
+      {/* Legend + latest values */}
+      <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1">
+        {LOSS_SERIES.map(s => {
+          const last = points[points.length - 1][s.key as keyof EpochPoint] as number;
+          const first = points[0][s.key as keyof EpochPoint] as number;
+          const delta = ((last - first) / first) * 100;
+          const down = delta < 0;
+          return (
+            <span key={s.key} className="flex items-center gap-1.5 font-mono text-[10px]">
+              <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: s.color }} />
+              <span style={{ color: s.color }}>{s.label}</span>
+              <span className="text-zinc-300">{last.toFixed(2)}</span>
+              <span className={down ? 'text-emerald-400' : 'text-red-400'}>
+                {down ? '↓' : '↑'}{Math.abs(delta).toFixed(0)}%
+              </span>
+            </span>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -249,6 +369,7 @@ export default function TrainingPage() {
   const [currentPhase, setCurrentPhase] = useState<string | null>(null);
   const [jobState, setJobState] = useState<JobState>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [epochPoints, setEpochPoints] = useState<EpochPoint[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
@@ -311,6 +432,7 @@ export default function TrainingPage() {
     setErrorMsg(null);
     setLogLines([]);
     setCurrentPhase(null);
+    setEpochPoints([]);
 
     try {
       const res = await fetch(`${API}/api/training/start`, {
@@ -339,6 +461,17 @@ export default function TrainingPage() {
             if (msg.message) appendLog(`── ${msg.phase?.toUpperCase() ?? ''}: ${msg.message}`);
           } else if (msg.type === 'epoch_done') {
             if (msg.message) appendLog(`✓ ${msg.message}`);
+            if (msg.epoch != null && msg.losses) {
+              const l = msg.losses;
+              setEpochPoints(prev => [...prev, {
+                epoch:     msg.epoch!,
+                loss_mel:  l.loss_mel  ?? 0,
+                loss_gen:  l.loss_gen  ?? 0,
+                loss_disc: l.loss_disc ?? 0,
+                loss_fm:   l.loss_fm   ?? 0,
+                loss_kl:   l.loss_kl   ?? 0,
+              }]);
+            }
           } else if (msg.type === 'done') {
             setCurrentPhase('done');
             setJobState('done');
@@ -531,6 +664,22 @@ export default function TrainingPage() {
             <PhaseBar currentPhase={currentPhase} jobDone={jobState === 'done'} />
           </section>
         )}
+
+        {(epochPoints.length > 0 || jobState === 'running') && currentPhase === 'train' || epochPoints.length > 0 ? (
+          <section>
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500">Loss Curves</h2>
+              {epochPoints.length > 0 && (
+                <span className="text-[10px] font-mono text-zinc-600">
+                  {epochPoints.length} / {epochs} epochs
+                </span>
+              )}
+            </div>
+            <div className="bg-zinc-950 rounded-lg p-3 border border-zinc-800">
+              <LossChart points={epochPoints} totalEpochs={epochs} />
+            </div>
+          </section>
+        ) : null}
 
         <section>
           <div className="flex items-center justify-between mb-3">
