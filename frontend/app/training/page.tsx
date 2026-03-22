@@ -198,18 +198,19 @@ function BatchSizeSelector({
           </div>
         </div>
 
-        {/* Value + badge */}
-        <div className="flex items-center gap-2 shrink-0">
-          <span className={`text-2xl font-mono font-bold tabular-nums w-10 text-right ${
+        {/* Value + badge — fixed-width container so the slider track never reflows */}
+        <div className="flex items-center gap-2 shrink-0 w-36">
+          <span className={`text-2xl font-mono font-bold tabular-nums w-10 text-right shrink-0 ${
             isRisky ? 'text-red-400' : isSweet ? 'text-emerald-400' : 'text-zinc-100'
           }`}>
             {POW2[idx]}
           </span>
-          {b && (
-            <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wide font-mono ${b.cls}`}>
-              {b.text}
-            </span>
-          )}
+          {/* Render badge placeholder even when empty so width is stable */}
+          <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wide font-mono w-20 text-center ${
+            b ? b.cls : 'invisible'
+          }`}>
+            {b ? b.text : 'safe / slow'}
+          </span>
         </div>
       </div>
 
