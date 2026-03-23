@@ -401,12 +401,21 @@ def run_worker(
         _silence_rms = 10 ** (silence_threshold_db / 20.0)
 
         # Hold/release gate — prevents abrupt cut-off mid-word.
-        # At 200ms blocks: HOLD=3→600ms, RELEASE=2→400ms fade.
+        # At 200ms blocks: HOLD=3→600ms, RELEASE=5→1s fade.
+        # _gate_gain is smoothed per-sample with an exponential envelope
+        # applied across the output block to avoid hard amplitude jumps.
         _HOLD_BLOCKS    = 3
-        _RELEASE_BLOCKS = 2
+        _RELEASE_BLOCKS = 5
         _hold_count     = 0
         _release_count  = 0
-        _gate_gain      = 0.0
+        _gate_gain      = 0.0   # block-level target gain
+        _gate_gain_cur  = 0.0   # sample-level smoothed gain (avoids step discontinuity)
+
+        # RMS envelope: EWMA of input RMS over recent blocks.
+        # The per-block scaler uses the smoothed value instead of the instantaneous
+        # one to prevent single quiet-frame spikes from triggering 50× amplification.
+        _rms_alpha   = 0.15          # EWMA weight (higher = faster tracking)
+        _rms_smooth  = None          # initialized on first speech frame
 
         # Rolling 16k context buffer — circular shift, no torch.roll (avoids copy)
         rolling_buf = _torch.zeros(total_16k_samples, dtype=_torch.float32,
@@ -479,6 +488,11 @@ def run_worker(
                 _gate_gain      = 1.0
                 _hold_count     = _HOLD_BLOCKS
                 _release_count  = _RELEASE_BLOCKS
+                # Seed the EWMA on the first voiced frame
+                if _rms_smooth is None:
+                    _rms_smooth = input_rms
+                else:
+                    _rms_smooth = _rms_alpha * input_rms + (1 - _rms_alpha) * _rms_smooth
             elif _hold_count > 0:
                 _hold_count -= 1
                 _gate_gain   = 1.0
@@ -501,73 +515,69 @@ def run_worker(
                          else _torch.from_numpy(infer_raw))
             infer_wav = infer_wav.to(infer_device)
 
+            # ── SOLA crossfade (run on every block, gate applied after) ───
+            #
+            # We always run SOLA to keep sola_buf up-to-date. If the gate is
+            # closed we still update sola_buf from the inference output so
+            # the crossfade on the next voiced block is correctly aligned.
+            # Only the final audio_device write (and file save) are zeroed.
+            # This prevents the "pop at word onset" artifact caused by
+            # sola_buf containing zeros when the gate reopens.
+
+            if infer_wav.shape[0] < _min_infer_len:
+                pad = _min_infer_len - infer_wav.shape[0]
+                infer_wav = _F.pad(infer_wav, (0, pad))
+
+            search_len = sola_buf_48k + sola_search_48k
+            conv_input = infer_wav[None, None, :search_len]
+            cor_nom = _F.conv1d(conv_input, sola_buf[None, None, :])
+            cor_den = _torch.sqrt(
+                _F.conv1d(conv_input ** 2,
+                           _torch.ones(1, 1, sola_buf_48k, device=infer_device))
+                + 1e-8
+            )
+            sola_offset = int(_torch.argmax(cor_nom[0, 0] / cor_den[0, 0]).item())
+            infer_wav = infer_wav[sola_offset:]
+            infer_wav[:sola_buf_48k] = (infer_wav[:sola_buf_48k] * fade_in
+                                         + sola_buf * fade_out)
+            # Update sola_buf for next block
+            tail_end = block_48k + sola_buf_48k
+            if infer_wav.shape[0] >= tail_end:
+                sola_buf[:] = infer_wav[block_48k:tail_end]
+            else:
+                available = infer_wav.shape[0] - block_48k
+                if available > 0:
+                    sola_buf[:available] = infer_wav[block_48k:]
+                sola_buf[max(0, available):] = 0.0
+
             if _gate_gain == 0.0:
-                # Output zeros; SOLA buf intentionally NOT reset (prevents pop on resume)
+                # Gate closed — output silence; sola_buf already updated above
                 out_48k = np.zeros(block_48k, dtype=np.float32)
             else:
-                # ── RMS envelope matching (Applio method) ─────────────────
-                # Scale output energy to match input energy. This prevents the
-                # converted voice from being much louder/quieter than the input,
-                # which would cause perceived level jumps on continuous speech.
-                # Use sqrt(input_rms²) = input_rms as the target amplitude.
-                out_rms = float(_torch.sqrt(_torch.mean(infer_wav ** 2)).item()) + 1e-8
-                rms_scale = (input_rms / out_rms) * _gate_gain
-                # Cap at 2× to prevent runaway amplification on near-silence blocks
-                rms_scale = min(rms_scale, 2.0)
+                # ── RMS envelope matching ─────────────────────────────────
+                # Use smoothed input RMS (EWMA) as the target amplitude to
+                # prevent single near-silence frames from causing 50× spikes.
+                # If rms_smooth hasn't been seeded yet (no voiced frame seen),
+                # fall back to raw input_rms.
+                ref_rms = _rms_smooth if _rms_smooth is not None else input_rms
+                out_rms = float(_torch.sqrt(_torch.mean(infer_wav[:block_48k] ** 2)).item()) + 1e-8
+                rms_scale = (ref_rms / out_rms)
+                # Cap at 1.5× — tighter than before since smoothed RMS is stable.
+                rms_scale = min(rms_scale, 1.5)
                 infer_wav = infer_wav * rms_scale
 
-                # ── SOLA crossfade (DDSP-SVC / RVC-WebUI-MacOS algorithm) ─
-                #
-                # Find the shift offset within [0, sola_search_48k] that maximises
-                # normalised cross-correlation between the start of infer_wav and
-                # the saved tail of the previous block (sola_buf).
-                #
-                # Then:
-                #  1. Shift infer_wav left by sola_offset samples.
-                #  2. Blend the first sola_buf_48k samples: fade_in × new + fade_out × old.
-                #  3. Save infer_wav[block_48k : block_48k+sola_buf_48k] as the next sola_buf.
-                #  4. Output infer_wav[:block_48k].
-                #
-                # Length check: if infer_wav is shorter than needed (model returned fewer
-                # samples), pad with zeros rather than crash.
-                if infer_wav.shape[0] < _min_infer_len:
-                    pad = _min_infer_len - infer_wav.shape[0]
-                    infer_wav = _F.pad(infer_wav, (0, pad))
-
-                search_len = sola_buf_48k + sola_search_48k
-                conv_input = infer_wav[None, None, :search_len]
-                cor_nom = _F.conv1d(conv_input, sola_buf[None, None, :])
-                cor_den = _torch.sqrt(
-                    _F.conv1d(conv_input ** 2,
-                               _torch.ones(1, 1, sola_buf_48k, device=infer_device))
-                    + 1e-8
-                )
-                # Full argmax over the search window — no artificial clamp.
-                # A clamped offset still has a phase discontinuity; we trust the
-                # cross-correlation to find the best alignment.
-                sola_offset = int(_torch.argmax(cor_nom[0, 0] / cor_den[0, 0]).item())
-
-                infer_wav = infer_wav[sola_offset:]
-
-                # Crossfade: blend previous block tail (fade_out) with new head (fade_in)
-                infer_wav[:sola_buf_48k] = (infer_wav[:sola_buf_48k] * fade_in
-                                             + sola_buf * fade_out)
-
-                # Save new tail for next iteration's crossfade
-                # Read from [block_48k : block_48k + sola_buf_48k] AFTER the offset shift
-                tail_end = block_48k + sola_buf_48k
-                if infer_wav.shape[0] >= tail_end:
-                    sola_buf[:] = infer_wav[block_48k:tail_end]
-                else:
-                    # Shorter than expected — zero-pad the tail store
-                    available = infer_wav.shape[0] - block_48k
-                    if available > 0:
-                        sola_buf[:available] = infer_wav[block_48k:]
-                    sola_buf[max(0, available):] = 0.0
-
-                # Clip output to [-1, 1] before writing to audio device
-                out_block = _torch.clamp(infer_wav[:block_48k], -1.0, 1.0)
+                # ── Per-sample gate envelope ──────────────────────────────
+                # Interpolate gate gain linearly from _gate_gain_cur (end of
+                # last block) to _gate_gain (target for this block).
+                # This converts the block-level step into a sample-level ramp,
+                # eliminating the amplitude discontinuity at block boundaries
+                # when the gate opens or closes.
+                gain_ramp = _torch.linspace(_gate_gain_cur, _gate_gain,
+                                             block_48k, device=infer_device)
+                out_block = _torch.clamp(infer_wav[:block_48k] * gain_ramp, -1.0, 1.0)
                 out_48k = out_block.cpu().numpy().astype(np.float32)
+
+            _gate_gain_cur = _gate_gain   # carry current gain into next block
 
             # ── write to output device ────────────────────────────────────
             try:
