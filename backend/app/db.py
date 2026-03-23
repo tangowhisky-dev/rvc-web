@@ -77,6 +77,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
     ("total_epochs_trained", "INTEGER NOT NULL DEFAULT 0"),
     ("checkpoint_path",      "TEXT"),   # G_latest.pth — resume checkpoint
     ("needs_retraining",     "INTEGER NOT NULL DEFAULT 0"),
+    # Speech-weighted RMS of the first uploaded audio file for this profile.
+    # All subsequent uploads are normalized to this value so the training corpus
+    # is level-consistent.  Also used at inference time to match microphone input
+    # level to the training distribution.  NULL on profiles created before this
+    # migration — the worker falls back gracefully (no pre-gain applied).
+    ("profile_rms",          "REAL"),
 ]
 
 

@@ -44,7 +44,7 @@ from fastapi.responses import FileResponse
 from fastapi import UploadFile
 from pydantic import BaseModel
 
-from backend.app.audio_preprocessing import get_duration
+from backend.app.audio_preprocessing import get_duration, measure_speech_rms, normalize_rms_inplace
 from backend.app.db import get_db
 
 logger = logging.getLogger("rvc_web.profiles")
@@ -86,6 +86,7 @@ class ProfileOut(BaseModel):
     index_path: Optional[str] = None
     total_epochs_trained: int = 0
     needs_retraining: bool = False
+    profile_rms: Optional[float] = None     # speech-weighted RMS of training data
     audio_files: list[AudioFileOut] = []
 
 
@@ -239,6 +240,7 @@ async def _row_to_out(row, db) -> ProfileOut:
         index_path=_resolve_index_path(row),
         total_epochs_trained=int(row["total_epochs_trained"] or 0) if "total_epochs_trained" in keys else 0,
         needs_retraining=bool(row["needs_retraining"]) if "needs_retraining" in keys else False,
+        profile_rms=float(row["profile_rms"]) if "profile_rms" in keys and row["profile_rms"] is not None else None,
         audio_files=audio_files,
     )
 
@@ -352,6 +354,7 @@ async def create_profile(
     pdir = os.path.join(_profiles_root(), profile_id)
     audio_dir = _audio_dir(pdir)
     os.makedirs(audio_dir, exist_ok=True)
+    loop = asyncio.get_event_loop()
 
     original_filename = file.filename or "upload.wav"
 
@@ -363,6 +366,14 @@ async def create_profile(
         shutil.rmtree(pdir, ignore_errors=True)
         raise
 
+    # Measure the speech-weighted RMS of this first file.  All subsequent files
+    # added to the profile will be normalized to match it.
+    profile_rms: Optional[float] = None
+    try:
+        profile_rms = await loop.run_in_executor(None, measure_speech_rms, file_path)
+    except Exception as exc:
+        logger.warning("profile RMS measurement failed for %s: %s", file_path, exc)
+
     created_at = datetime.now(timezone.utc).isoformat()
     file_id = uuid.uuid4().hex
 
@@ -370,9 +381,9 @@ async def create_profile(
         await db.execute(
             """INSERT INTO profiles
                (id, name, status, sample_path, batch_size, audio_duration,
-                preprocessed_path, profile_dir, created_at)
-               VALUES (?, ?, 'untrained', ?, 8, ?, NULL, ?, ?)""",
-            (profile_id, name, file_path, clip_dur, pdir, created_at),
+                preprocessed_path, profile_dir, profile_rms, created_at)
+               VALUES (?, ?, 'untrained', ?, 8, ?, NULL, ?, ?, ?)""",
+            (profile_id, name, file_path, clip_dur, pdir, profile_rms, created_at),
         )
         await db.execute(
             """INSERT INTO audio_files (id, profile_id, filename, file_path, duration, is_cleaned, created_at)
@@ -385,7 +396,7 @@ async def create_profile(
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining
+                      total_epochs_trained, needs_retraining, profile_rms
                FROM profiles WHERE id = ?""",
             (profile_id,),
         )
@@ -411,7 +422,7 @@ async def add_audio_file(
     """Clip and add an audio file to an existing profile."""
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT id, profile_dir, total_epochs_trained FROM profiles WHERE id = ?",
+            "SELECT id, profile_dir, total_epochs_trained, profile_rms FROM profiles WHERE id = ?",
             (profile_id,),
         )
         row = await cursor.fetchone()
@@ -425,11 +436,27 @@ async def add_audio_file(
 
     audio_dir = _audio_dir(pdir)
     os.makedirs(audio_dir, exist_ok=True)
+    loop = asyncio.get_event_loop()
 
     original_filename = file.filename or "upload.wav"
     file_path, filename, clip_dur = await _upload_and_clip(
         file, audio_dir, seg_start, seg_end, original_filename
     )
+
+    # Normalize to the profile's RMS reference so all training files are
+    # level-consistent.  If the profile has no stored RMS yet (legacy profile),
+    # skip normalization — it will be measured next time training starts.
+    stored_rms = row["profile_rms"]
+    if stored_rms is not None:
+        try:
+            await loop.run_in_executor(
+                None, normalize_rms_inplace, file_path, float(stored_rms)
+            )
+            logger.info(
+                "normalized new file %s to profile_rms=%.5f", filename, stored_rms
+            )
+        except Exception as exc:
+            logger.warning("RMS normalization failed for %s: %s — keeping original level", filename, exc)
 
     file_id = uuid.uuid4().hex
     created_at = datetime.now(timezone.utc).isoformat()
@@ -471,7 +498,7 @@ async def list_profiles() -> list[ProfileOut]:
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining
+                      total_epochs_trained, needs_retraining, profile_rms
                FROM profiles ORDER BY created_at DESC"""
         )
         rows = await cursor.fetchall()
@@ -492,7 +519,7 @@ async def get_profile(profile_id: str) -> ProfileOut:
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining
+                      total_epochs_trained, needs_retraining, profile_rms
                FROM profiles WHERE id = ?""",
             (profile_id,),
         )
@@ -575,13 +602,23 @@ async def delete_audio_file(profile_id: str, file_id: str) -> Response:
 
 @router.post("/{profile_id}/audio/{file_id}/clean", response_model=PreprocessResponse)
 async def clean_audio_file(profile_id: str, file_id: str) -> PreprocessResponse:
-    """Run noise removal on one audio file, overwriting it in-place."""
+    """Run noise removal on one audio file, overwriting it in-place.
+
+    After noise removal the file is RMS-normalized to the profile's stored
+    reference level.  The noise removal step peak-normalizes to −1 dBFS which
+    changes the RMS; the subsequent RMS step brings it back to the profile level.
+    """
     async with get_db() as db:
         cursor = await db.execute(
             "SELECT file_path, filename FROM audio_files WHERE id = ? AND profile_id = ?",
             (file_id, profile_id),
         )
         row = await cursor.fetchone()
+        cursor2 = await db.execute(
+            "SELECT profile_rms FROM profiles WHERE id = ?",
+            (profile_id,),
+        )
+        profile_row = await cursor2.fetchone()
 
     if row is None:
         raise HTTPException(status_code=404, detail="Audio file not found")
@@ -618,6 +655,17 @@ async def clean_audio_file(profile_id: str, file_id: str) -> PreprocessResponse:
             except OSError:
                 pass
         return PreprocessResponse(ok=False, message=f"Unexpected error: {exc}")
+
+    # Re-apply RMS normalization — noise removal peak-normalizes to −1 dBFS
+    # which shifts the RMS away from the profile reference.
+    stored_rms = profile_row["profile_rms"] if profile_row else None
+    if stored_rms is not None:
+        try:
+            await loop.run_in_executor(
+                None, normalize_rms_inplace, file_path, float(stored_rms)
+            )
+        except Exception as exc:
+            logger.warning("post-clean RMS normalization failed for %s: %s", file_path, exc)
 
     cleaned_dur = await loop.run_in_executor(None, get_duration, file_path)
 

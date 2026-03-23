@@ -225,11 +225,11 @@ def run_worker(
     save_path: str | None = None,
     model_path: str | None = None,
     index_path: str | None = None,
+    profile_rms: float | None = None,
 ) -> None:
     """Run in isolated child process. Owns all native code (fairseq, sounddevice, MPS)."""
 
     import glob as _glob
-
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -429,6 +429,38 @@ def run_worker(
         _rms_alpha   = 0.15          # EWMA weight (higher = faster tracking)
         _rms_smooth  = None          # initialized on first speech frame
 
+        # Input pre-gain: scales the microphone signal to match the RMS level of
+        # the training data before it reaches the model.  This is the single most
+        # important inference-time fix for cross-speaker RMS mismatch.
+        #
+        # How it works:
+        #   profile_rms is the speech-weighted RMS of the first uploaded training
+        #   file, measured during upload and stored in the profiles table.
+        #   At inference time we want the model to see input at the same level it
+        #   was trained on.  _pre_gain = profile_rms / live_rms is computed as a
+        #   running estimate using the EWMA of the live microphone RMS.
+        #
+        #   To avoid instability on the very first block (EWMA not yet warmed up),
+        #   we set an initial static pre-gain from the ratio of profile_rms to a
+        #   reasonable default mic level (0.03 ≈ typical speech at -30 dBFS).
+        #   The EWMA then adapts it block by block.
+        #
+        #   Gain is clamped to [_PRE_GAIN_MIN, _PRE_GAIN_MAX] to prevent extreme
+        #   amplification of silence or breath noise.
+        _PRE_GAIN_MIN = 0.1
+        _PRE_GAIN_MAX = 10.0
+        _MIC_RMS_DEFAULT = 0.03   # assumed initial mic RMS before EWMA warms up
+        if profile_rms is not None and profile_rms > 0:
+            _pre_gain = float(np.clip(profile_rms / _MIC_RMS_DEFAULT,
+                                      _PRE_GAIN_MIN, _PRE_GAIN_MAX))
+            logging.getLogger("rvc_web.worker").info(
+                "input pre-gain enabled: profile_rms=%.5f  initial_gain=%.3f×",
+                profile_rms, _pre_gain,
+            )
+        else:
+            _pre_gain = 1.0   # no normalization — legacy profile or RMS not measured
+        _mic_rms_ewma: float = _MIC_RMS_DEFAULT  # adaptive mic-level EWMA
+
         # Rolling 16k context buffer — circular shift, no torch.roll (avoids copy)
         rolling_buf = _torch.zeros(total_16k_samples, dtype=_torch.float32,
                                    device=infer_device)
@@ -488,6 +520,21 @@ def run_worker(
             x_44k = data.squeeze()
             x_44k_t = _torch.from_numpy(x_44k).to(infer_device)
             x_16k_t = _resample_44_16(x_44k_t.unsqueeze(0)).squeeze(0)
+
+            # ── input RMS pre-gain ────────────────────────────────────────
+            # Normalise microphone input to the training-data RMS level so the
+            # model always sees the distribution it was trained on.
+            # The gain adapts block-by-block: on every voiced frame we update a
+            # slow EWMA of the live mic RMS and recompute _pre_gain from it.
+            # Clamped to [_PRE_GAIN_MIN, _PRE_GAIN_MAX] for stability.
+            _raw_rms = float(_torch.sqrt(_torch.mean(x_16k_t ** 2)).item())
+            if profile_rms is not None and profile_rms > 0 and _raw_rms > _silence_rms:
+                # Update mic-level EWMA only on voiced frames (avoids drift from breath/noise)
+                _mic_rms_ewma = _rms_alpha * _raw_rms + (1 - _rms_alpha) * _mic_rms_ewma
+                _pre_gain = float(np.clip(profile_rms / _mic_rms_ewma,
+                                          _PRE_GAIN_MIN, _PRE_GAIN_MAX))
+            if _pre_gain != 1.0:
+                x_16k_t = x_16k_t * _pre_gain
 
             # ── update rolling 16k buffer (circular shift) ────────────────
             # Equivalent to torch.roll but avoids the internal copy overhead.

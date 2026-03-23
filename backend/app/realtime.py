@@ -160,7 +160,7 @@ class RealtimeManager:
         # Validate profile in DB and fetch artifact paths
         async with get_db() as db:
             row = await db.execute_fetchall(
-                """SELECT id, status, model_path, index_path, profile_dir
+                """SELECT id, status, model_path, index_path, profile_dir, profile_rms
                    FROM profiles WHERE id = ?""",
                 (profile_id,),
             )
@@ -174,6 +174,7 @@ class RealtimeManager:
         db_model_path: Optional[str] = row[0][2] or None
         db_index_path: Optional[str] = row[0][3] or None
         stored_profile_dir: Optional[str] = row[0][4] or None
+        db_profile_rms: Optional[float] = float(row[0][5]) if row[0][5] is not None else None
 
         # Check for per-profile canonical paths first
         if stored_profile_dir:
@@ -209,6 +210,7 @@ class RealtimeManager:
                 save_path=save_path,
                 model_path=db_model_path,
                 index_path=db_index_path,
+                profile_rms=db_profile_rms,
             ),
             daemon=True,
         )
