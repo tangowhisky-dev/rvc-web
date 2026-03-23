@@ -108,7 +108,7 @@ def remove_noise(
         cleaned = cleaned / peak * 0.891  # -1 dBFS
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    sf.write(output_path, cleaned, sr, subtype="PCM_16")
+    sf.write(output_path, cleaned, sr, subtype="PCM_16", format="WAV")
 
     logger.info(
         "noise removal complete: %s -> %s (%.1f s)",

@@ -14,6 +14,8 @@ interface Profile {
   name: string;
   status: string;
   total_epochs_trained: number;
+  needs_retraining: boolean;
+  audio_files: { id: string; duration: number | null }[];
 }
 
 interface HardwareInfo {
@@ -51,6 +53,15 @@ interface EpochPoint {
   loss_kl: number;
 }
 
+interface EpochLossPoint {
+  epoch: number;
+  loss_mel: number | null;
+  loss_gen: number | null;
+  loss_disc: number | null;
+  loss_fm: number | null;
+  loss_kl: number | null;
+  trained_at: string;
+}
 type JobState = 'idle' | 'running' | 'done' | 'failed';
 
 function nowStamp() {
@@ -105,7 +116,7 @@ const LOSS_SERIES = [
   { key: 'loss_kl',   label: 'KL',    color: '#f87171' }, // red    — latent regularisation
 ] as const;
 
-function LossChart({ points, totalEpochs }: { points: EpochPoint[]; totalEpochs: number }) {
+function LossChart({ points, totalEpochs: totalEpochsProp }: { points: EpochPoint[]; totalEpochs?: number }) {
   if (points.length < 2) {
     return (
       <div className="h-36 flex items-center justify-center text-zinc-600 font-mono text-[11px]">
@@ -113,6 +124,8 @@ function LossChart({ points, totalEpochs }: { points: EpochPoint[]; totalEpochs:
       </div>
     );
   }
+
+  const totalEpochs = totalEpochsProp ?? Math.max(...points.map(p => p.epoch));
 
   const W = 560; // viewBox width
   const H = 120; // viewBox height
@@ -382,7 +395,104 @@ export default function TrainingPage() {
   }, [logLines]);
   useEffect(() => () => { wsRef.current?.close(); wsRef.current = null; }, []);
 
-  // Fetch profiles + hardware on mount
+  // Load historical epoch losses whenever the selected profile changes.
+  // New epochs from a live run are appended on top of these.
+  useEffect(() => {
+    if (!selectedId) { setEpochPoints([]); return; }
+    let cancelled = false;
+    fetch(`${API}/api/training/losses/${selectedId}`)
+      .then(r => r.ok ? r.json() : [])
+      .then((rows: EpochLossPoint[]) => {
+        if (cancelled) return;
+        setEpochPoints(rows.map(r => ({
+          epoch:     r.epoch,
+          loss_mel:  r.loss_mel  ?? 0,
+          loss_gen:  r.loss_gen  ?? 0,
+          loss_disc: r.loss_disc ?? 0,
+          loss_fm:   r.loss_fm   ?? 0,
+          loss_kl:   r.loss_kl   ?? 0,
+        })));
+      })
+      .catch(() => { if (!cancelled) setEpochPoints([]); });
+    return () => { cancelled = true; };
+  }, [selectedId]);
+
+  // -------------------------------------------------------------------------
+  // attachWs — wire up a WebSocket for profile_id and drive UI state from it.
+  // Called both from handleStart (new job) and on mount (reconnect to in-progress).
+  // -------------------------------------------------------------------------
+  function attachWs(profileId: string) {
+    closeWs();
+    const ws = new WebSocket(`${WS_BASE}/ws/training/${profileId}`);
+    wsRef.current = ws;
+
+    ws.onmessage = (ev: MessageEvent) => {
+      try {
+        const msg = JSON.parse(ev.data as string) as TrainingMsg;
+        if (msg.type === 'keepalive') return; // silent keepalive — do nothing
+        if (msg.phase && msg.type !== 'done') setCurrentPhase(msg.phase);
+        if (msg.type === 'log') {
+          if (msg.message) appendLog(msg.message);
+        } else if (msg.type === 'phase') {
+          if (msg.message) appendLog(`── ${msg.phase?.toUpperCase() ?? ''}: ${msg.message}`);
+        } else if (msg.type === 'epoch_done') {
+          if (msg.message) appendLog(`✓ ${msg.message}`);
+          if (msg.epoch != null && msg.losses) {
+            const l = msg.losses;
+            setEpochPoints(prev => [...prev, {
+              epoch:     msg.epoch!,
+              loss_mel:  l.loss_mel  ?? 0,
+              loss_gen:  l.loss_gen  ?? 0,
+              loss_disc: l.loss_disc ?? 0,
+              loss_fm:   l.loss_fm   ?? 0,
+              loss_kl:   l.loss_kl   ?? 0,
+            }]);
+          }
+        } else if (msg.type === 'done') {
+          setCurrentPhase('done');
+          setJobState('done');
+          jobStateRef.current = 'done';
+          if (msg.message) appendLog(`✓ ${msg.message}`);
+          // Refresh profiles so epoch count updates
+          fetch(`${API}/api/profiles`).then(r => r.ok ? r.json() : null).then(d => { if (d) setProfiles(d); }).catch(() => {});
+          closeWs();
+        } else if (msg.type === 'error') {
+          setJobState('failed');
+          jobStateRef.current = 'failed';
+          const t = msg.message ?? 'Unknown error';
+          setErrorMsg(t);
+          appendLog(`ERROR: ${t}`);
+          closeWs();
+        }
+      } catch { /* malformed JSON */ }
+    };
+
+    ws.onerror = () => {
+      // onerror fires if the WS upgrade itself fails (backend down, port wrong, etc.)
+      // Don't treat this as a training failure — the job may still be running.
+      // Log it and let onclose decide state.
+      appendLog('(WebSocket connection error — will retry on next action)');
+      closeWs();
+      if (jobStateRef.current === 'running') {
+        // Don't flip to failed — just go idle so user can reconnect
+        setJobState('idle');
+        jobStateRef.current = 'idle';
+      }
+    };
+
+    ws.onclose = () => {
+      if (jobStateRef.current === 'running') {
+        appendLog('(connection closed — training may still be running)');
+        setJobState('idle');
+        jobStateRef.current = 'idle';
+      }
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // On mount: fetch profiles + hardware, then check if any profile has a
+  // running job and reconnect to its WS stream.
+  // -------------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false;
     async function load() {
@@ -395,7 +505,6 @@ export default function TrainingPage() {
         const data: Profile[] = await pRes.json();
         if (cancelled) return;
         setProfiles(data);
-        if (data.length) setSelectedId(data[0].id);
 
         if (hwRes.ok) {
           const hwData: HardwareInfo = await hwRes.json();
@@ -404,15 +513,44 @@ export default function TrainingPage() {
             setBatchSize(hwData.sweet_spot_batch_size);
           }
         }
+
+        // Check every profile for a running job; pick the first one found.
+        let resumedId: string | null = null;
+        for (const p of data) {
+          try {
+            const sRes = await fetch(`${API}/api/training/status/${p.id}`);
+            if (sRes.ok) {
+              const s = await sRes.json();
+              if (s.status === 'training' || s.phase === 'train' || s.phase === 'preprocess' || s.phase === 'extract_f0' || s.phase === 'extract_feature' || s.phase === 'index') {
+                resumedId = p.id;
+                break;
+              }
+            }
+          } catch { /* no job for this profile */ }
+        }
+
+        if (cancelled) return;
+
+        if (resumedId) {
+          // Pre-select the profile that's training
+          setSelectedId(resumedId);
+          setJobState('running');
+          jobStateRef.current = 'running';
+          appendLog(`(reconnected — training for profile ${data.find(p => p.id === resumedId)?.name ?? resumedId} already in progress)`);
+          attachWs(resumedId);
+        } else if (data.length) {
+          setSelectedId(data[0].id);
+        }
       } catch (err) {
         if (!cancelled) setProfilesError(
           `Cannot reach backend (${err instanceof Error ? err.message : String(err)}). ` +
-          'Start the backend: conda run -n rvc uvicorn backend.app.main:app --reload'
+          'Run: bash scripts/start.sh'
         );
       }
     }
     load();
     return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function appendLog(line: string, ts?: string) {
@@ -433,7 +571,7 @@ export default function TrainingPage() {
     setErrorMsg(null);
     setLogLines([]);
     setCurrentPhase(null);
-    setEpochPoints([]);
+    // Don't clear epochPoints — historical losses stay; new epochs append on top
 
     try {
       const res = await fetch(`${API}/api/training/start`, {
@@ -441,6 +579,16 @@ export default function TrainingPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize }),
       });
+
+      if (res.status === 409) {
+        // Job already running for this profile — connect to it instead of erroring.
+        appendLog('(job already running — reconnecting to in-progress training)');
+        setJobState('running');
+        jobStateRef.current = 'running';
+        attachWs(selectedId);
+        return;
+      }
+
       if (!res.ok) {
         const body = await res.json().catch(() => ({ detail: res.statusText }));
         throw new Error(body.detail ?? `HTTP ${res.status}`);
@@ -448,65 +596,7 @@ export default function TrainingPage() {
 
       setJobState('running');
       jobStateRef.current = 'running';
-
-      const ws = new WebSocket(`${WS_BASE}/ws/training/${selectedId}`);
-      wsRef.current = ws;
-
-      ws.onmessage = (ev: MessageEvent) => {
-        try {
-          const msg = JSON.parse(ev.data as string) as TrainingMsg;
-          if (msg.phase && msg.type !== 'done') setCurrentPhase(msg.phase);
-          if (msg.type === 'log') {
-            if (msg.message) appendLog(msg.message);
-          } else if (msg.type === 'phase') {
-            if (msg.message) appendLog(`── ${msg.phase?.toUpperCase() ?? ''}: ${msg.message}`);
-          } else if (msg.type === 'epoch_done') {
-            if (msg.message) appendLog(`✓ ${msg.message}`);
-            if (msg.epoch != null && msg.losses) {
-              const l = msg.losses;
-              setEpochPoints(prev => [...prev, {
-                epoch:     msg.epoch!,
-                loss_mel:  l.loss_mel  ?? 0,
-                loss_gen:  l.loss_gen  ?? 0,
-                loss_disc: l.loss_disc ?? 0,
-                loss_fm:   l.loss_fm   ?? 0,
-                loss_kl:   l.loss_kl   ?? 0,
-              }]);
-            }
-          } else if (msg.type === 'done') {
-            setCurrentPhase('done');
-            setJobState('done');
-            jobStateRef.current = 'done';
-            if (msg.message) appendLog(`✓ ${msg.message}`);
-            closeWs();
-          } else if (msg.type === 'error') {
-            setJobState('failed');
-            jobStateRef.current = 'failed';
-            const t = msg.message ?? 'Unknown error';
-            setErrorMsg(t);
-            appendLog(`ERROR: ${t}`);
-            closeWs();
-          }
-        } catch { /* malformed JSON */ }
-      };
-
-      ws.onerror = () => {
-        appendLog('(WebSocket error)');
-        if (jobStateRef.current === 'running') {
-          setJobState('failed');
-          jobStateRef.current = 'failed';
-          setErrorMsg('WebSocket error — check backend logs.');
-        }
-        closeWs();
-      };
-
-      ws.onclose = () => {
-        if (jobStateRef.current === 'running') {
-          appendLog('(connection closed)');
-          setJobState('idle');
-          jobStateRef.current = 'idle';
-        }
-      };
+      attachWs(selectedId);
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err);
       setErrorMsg(m);
@@ -567,6 +657,14 @@ export default function TrainingPage() {
       </header>
 
       <div className="max-w-4xl mx-auto px-6 py-8 flex flex-col gap-8">
+        {/* In-progress notice */}
+        {isRunning && (
+          <div className="rounded-lg border border-cyan-800/60 bg-cyan-950/30 px-4 py-3 text-[13px] font-mono text-cyan-300 flex items-center gap-3">
+            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse shrink-0" />
+            Training in progress — cancel to interrupt, or watch the log and chart below.
+          </div>
+        )}
+
         {(profilesError || (jobState === 'failed' && errorMsg)) && (
           <div className="rounded-lg border border-red-800/60 bg-red-950/40 px-4 py-3 text-[13px] font-mono text-red-300">
             {profilesError || errorMsg}
@@ -602,6 +700,7 @@ export default function TrainingPage() {
                       <option key={p.id} value={p.id}>
                         {p.name}
                         {p.total_epochs_trained > 0 ? ` (${p.total_epochs_trained} ep)` : ''}
+                        {p.needs_retraining ? ' ⚠' : ''}
                         {p.status === 'trained' ? ' ✓' : p.status === 'training' ? ' ⟳' : p.status === 'failed' ? ' ✗' : ''}
                       </option>
                     ))}
@@ -621,14 +720,24 @@ export default function TrainingPage() {
                              font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
                              disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
                 />
-                {/* Resume indicator */}
+                {/* Resume indicator / re-training warning */}
                 {(() => {
                   const sel = profiles.find(p => p.id === selectedId);
-                  return sel && sel.total_epochs_trained > 0 ? (
-                    <span className="text-[10px] font-mono text-amber-500/80">
-                      ↳ resume from epoch {sel.total_epochs_trained} → {sel.total_epochs_trained + epochs} total
-                    </span>
-                  ) : null;
+                  if (!sel) return null;
+                  return (
+                    <div className="flex flex-col gap-1">
+                      {sel.total_epochs_trained > 0 && (
+                        <span className="text-[10px] font-mono text-amber-500/80">
+                          ↳ resume from epoch {sel.total_epochs_trained} → {sel.total_epochs_trained + epochs} total
+                        </span>
+                      )}
+                      {sel.needs_retraining && (
+                        <span className="text-[10px] font-mono text-amber-400">
+                          ⚠ audio files changed — re-training recommended
+                        </span>
+                      )}
+                    </div>
+                  );
                 })()}
               </div>
             </div>
@@ -676,18 +785,22 @@ export default function TrainingPage() {
           </section>
         )}
 
-        {(epochPoints.length > 0 || jobState === 'running') && currentPhase === 'train' || epochPoints.length > 0 ? (
+        {epochPoints.length > 0 ? (
           <section>
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500">Loss Curves</h2>
-              {epochPoints.length > 0 && (
-                <span className="text-[10px] font-mono text-zinc-600">
-                  {epochPoints.length} / {epochs} epochs
-                </span>
-              )}
+              <span className="text-[10px] font-mono text-zinc-600">
+                {epochPoints.length} epoch{epochPoints.length !== 1 ? 's' : ''}
+                {isRunning ? ` · +${epochs} target` : ''}
+              </span>
             </div>
             <div className="bg-zinc-950 rounded-lg p-3 border border-zinc-800">
-              <LossChart points={epochPoints} totalEpochs={epochs} />
+              <LossChart
+                points={epochPoints}
+                totalEpochs={isRunning
+                  ? Math.max(epochPoints.length > 0 ? epochPoints[epochPoints.length - 1].epoch : 0, epochs)
+                  : undefined}
+              />
             </div>
           </section>
         ) : null}
@@ -732,7 +845,7 @@ export default function TrainingPage() {
         </section>
 
         <footer className="text-[11px] font-mono text-zinc-600 pb-4">
-          Training data must be uploaded as a voice sample in the Library tab first.
+          Training data must be uploaded as voice sample(s) in the Library tab first.
         </footer>
       </div>
     </main>

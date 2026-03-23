@@ -308,6 +308,10 @@ class RealtimeManager:
                 if session._proc is not None and not session._proc.is_alive():
                     if session.status != "active":
                         break
+                    else:
+                        print(f"ERROR: worker process {session._proc.pid} died unexpectedly!", flush=True)
+                        self.stop_session(session.session_id)
+                        break
                 continue
 
             event = msg.get("event", "")

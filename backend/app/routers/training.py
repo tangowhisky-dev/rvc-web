@@ -1,11 +1,12 @@
 """Training REST + WebSocket router.
 
 Endpoints:
-  GET    /api/training/hardware           — hardware info + batch size sweet spot
-  POST   /api/training/start              — start a training job
-  POST   /api/training/cancel             — cancel a running training job
+  GET    /api/training/hardware            — hardware info + batch size sweet spot
+  POST   /api/training/start               — start a training job
+  POST   /api/training/cancel              — cancel a running training job
   GET    /api/training/status/{profile_id} — poll job status
-  WS     /ws/training/{profile_id}        — live log stream
+  GET    /api/training/losses/{profile_id} — historical epoch losses for chart
+  WS     /ws/training/{profile_id}         — live log stream
 """
 
 import asyncio
@@ -53,6 +54,16 @@ class StatusResponse(BaseModel):
     progress_pct: int
     status: str
     error: Optional[str] = None
+
+
+class EpochLossPoint(BaseModel):
+    epoch: int
+    loss_mel: Optional[float] = None
+    loss_gen: Optional[float] = None
+    loss_disc: Optional[float] = None
+    loss_fm: Optional[float] = None
+    loss_kl: Optional[float] = None
+    trained_at: str
 
 
 class HardwareInfo(BaseModel):
@@ -155,13 +166,40 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     if row is None:
         raise HTTPException(status_code=404, detail=f"Profile not found: {request.profile_id}")
 
-    if row["sample_path"] is None:
-        raise HTTPException(status_code=400, detail="Profile has no sample_path")
-
     rvc_root = os.environ.get("RVC_ROOT", "")
     if not rvc_root:
         raise HTTPException(status_code=400, detail="RVC_ROOT not set")
     rvc_root = os.path.abspath(rvc_root)
+
+    # Resolve profile_dir — new profiles have it stored; legacy ones derive it
+    stored_profile_dir = row["profile_dir"] if "profile_dir" in row.keys() else None
+    if stored_profile_dir:
+        profile_dir = os.path.abspath(stored_profile_dir)
+    else:
+        # Legacy: derive from DATA_DIR or default
+        data_dir = os.environ.get("DATA_DIR", "data")
+        profile_dir = os.path.abspath(os.path.join(data_dir, "profiles", request.profile_id))
+
+    # sample_dir = profile_dir/audio/ so all audio files are picked up by
+    # preprocess.py (it does os.listdir on this directory).
+    # Fall back to legacy sample_path dirname for profiles without profile_dir.
+    # Use abspath — preprocess.py runs with cwd=rvc_root so relative paths
+    # would resolve against the wrong directory.
+    audio_dir = os.path.abspath(os.path.join(profile_dir, "audio"))
+    if os.path.isdir(audio_dir):
+        sample_dir = audio_dir
+    elif row["sample_path"]:
+        sample_dir = os.path.dirname(os.path.abspath(row["sample_path"]))
+    else:
+        raise HTTPException(status_code=400, detail="Profile has no audio files")
+
+    # Verify at least one WAV exists in sample_dir
+    try:
+        wav_files = [f for f in os.listdir(sample_dir) if f.endswith(".wav")]
+    except OSError:
+        wav_files = []
+    if not wav_files:
+        raise HTTPException(status_code=400, detail="No audio files found in profile — add audio before training")
 
     # Request batch_size always wins over the profile's stored default.
     # Persist it back so the DB stays in sync with what was actually used.
@@ -172,17 +210,6 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
             (batch_size, request.profile_id),
         )
         await db.commit()
-
-    sample_dir = os.path.dirname(os.path.abspath(row["sample_path"]))
-
-    # Resolve profile_dir — new profiles have it stored; legacy ones derive it
-    stored_profile_dir = row["profile_dir"] if "profile_dir" in row.keys() else None
-    if stored_profile_dir:
-        profile_dir = stored_profile_dir
-    else:
-        # Legacy: derive from DATA_DIR or default
-        data_dir = os.environ.get("DATA_DIR", "data")
-        profile_dir = os.path.join(data_dir, "profiles", request.profile_id)
 
     try:
         job = manager.start_job(
@@ -270,6 +297,40 @@ async def get_status(profile_id: str) -> StatusResponse:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# GET /api/training/losses/{profile_id}
+# ---------------------------------------------------------------------------
+
+@router.get("/losses/{profile_id}", response_model=list[EpochLossPoint])
+async def get_losses(profile_id: str) -> list[EpochLossPoint]:
+    """Return all persisted epoch losses for a profile, ordered by epoch.
+
+    Returns an empty list if no loss data exists yet (new profile, or
+    training has never completed an epoch).
+    """
+    async with get_db() as db:
+        cursor = await db.execute(
+            """SELECT epoch, loss_mel, loss_gen, loss_disc, loss_fm, loss_kl, trained_at
+               FROM epoch_losses
+               WHERE profile_id = ?
+               ORDER BY epoch ASC""",
+            (profile_id,),
+        )
+        rows = await cursor.fetchall()
+    return [
+        EpochLossPoint(
+            epoch=r["epoch"],
+            loss_mel=r["loss_mel"],
+            loss_gen=r["loss_gen"],
+            loss_disc=r["loss_disc"],
+            loss_fm=r["loss_fm"],
+            loss_kl=r["loss_kl"],
+            trained_at=r["trained_at"],
+        )
+        for r in rows
+    ]
+
+
 # WS /ws/training/{profile_id}  (registered on ws_router, no prefix)
 # ---------------------------------------------------------------------------
 

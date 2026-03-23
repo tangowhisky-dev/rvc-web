@@ -99,6 +99,6 @@ if [ -z "$FRONTEND_URL" ]; then
   FRONTEND_URL="http://localhost:3000"
 fi
 
-echo "[start] Opening browser at $FRONTEND_URL"
-open "$FRONTEND_URL"
+#echo "[start] Opening browser at $FRONTEND_URL"
+#open "$FRONTEND_URL"
 echo "[start] Done — $FRONTEND_URL"

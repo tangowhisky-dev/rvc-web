@@ -40,7 +40,7 @@ from typing import Dict, Optional
 import aiofiles
 import numpy as np
 
-from backend.app.db import get_db
+from backend.app.db import get_db, save_epoch_loss
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +360,7 @@ async def _run_pipeline(
     # non-feature directories.
     # ------------------------------------------------------------------
     ckpt_dir = os.path.join(profile_dir, "checkpoints") if profile_dir else None
+    seeded_checkpoint = False
     if ckpt_dir and os.path.isdir(ckpt_dir):
         os.makedirs(exp_dir, exist_ok=True)
         for ckpt_file in ("G_latest.pth", "D_latest.pth"):
@@ -367,6 +368,7 @@ async def _run_pipeline(
             dst = os.path.join(exp_dir, ckpt_file)
             if os.path.exists(src):
                 shutil.copy2(src, dst)
+                seeded_checkpoint = True
                 await job.queue.put({
                     "type": "log",
                     "message": f"Seeded {ckpt_file} from profile checkpoints (resuming from epoch {prior_epochs})",
@@ -379,22 +381,66 @@ async def _run_pipeline(
     # Preserve the feature extraction outputs (0_gt_wavs, 1_16k_wavs,
     # 2a_f0, 2b-f0nsf, 3_feature768) so re-runs skip those phases fast
     # when the audio hasn't changed.
-    # Preserve G_latest.pth / D_latest.pth that were just seeded above.
+    # Preserve G_latest.pth / D_latest.pth ONLY if they were just seeded
+    # from this profile's own checkpoints/ dir.  If this is a fresh profile
+    # (prior_epochs == 0 and nothing was seeded), delete any stale
+    # checkpoints left by a previously-deleted profile so train.py starts
+    # from pretrained weights instead of inheriting a stranger's weights.
+    #
+    # Additionally: if exp_dir was built for a *different* profile (detected
+    # via a sentinel file), wipe the feature dirs too — they're stale audio.
     # ------------------------------------------------------------------
-    _KEEP_DIRS  = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
-    _KEEP_FILES = {"G_latest.pth", "D_latest.pth"}
-    if os.path.isdir(exp_dir):
-        for entry in os.listdir(exp_dir):
-            if entry in _KEEP_DIRS or entry in _KEEP_FILES:
-                continue
-            full = os.path.join(exp_dir, entry)
-            try:
-                if os.path.isdir(full):
-                    shutil.rmtree(full, ignore_errors=True)
-                else:
-                    os.remove(full)
-            except OSError:
-                pass
+    sentinel_path = os.path.join(exp_dir, ".profile_id")
+    prev_profile_id = None
+    if os.path.isfile(sentinel_path):
+        try:
+            prev_profile_id = open(sentinel_path).read().strip()
+        except OSError:
+            pass
+
+    different_profile = prev_profile_id is not None and prev_profile_id != job.profile_id
+
+    # If a different profile last used this workspace, treat as completely fresh:
+    # wipe feature dirs too so preprocessing reruns for the new audio.
+    if different_profile:
+        await job.queue.put({
+            "type": "log",
+            "message": f"Detected stale workspace from profile {prev_profile_id[:8]}… — clearing all cached features",
+            "phase": "setup",
+        })
+        if os.path.isdir(exp_dir):
+            shutil.rmtree(exp_dir, ignore_errors=True)
+        os.makedirs(exp_dir, exist_ok=True)
+        # Re-seed checkpoints after clearing (they were copied before cleanup above)
+        if seeded_checkpoint and ckpt_dir:
+            for ckpt_file in ("G_latest.pth", "D_latest.pth"):
+                src = os.path.join(ckpt_dir, ckpt_file)
+                dst = os.path.join(exp_dir, ckpt_file)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+    else:
+        _KEEP_DIRS  = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
+        _KEEP_FILES = {"G_latest.pth", "D_latest.pth"} if seeded_checkpoint else set()
+        if os.path.isdir(exp_dir):
+            for entry in os.listdir(exp_dir):
+                if entry in _KEEP_DIRS or entry in _KEEP_FILES:
+                    continue
+                full = os.path.join(exp_dir, entry)
+                try:
+                    if os.path.isdir(full):
+                        shutil.rmtree(full, ignore_errors=True)
+                    else:
+                        os.remove(full)
+                except OSError:
+                    pass
+        os.makedirs(exp_dir, exist_ok=True)
+
+    # Write sentinel so the next run can detect a profile change.
+    try:
+        with open(sentinel_path, "w") as f:
+            f.write(job.profile_id)
+    except OSError:
+        pass
     os.makedirs(exp_dir, exist_ok=True)
 
     # Delete stale .spec.pt cache files inside 0_gt_wavs.
@@ -674,6 +720,12 @@ async def _run_pipeline(
                     if losses:
                         msg["losses"] = losses
                     await job.queue.put(msg)
+                    # Persist losses to DB so the chart survives restarts
+                    if losses:
+                        try:
+                            await save_epoch_loss(job.profile_id, epoch_num, losses)
+                        except Exception as _e:
+                            logger.warning(f"epoch_loss DB write failed: {_e}")
                     last_loss_line = ""
                     continue
 
@@ -845,7 +897,8 @@ async def _run_pipeline(
                    model_path = ?,
                    checkpoint_path = ?,
                    index_path = ?,
-                   total_epochs_trained = ?
+                   total_epochs_trained = ?,
+                   needs_retraining = 0
                WHERE id = ?""",
             (dest_infer_path, dest_model_path, dest_index_path, new_total_epochs, job.profile_id),
         )

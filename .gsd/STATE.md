@@ -44,3 +44,9 @@ None.
 
 Ready for M002 planning. Run `./scripts/start.sh` for hardware UAT with MPS inference.
 
+
+## RVC Realtime Inference Crash Fix
+- Discovered that the root cause of the immediate worker crash on audio input was an OpenMP `libomp.dylib` clash combined with FAISS requiring contiguous memory on some environments.
+- Applied `np.ascontiguousarray` monkey-patch to `rvc.index.search(npy)` to prevent segfaults when querying the RVC index.
+- Restored missing `faiss` `import` in `_realtime_worker.py` and `omp_set_num_threads(1)` call to prevent macOS multithreading crash.
+- Realtime WS now streams audio properly (tested on backend endpoint).

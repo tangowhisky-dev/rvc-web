@@ -260,11 +260,53 @@ export default function RealtimePage() {
       }
     }
 
+    async function checkActiveSession() {
+      try {
+        const res = await fetch(`${API}/api/realtime/status`);
+        if (!res.ok) return;
+        const status = await res.json();
+        if (cancelled) return;
+        if (status.active && status.session_id) {
+          // Session already running — restore state and reconnect WS
+          setSessionId(status.session_id);
+          sessionIdRef.current = status.session_id;
+          setSessionState('active');
+          // Reopen WS for live waveform feed
+          const ws = new WebSocket(`ws://localhost:8000/ws/realtime/${status.session_id}`);
+          wsRef.current = ws;
+          ws.onmessage = (event) => {
+            try {
+              const msg = JSON.parse(event.data as string);
+              if (workerRef.current) workerRef.current.postMessage(msg);
+              if (msg.type === 'done') {
+                setSessionState('idle');
+                setSessionId(null);
+                sessionIdRef.current = null;
+                cleanup();
+              }
+            } catch (_) {}
+          };
+          ws.onerror = () => { cleanup(); setSessionState('idle'); };
+          ws.onclose = () => {
+            if (sessionIdRef.current !== null) {
+              setSessionState('idle');
+              setSessionId(null);
+              sessionIdRef.current = null;
+            }
+          };
+        }
+      } catch (_) {
+        // Non-fatal
+      }
+    }
+
     loadDevices();
     loadProfiles();
+    checkActiveSession();
     return () => {
       cancelled = true;
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ---------------------------------------------------------------------------
@@ -401,6 +443,21 @@ export default function RealtimePage() {
           ...(saveEnabled && resolvedSavePath ? { save_path: resolvedSavePath } : {}),
         }),
       });
+
+      if (startRes.status === 409) {
+        // Session already active — reconnect to it
+        const statusRes = await fetch(`${API}/api/realtime/status`);
+        if (statusRes.ok) {
+          const status = await statusRes.json();
+          if (status.active && status.session_id) {
+            setSessionId(status.session_id);
+            sessionIdRef.current = status.session_id;
+            setSessionState('active');
+            return;
+          }
+        }
+        throw new Error('Session already active — stop it first');
+      }
 
       if (!startRes.ok) {
         const body = await startRes.json().catch(() => ({ detail: startRes.statusText }));
@@ -623,6 +680,14 @@ export default function RealtimePage() {
       </header>
 
       <div className="max-w-4xl mx-auto px-6 py-8 flex flex-col gap-8">
+        {/* Active session notice */}
+        {isActive && (
+          <div className="rounded-lg border border-cyan-800/60 bg-cyan-950/30 px-4 py-3 text-[13px] font-mono text-cyan-300 flex items-center gap-3">
+            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse shrink-0" />
+            Session live{sessionId ? ` · ${sessionId.slice(0, 12)}…` : ''} — stop when done.
+          </div>
+        )}
+
         {/* Error banner */}
         {(devicesError || sessionError) && (
           <div className="rounded-lg border border-red-800/60 bg-red-950/40 px-4 py-3 text-[13px] font-mono text-red-300">

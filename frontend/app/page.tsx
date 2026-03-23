@@ -8,25 +8,34 @@ const API = 'http://localhost:8000';
 // Types
 // ---------------------------------------------------------------------------
 
+interface AudioFile {
+  id: string;
+  profile_id: string;
+  filename: string;
+  file_path: string;
+  duration: number | null;
+  is_cleaned: boolean;
+  created_at: string;
+}
+
 interface Profile {
   id: string;
   name: string;
   status: string;
   created_at: string;
   sample_path: string;
-  audio_duration: number | null;
-  preprocessed_path: string | null;
+  profile_dir: string | null;
   model_path: string | null;
   checkpoint_path: string | null;
   index_path: string | null;
-  profile_dir: string | null;
   total_epochs_trained: number;
+  needs_retraining: boolean;
+  audio_files: AudioFile[];
 }
 
 interface HealthStatus {
   profile_id: string;
   audio_ok: boolean;
-  preprocessed_ok: boolean;
   model_ok: boolean;
   index_ok: boolean;
   can_train: boolean;
@@ -265,7 +274,6 @@ function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: Wav
       setPlaying(false);
       cancelAnimationFrame(rafRef.current);
     } else {
-      // Start from startSec
       a.currentTime = startSec;
       a.play().then(() => {
         setPlaying(true);
@@ -368,7 +376,6 @@ function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: Wav
 
       {/* Controls row: play preview + validity + segment times */}
       <div className="flex items-center gap-3">
-        {/* Play/pause preview from startSec */}
         <button
           onClick={togglePlay}
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md border text-[11px] font-mono
@@ -402,24 +409,29 @@ function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: Wav
 }
 
 // ---------------------------------------------------------------------------
-// Upload panel
+// AudioFilePicker — file input + waveform + clip submit
+// Reused by both new-profile creation and add-audio-to-profile flows.
 // ---------------------------------------------------------------------------
 
-interface UploadPanelProps {
-  onUploaded: () => void;
+interface AudioFilePickerProps {
+  /** If provided, shows a "Profile Name" field and creates a new profile. */
+  newProfile?: boolean;
+  /** For existing profiles, called with (profileId, file, segStart, segEnd) */
+  onSubmit: (args: { name?: string; file: File; segStart: number; segEnd: number }) => Promise<void>;
+  onCancel: () => void;
+  submitLabel?: string;
+  showNameField?: boolean;
 }
 
-function UploadPanel({ onUploaded }: UploadPanelProps) {
-  const [nameInput, setNameInput]   = useState('');
-  const [file, setFile]             = useState<File | null>(null);
-  const [fileDuration, setFileDuration] = useState<number | null>(null);
-  const [durationError, setDurationError] = useState<string | null>(null);
-  const [uploading, setUploading]   = useState(false);
-  const [error, setError]           = useState<string | null>(null);
-
-  const [startSec, setStartSec] = useState(0);
-  const [endSec,   setEndSec]   = useState(0);
-
+function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField }: AudioFilePickerProps) {
+  const [nameInput, setNameInput]           = useState('');
+  const [file, setFile]                     = useState<File | null>(null);
+  const [fileDuration, setFileDuration]     = useState<number | null>(null);
+  const [durationError, setDurationError]   = useState<string | null>(null);
+  const [uploading, setUploading]           = useState(false);
+  const [error, setError]                   = useState<string | null>(null);
+  const [startSec, setStartSec]             = useState(0);
+  const [endSec, setEndSec]                 = useState(0);
   const fileRef = useRef<HTMLInputElement>(null);
 
   async function onFileChange(f: File | null) {
@@ -452,7 +464,6 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
       if (dur > 30 * 60)              { setDurationError(`${(dur / 60).toFixed(1)} min — max is 30 min`); return; }
 
       setFileDuration(dur);
-      // Default: last 15 min (or whole file if shorter), anchored at start if < 15 min
       const defaultEnd   = Math.min(dur, MAX_SEG_SEC);
       const defaultStart = Math.max(0, defaultEnd - MIN_SEG_SEC);
       setStartSec(defaultStart);
@@ -465,32 +476,23 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
 
   const segLen   = endSec - startSec;
   const segValid = segLen >= MIN_SEG_SEC && segLen <= MAX_SEG_SEC;
+  const nameOk   = !showNameField || nameInput.trim().length > 0;
+  const canSubmit = nameOk && !!file && !durationError && segValid && !uploading;
 
-  async function handleUpload(ev: React.FormEvent) {
+  async function handleSubmit(ev: React.FormEvent) {
     ev.preventDefault();
-    if (!nameInput.trim() || !file || !fileDuration || durationError || !segValid) return;
-
+    if (!canSubmit || !file) return;
     setUploading(true);
     setError(null);
-
-    const form = new FormData();
-    form.append('name', nameInput.trim());
-    form.append('file', file);
-    form.append('seg_start', String(startSec));
-    form.append('seg_end',   String(endSec));
-
     try {
-      const res = await fetch(`${API}/api/profiles`, { method: 'POST', body: form });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(body.detail ?? `HTTP ${res.status}`);
-      }
+      await onSubmit({ name: showNameField ? nameInput.trim() : undefined, file, segStart: startSec, segEnd: endSec });
+      // Reset on success
       setNameInput('');
       setFile(null);
       setFileDuration(null);
-      setStartSec(0); setEndSec(0);
+      setStartSec(0);
+      setEndSec(0);
       if (fileRef.current) fileRef.current.value = '';
-      onUploaded();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -498,26 +500,24 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
     }
   }
 
-  const canSubmit = nameInput.trim().length > 0 && !!file && !durationError && segValid && !uploading;
-
   return (
-    <form onSubmit={handleUpload}
-      className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5 flex flex-col gap-5">
-
-      <div className="grid grid-cols-2 gap-4">
-        <div className="flex flex-col gap-1.5">
-          <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">Profile Name</label>
-          <input
-            type="text" value={nameInput} placeholder="e.g. My Voice"
-            onChange={(e) => setNameInput(e.target.value)}
-            className="bg-zinc-950 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
-                       font-mono text-zinc-200 placeholder:text-zinc-600
-                       focus:outline-none focus:border-cyan-600 transition-colors"
-          />
-        </div>
+    <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+      <div className={`grid gap-4 ${showNameField ? 'grid-cols-2' : 'grid-cols-1'}`}>
+        {showNameField && (
+          <div className="flex flex-col gap-1.5">
+            <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">Profile Name</label>
+            <input
+              type="text" value={nameInput} placeholder="e.g. My Voice"
+              onChange={(e) => setNameInput(e.target.value)}
+              className="bg-zinc-950 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
+                         font-mono text-zinc-200 placeholder:text-zinc-600
+                         focus:outline-none focus:border-cyan-600 transition-colors"
+            />
+          </div>
+        )}
         <div className="flex flex-col gap-1.5">
           <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
-            Audio Sample
+            Audio File
             <span className="ml-2 font-normal text-zinc-600 normal-case tracking-normal">
               max 30 min · select 10–15 min segment below
             </span>
@@ -544,7 +544,6 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
         </div>
       </div>
 
-      {/* Waveform — canvas drag handles are the only segment selection surface */}
       {file && fileDuration != null && !durationError && (
         <WaveformViewer
           file={file}
@@ -561,19 +560,209 @@ function UploadPanel({ onUploaded }: UploadPanelProps) {
         </div>
       )}
 
-      <button type="submit" disabled={!canSubmit}
-        className="py-2.5 rounded-lg font-mono text-[13px] font-medium tracking-wider uppercase
-                   transition-all bg-cyan-900/40 border border-cyan-600/40 text-cyan-300
-                   hover:bg-cyan-800/40 hover:border-cyan-500/60
-                   disabled:opacity-30 disabled:cursor-not-allowed">
-        {uploading ? '⟳  Uploading…' : '↑  Upload & Clip to Selected Segment'}
-      </button>
+      <div className="flex items-center gap-3">
+        <button type="submit" disabled={!canSubmit}
+          className="py-2 px-5 rounded-lg font-mono text-[12px] font-medium tracking-wider uppercase
+                     transition-all bg-cyan-900/40 border border-cyan-600/40 text-cyan-300
+                     hover:bg-cyan-800/40 hover:border-cyan-500/60
+                     disabled:opacity-30 disabled:cursor-not-allowed">
+          {uploading ? '⟳ Uploading…' : (submitLabel ?? '↑ Upload & Clip')}
+        </button>
+        <button type="button" onClick={onCancel}
+          className="py-2 px-4 rounded-lg font-mono text-[12px] text-zinc-500
+                     hover:text-zinc-300 transition-colors">
+          Cancel
+        </button>
+      </div>
     </form>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Profile card
+// UploadPanel — new profile creation (wraps AudioFilePicker)
+// ---------------------------------------------------------------------------
+
+interface UploadPanelProps {
+  onUploaded: () => void;
+  onCancel: () => void;
+}
+
+function UploadPanel({ onUploaded, onCancel }: UploadPanelProps) {
+  async function handleSubmit({ name, file, segStart, segEnd }: { name?: string; file: File; segStart: number; segEnd: number }) {
+    const form = new FormData();
+    form.append('name', name!);
+    form.append('file', file);
+    form.append('seg_start', String(segStart));
+    form.append('seg_end',   String(segEnd));
+
+    const res = await fetch(`${API}/api/profiles`, { method: 'POST', body: form });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(body.detail ?? `HTTP ${res.status}`);
+    }
+    onUploaded();
+  }
+
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
+      <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500 mb-4">New Profile</h2>
+      <AudioFilePicker
+        showNameField
+        onSubmit={handleSubmit}
+        onCancel={onCancel}
+        submitLabel="↑ Create Profile"
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// AudioFileRow — one row in the per-profile audio list
+// ---------------------------------------------------------------------------
+
+interface AudioFileRowProps {
+  profileId: string;
+  audioFile: AudioFile;
+  onDeleted: () => void;
+  onCleaned: () => void;
+}
+
+function AudioFileRow({ profileId, audioFile, onDeleted, onCleaned }: AudioFileRowProps) {
+  const [playing, setPlaying]     = useState(false);
+  const [cleaning, setCleaning]   = useState(false);
+  const [cleanMsg, setCleanMsg]   = useState<string | null>(null);
+  const [cleanOk, setCleanOk]     = useState<boolean | null>(null);
+  const [deleting, setDeleting]   = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  function togglePlay() {
+    if (!audioRef.current) {
+      const a = new Audio(`${API}/api/profiles/${profileId}/audio/${audioFile.id}`);
+      a.onended = () => setPlaying(false);
+      audioRef.current = a;
+    }
+    if (playing) {
+      audioRef.current.pause();
+      setPlaying(false);
+    } else {
+      audioRef.current.play().then(() => setPlaying(true)).catch(() => {});
+    }
+  }
+
+  // Stop on unmount
+  useEffect(() => () => { audioRef.current?.pause(); }, []);
+
+  async function handleClean() {
+    setCleaning(true);
+    setCleanMsg(null);
+    setCleanOk(null);
+    try {
+      const res = await fetch(`${API}/api/profiles/${profileId}/audio/${audioFile.id}/clean`, {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail ?? `HTTP ${res.status}`);
+      setCleanOk(data.ok);
+      setCleanMsg(data.ok
+        ? `✓ Done — ${(data.duration_sec / 60).toFixed(1)} min cleaned`
+        : `✗ ${data.message}`
+      );
+      if (data.ok) { onCleaned(); audioRef.current = null; }
+    } catch (err) {
+      setCleanOk(false);
+      setCleanMsg(`✗ ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setCleaning(false);
+    }
+  }
+
+  async function handleDelete() {
+    if (!window.confirm(`Delete audio file "${audioFile.filename}"?`)) return;
+    setDeleting(true);
+    audioRef.current?.pause();
+    try {
+      const res = await fetch(`${API}/api/profiles/${profileId}/audio/${audioFile.id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      onDeleted();
+    } catch (err) {
+      setDeleting(false);
+      alert(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-3 py-2 px-3 rounded-lg bg-zinc-950/40 border border-zinc-800/60">
+      {/* File info */}
+      <div className="flex-1 min-w-0 flex items-center gap-2">
+        <span className="text-[12px] font-mono text-zinc-200 truncate">{audioFile.filename}</span>
+        {audioFile.duration != null && (
+          <span className="text-[11px] font-mono text-zinc-500 shrink-0">
+            {fmtDuration(audioFile.duration)}
+          </span>
+        )}
+        {audioFile.is_cleaned ? (
+          <span className="text-[10px] font-mono text-emerald-500 shrink-0">✓ clean</span>
+        ) : (
+          <span className="text-[10px] font-mono text-zinc-600 shrink-0">raw</span>
+        )}
+      </div>
+
+      {/* Clean result message */}
+      {cleanMsg && (
+        <span className={`text-[10px] font-mono shrink-0 ${cleanOk ? 'text-emerald-400' : 'text-red-400'}`}>
+          {cleanMsg}
+        </span>
+      )}
+
+      {/* Actions */}
+      <div className="flex items-center gap-1.5 shrink-0">
+        <button
+          onClick={togglePlay}
+          title="Play"
+          className={`px-2 py-1 rounded text-[11px] font-mono border transition-colors ${
+            playing
+              ? 'bg-cyan-900/40 border-cyan-600/50 text-cyan-300'
+              : 'bg-zinc-800 border-zinc-700 text-zinc-400 hover:text-zinc-200'
+          }`}
+        >
+          {playing ? '■' : '▶'}
+        </button>
+
+        <button
+          onClick={handleClean}
+          disabled={cleaning}
+          title={audioFile.is_cleaned ? 'Re-run noise removal' : 'Run noise removal (overwrites file)'}
+          className="px-2 py-1 rounded text-[11px] font-mono border transition-colors
+                     bg-indigo-950/40 border-indigo-800/50 text-indigo-400
+                     hover:bg-indigo-900/40 hover:text-indigo-300
+                     disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {cleaning ? (
+            <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+            </svg>
+          ) : (audioFile.is_cleaned ? '⟳ re-clean' : '⬡ clean')}
+        </button>
+
+        <button
+          onClick={handleDelete}
+          disabled={deleting}
+          title="Delete audio file"
+          className="px-2 py-1 rounded text-[11px] font-mono border transition-colors
+                     text-red-400 border-red-900/50 bg-red-950/20
+                     hover:bg-red-900/30 hover:border-red-800/60
+                     disabled:opacity-40"
+        >
+          {deleting ? '…' : '✕ Remove'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ProfileCard
 // ---------------------------------------------------------------------------
 
 interface ProfileCardProps {
@@ -583,18 +772,11 @@ interface ProfileCardProps {
 }
 
 function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
-  const [preprocessing, setPreprocessing] = useState(false);
-  const [preprocessMsg, setPreprocessMsg] = useState<string | null>(null);
-  const [preprocessOk, setPreprocessOk]   = useState<boolean | null>(null);
   const [deleting, setDeleting]           = useState(false);
+  const [showAddAudio, setShowAddAudio]   = useState(false);
 
-  const [playingOrig,  setPlayingOrig]  = useState(false);
-  const [playingClean, setPlayingClean] = useState(false);
-  const origAudioRef  = useRef<HTMLAudioElement | null>(null);
-  const cleanAudioRef = useRef<HTMLAudioElement | null>(null);
-
-  // Health check state — loaded async on mount
-  const [health, setHealth]           = useState<HealthStatus | null>(null);
+  // Health check state — loaded async on mount and when status changes
+  const [health, setHealth]             = useState<HealthStatus | null>(null);
   const [healthLoading, setHealthLoading] = useState(true);
 
   useEffect(() => {
@@ -605,75 +787,11 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
       .then((h: HealthStatus) => { if (!cancelled) { setHealth(h); setHealthLoading(false); } })
       .catch(() => { if (!cancelled) setHealthLoading(false); });
     return () => { cancelled = true; };
-  }, [profile.id, profile.status]);
-
-  function stopAllAudio() {
-    origAudioRef.current?.pause();
-    cleanAudioRef.current?.pause();
-    setPlayingOrig(false);
-    setPlayingClean(false);
-  }
-
-  function toggleOrig() {
-    if (!origAudioRef.current) {
-      const a = new Audio(`${API}/api/profiles/${profile.id}/audio`);
-      a.onended = () => setPlayingOrig(false);
-      origAudioRef.current = a;
-    }
-    if (playingOrig) {
-      origAudioRef.current.pause();
-      setPlayingOrig(false);
-    } else {
-      stopAllAudio();
-      origAudioRef.current.play().then(() => setPlayingOrig(true)).catch(() => {});
-    }
-  }
-
-  function toggleClean() {
-    if (!cleanAudioRef.current) {
-      const a = new Audio(`${API}/api/profiles/${profile.id}/audio/clean`);
-      a.onended = () => setPlayingClean(false);
-      cleanAudioRef.current = a;
-    }
-    if (playingClean) {
-      cleanAudioRef.current.pause();
-      setPlayingClean(false);
-    } else {
-      stopAllAudio();
-      cleanAudioRef.current.src = `${API}/api/profiles/${profile.id}/audio/clean?t=${Date.now()}`;
-      cleanAudioRef.current.play().then(() => setPlayingClean(true)).catch(() => {});
-    }
-  }
-
-  async function handlePreprocess() {
-    setPreprocessing(true);
-    setPreprocessMsg(null);
-    setPreprocessOk(null);
-    try {
-      const res = await fetch(`${API}/api/profiles/${profile.id}/preprocess`, {
-        method: 'POST',
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail ?? `HTTP ${res.status}`);
-      setPreprocessOk(data.ok);
-      setPreprocessMsg(
-        data.ok
-          ? `Done — ${(data.duration_sec / 60).toFixed(1)} min cleaned`
-          : data.message
-      );
-      if (data.ok) { onRefresh(); cleanAudioRef.current = null; }
-    } catch (err) {
-      setPreprocessOk(false);
-      setPreprocessMsg(err instanceof Error ? err.message : String(err));
-    } finally {
-      setPreprocessing(false);
-    }
-  }
+  }, [profile.id, profile.status, profile.audio_files.length]);
 
   async function handleDelete() {
-    if (!window.confirm(`Delete profile "${profile.name}"? This cannot be undone.`)) return;
+    if (!window.confirm(`Delete profile "${profile.name}" and all its files? This cannot be undone.`)) return;
     setDeleting(true);
-    stopAllAudio();
     try {
       const res = await fetch(`${API}/api/profiles/${profile.id}`, { method: 'DELETE' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -684,9 +802,23 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
     }
   }
 
-  // Derived health display
+  async function handleAddAudio({ file, segStart, segEnd }: { name?: string; file: File; segStart: number; segEnd: number }) {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('seg_start', String(segStart));
+    form.append('seg_end',   String(segEnd));
+
+    const res = await fetch(`${API}/api/profiles/${profile.id}/audio`, { method: 'POST', body: form });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(body.detail ?? `HTTP ${res.status}`);
+    }
+    setShowAddAudio(false);
+    onRefresh();
+  }
+
   const hasErrors = health && health.errors.length > 0;
-  const isCorrupted = health && !health.can_train && !health.can_infer && profile.status !== 'untrained';
+  const totalDuration = profile.audio_files.reduce((s, af) => s + (af.duration ?? 0), 0);
 
   return (
     <div className={`rounded-xl border overflow-hidden ${
@@ -694,16 +826,19 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
         ? 'border-red-800/60 bg-zinc-900/60'
         : 'border-zinc-800 bg-zinc-900/60'
     }`}>
-      {/* Header */}
-      <div className="px-5 py-4 flex items-center justify-between gap-4">
-        <div className="flex flex-col gap-1 min-w-0">
-          <div className="flex items-center gap-3">
+
+      {/* ── Header ───────────────────────────────────────────────────── */}
+      <div className="px-5 py-4 flex items-start justify-between gap-4">
+        <div className="flex flex-col gap-1.5 min-w-0">
+
+          {/* Name + status row */}
+          <div className="flex items-center gap-2.5 flex-wrap">
             <span className="text-[15px] font-mono font-medium text-zinc-100 truncate">
               {profile.name}
             </span>
             <StatusBadge status={profile.status} />
 
-            {/* Health indicators */}
+            {/* Health pills */}
             {!healthLoading && health && (
               <div className="flex items-center gap-1.5">
                 <HealthPill ok={health.can_train} label="train" loading={false} />
@@ -713,108 +848,98 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
             {healthLoading && (
               <span className="text-[10px] font-mono text-zinc-600 animate-pulse">checking…</span>
             )}
-          </div>
-          <div className="flex items-center gap-3 text-[11px] font-mono text-zinc-500">
-            <span>{profile.id.slice(0, 12)}…</span>
-            {profile.audio_duration != null && (
-              <span>⏱ {fmtDuration(profile.audio_duration)}</span>
+
+            {/* Re-training recommended tag */}
+            {profile.needs_retraining && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono
+                               bg-amber-950/50 border border-amber-700/50 text-amber-400">
+                ⚠ re-training recommended
+              </span>
             )}
-            {profile.preprocessed_path && (
-              <span className="text-emerald-500">✓ noise removed</span>
+          </div>
+
+          {/* Meta row */}
+          <div className="flex items-center gap-3 text-[11px] font-mono text-zinc-500 flex-wrap">
+            <span title={profile.id}>{profile.id.slice(0, 12)}…</span>
+            {profile.audio_files.length > 0 && (
+              <span>{profile.audio_files.length} file{profile.audio_files.length !== 1 ? 's' : ''} · ⏱ {fmtDuration(totalDuration)}</span>
             )}
             {profile.total_epochs_trained > 0 && (
               <span className="text-cyan-600">{profile.total_epochs_trained} epochs</span>
             )}
             {profile.profile_dir && (
-              <span title={profile.profile_dir} className="text-zinc-600 max-w-[200px] truncate">
+              <span title={profile.profile_dir} className="text-zinc-700 max-w-[220px] truncate">
                 📁 {profile.profile_dir.split('/').slice(-2).join('/')}
               </span>
             )}
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
-          <button onClick={toggleOrig} title="Play clipped sample"
-            className={`px-2.5 py-1.5 rounded-md text-[11px] font-mono border transition-colors ${
-              playingOrig
-                ? 'bg-cyan-900/40 border-cyan-600/50 text-cyan-300'
-                : 'bg-zinc-800 border-zinc-700 text-zinc-400 hover:text-zinc-200'}`}>
-            {playingOrig ? '■' : '▶'} orig
-          </button>
-
-          {profile.preprocessed_path && (
-            <button onClick={toggleClean} title="Play noise-removed audio"
-              className={`px-2.5 py-1.5 rounded-md text-[11px] font-mono border transition-colors ${
-                playingClean
-                  ? 'bg-emerald-900/40 border-emerald-600/50 text-emerald-300'
-                  : 'bg-zinc-800 border-zinc-700 text-emerald-500 hover:text-emerald-300'}`}>
-              {playingClean ? '■' : '▶'} clean
-            </button>
-          )}
-
-          <button onClick={handleDelete} disabled={deleting}
-            className="px-3 py-1.5 rounded-md text-[11px] font-mono uppercase tracking-wider
-                       text-red-400 border border-red-900/50 bg-red-950/20
-                       hover:bg-red-900/30 hover:border-red-800/60 transition-colors
-                       disabled:opacity-40">
-            Delete
-          </button>
-        </div>
+        {/* Delete button */}
+        <button onClick={handleDelete} disabled={deleting}
+          className="shrink-0 px-3 py-1.5 rounded-md text-[11px] font-mono uppercase tracking-wider
+                     text-red-400 border border-red-900/50 bg-red-950/20
+                     hover:bg-red-900/30 hover:border-red-800/60 transition-colors
+                     disabled:opacity-40">
+          {deleting ? '…' : 'Delete'}
+        </button>
       </div>
 
-      {/* Health error strip — shown when files are missing */}
+      {/* ── Health error strip ────────────────────────────────────────── */}
       {health && health.errors.length > 0 && (
         <div className="border-t border-red-800/40 bg-red-950/20 px-5 py-2.5 flex flex-col gap-1">
           <span className="text-[10px] font-mono uppercase tracking-widest text-red-400 font-semibold">
             ⚠ Profile integrity issues
           </span>
           {health.errors.map((err, i) => (
-            <span key={i} className="text-[11px] font-mono text-red-300/80">
-              · {err}
-            </span>
+            <span key={i} className="text-[11px] font-mono text-red-300/80">· {err}</span>
           ))}
-          {!health.can_train && (
-            <span className="text-[10px] font-mono text-zinc-500 mt-0.5">
-              Training unavailable — audio file missing.
-              Re-upload audio to restore this profile.
-            </span>
-          )}
-          {health.can_train && !health.can_infer && (
-            <span className="text-[10px] font-mono text-zinc-500 mt-0.5">
-              Inference unavailable — model or index missing. Run training to generate them.
-            </span>
-          )}
         </div>
       )}
 
-      {/* Noise removal strip */}
-      <div className="border-t border-zinc-800 px-5 py-3 flex items-center gap-4">
-        <button
-          onClick={handlePreprocess}
-          disabled={preprocessing || (health !== null && !health.can_train)}
-          title={health && !health.can_train ? 'Audio file missing — cannot preprocess' : undefined}
-          className="px-4 py-2 rounded-lg font-mono text-[12px] font-medium uppercase tracking-wide
-                     bg-indigo-900/40 border border-indigo-600/40 text-indigo-300
-                     hover:bg-indigo-800/40 hover:border-indigo-500/60 transition-all
-                     disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-2"
-        >
-          {preprocessing && (
-            <svg className="animate-spin w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-            </svg>
+      {/* ── Audio files section ───────────────────────────────────────── */}
+      <div className="border-t border-zinc-800 px-5 py-3 flex flex-col gap-2">
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-500">
+            Audio Files
+          </span>
+          {!showAddAudio && (
+            <button
+              onClick={() => setShowAddAudio(true)}
+              className="px-2.5 py-1 rounded text-[11px] font-mono border transition-colors
+                         bg-zinc-800 border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600"
+            >
+              + Add Audio
+            </button>
           )}
-          {preprocessing ? 'Removing noise…' : profile.preprocessed_path ? '⬡ Re-run Noise Removal' : '⬡ Remove Noise'}
-        </button>
+        </div>
 
-        {preprocessMsg ? (
-          <span className={`text-[11px] font-mono ${preprocessOk ? 'text-emerald-400' : 'text-red-400'}`}>
-            {preprocessOk ? '✓ ' : '✗ '}{preprocessMsg}
-          </span>
+        {profile.audio_files.length === 0 ? (
+          <p className="text-[11px] font-mono text-zinc-600 py-1">No audio files — add one to enable training.</p>
         ) : (
-          <span className="text-[10px] font-mono text-zinc-600">
-            Spectral noise gating on the clipped sample
-          </span>
+          <div className="flex flex-col gap-1.5">
+            {profile.audio_files.map((af) => (
+              <AudioFileRow
+                key={af.id}
+                profileId={profile.id}
+                audioFile={af}
+                onDeleted={onRefresh}
+                onCleaned={onRefresh}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Inline Add Audio form */}
+        {showAddAudio && (
+          <div className="mt-2 rounded-lg border border-zinc-700 bg-zinc-900/60 p-4">
+            <p className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-3">Add Audio File</p>
+            <AudioFilePicker
+              onSubmit={handleAddAudio}
+              onCancel={() => setShowAddAudio(false)}
+              submitLabel="↑ Upload & Clip"
+            />
+          </div>
         )}
       </div>
     </div>
@@ -826,11 +951,11 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
 // ---------------------------------------------------------------------------
 
 export default function LibraryPage() {
-  const [profiles, setProfiles]     = useState<Profile[]>([]);
-  const [loading, setLoading]       = useState(true);
+  const [profiles, setProfiles]       = useState<Profile[]>([]);
+  const [loading, setLoading]         = useState(true);
   const [sessionActive, setSessionActive] = useState(false);
-  const [error, setError]           = useState<string | null>(null);
-  const [showUpload, setShowUpload] = useState(false);
+  const [error, setError]             = useState<string | null>(null);
+  const [showUpload, setShowUpload]   = useState(false);
 
   async function fetchProfiles() {
     try {
@@ -864,11 +989,6 @@ export default function LibraryPage() {
     return () => { cancelled = true; clearInterval(tid); };
   }, []);
 
-  function onUploaded() {
-    setShowUpload(false);
-    fetchProfiles();
-  }
-
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100 font-sans">
       {sessionActive && (
@@ -883,7 +1003,7 @@ export default function LibraryPage() {
           <div>
             <h1 className="text-xl font-mono font-semibold text-zinc-100">Voice Profiles</h1>
             <p className="text-[13px] text-zinc-500 mt-1">
-              Upload a sample, select 10–15 min segment, upload to clip it, then optionally remove noise.
+              Each profile holds audio files for one voice. Add files, clean noise, then train.
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -910,10 +1030,10 @@ export default function LibraryPage() {
 
         {showUpload && (
           <section>
-            <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500 mb-4">
-              Upload New Profile
-            </h2>
-            <UploadPanel onUploaded={onUploaded} />
+            <UploadPanel
+              onUploaded={() => { setShowUpload(false); fetchProfiles(); }}
+              onCancel={() => setShowUpload(false)}
+            />
           </section>
         )}
 
