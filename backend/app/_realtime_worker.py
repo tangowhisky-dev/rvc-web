@@ -91,7 +91,19 @@ def _compute_block_params(block_48k: int = _BLOCK_48K, extra_time: float = _EXTR
     total_16k_samples = extra_16k + f0_extractor_frame
     p_len = total_16k_samples // _WINDOW
 
-    return_length_frames = block_16k // _WINDOW
+    # CRITICAL: request block + sola_buf + sola_search from rtrvc.infer() so that
+    # after the SOLA offset shift there are still sola_buf_48k samples available
+    # to save into sola_buf for the next block's crossfade.
+    #
+    # rtrvc.py return_length is in 16kHz FRAMES (each frame = window=160 samples).
+    # rtrvc output at 48kHz = return_length * window * (48000/16000) = return_length * 480.
+    # So: return_length = total_48k_output / 480.
+    #
+    # RVC-WebUI-MacOS uses: return_length = (block + sola_buf + sola_search) / zc
+    # where zc=480.  This gives exactly enough output to fill block+sola_buf+sola_search.
+    total_out_48k = block_48k + _SOLA_BUF_48K + _SOLA_SEARCH_48K   # 9600+1920+480 = 12000
+    return_length_frames = total_out_48k // _ZC                       # 12000/480 = 25
+
     skip_head_frames = p_len - return_length_frames
 
     block_44k = int(block_48k * 44100 / _SR_48K)
