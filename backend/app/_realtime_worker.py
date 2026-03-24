@@ -65,7 +65,7 @@ import torch
 _SR_16K = 16000
 _SR_48K = 48000
 _WINDOW = 160              # HuBERT/RMVPE hop size in samples at 16kHz
-_BLOCK_48K = 9600          # 200ms output block at 48kHz
+_BLOCK_48K = 5760          # 120ms output block at 48kHz
 _EXTRA_TIME = 2.0          # seconds of historical context fed to the model
 _ZC = _SR_48K // 100       # zero-crossing unit = 10ms at 48kHz = 480 samples
 _SOLA_BUF_48K = 4 * _ZC   # 40ms SOLA crossfade buffer
