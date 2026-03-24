@@ -332,11 +332,27 @@ async def _run_pipeline(
     batch_size: int = 8,
     profile_dir: str = "",
     prior_epochs: int = 0,
+    files_changed: bool = False,
 ) -> None:
     """Orchestrate the full training pipeline for one TrainingJob.
 
     Chains: preprocess → f0 extract → feature extract → (config+filelist setup)
             → train (with log tailing) → FAISS index build → copy to profile_dir.
+
+    files_changed: True when audio files were added or removed since the last
+      training run (needs_retraining flag from DB).  Forces a full wipe of the
+      feature directories (0_gt_wavs, 1_16k_wavs, 2a_f0, 2b-f0nsf, 3_feature768)
+      even for same-profile re-runs, so preprocess.py and extract_f0/feature
+      both reprocess from scratch.
+
+      Why this matters: preprocess.py names segment files by sorted position of
+      the source audio file (idx0 = index in sorted(listdir(sample_dir))). If a
+      new audio file sorts before an existing one, sorted indices shift and
+      preprocess.py overwrites 0_gt_wavs segments with new audio — but
+      extract_f0 and extract_feature skip files whose .npy already exists.
+      The result is stale F0/feature data paired with new audio — silently wrong
+      training targets. Wiping the feature dirs when files_changed=True forces
+      full re-extraction and eliminates this mismatch.
 
     prior_epochs: epochs already trained for this profile (from DB). Used to:
       - compute cumulative -te target for train.py so resumed runs continue
@@ -412,6 +428,39 @@ async def _run_pipeline(
             shutil.rmtree(exp_dir, ignore_errors=True)
         os.makedirs(exp_dir, exist_ok=True)
         # Re-seed checkpoints after clearing (they were copied before cleanup above)
+        if seeded_checkpoint and ckpt_dir:
+            for ckpt_file in ("G_latest.pth", "D_latest.pth"):
+                src = os.path.join(ckpt_dir, ckpt_file)
+                dst = os.path.join(exp_dir, ckpt_file)
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
+    elif files_changed:
+        # Audio files were added or removed since last training run.  Wipe ALL
+        # feature directories so preprocess + extract_f0 + extract_feature all
+        # reprocess from scratch.  Without this, extract_f0/feature skip files
+        # whose .npy exists — but those .npy files may now be paired with the
+        # WRONG audio segments because sorted(listdir) indices shifted.
+        _FEATURE_DIRS = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
+        _KEEP_FILES = {"G_latest.pth", "D_latest.pth"} if seeded_checkpoint else set()
+        await job.queue.put({
+            "type": "log",
+            "message": "Audio files changed — clearing cached features for full re-extraction",
+            "phase": "setup",
+        })
+        if os.path.isdir(exp_dir):
+            for entry in os.listdir(exp_dir):
+                if entry in _KEEP_FILES:
+                    continue
+                full = os.path.join(exp_dir, entry)
+                try:
+                    if os.path.isdir(full):
+                        shutil.rmtree(full, ignore_errors=True)
+                    else:
+                        os.remove(full)
+                except OSError:
+                    pass
+        os.makedirs(exp_dir, exist_ok=True)
+        # Re-seed checkpoints after clearing feature dirs
         if seeded_checkpoint and ckpt_dir:
             for ckpt_file in ("G_latest.pth", "D_latest.pth"):
                 src = os.path.join(ckpt_dir, ckpt_file)
@@ -942,6 +991,7 @@ class TrainingManager:
         batch_size: int = 8,
         profile_dir: str = "",
         prior_epochs: int = 0,
+        files_changed: bool = False,
     ) -> TrainingJob:
         """Create and launch a training job for profile_id.
 
@@ -951,6 +1001,11 @@ class TrainingManager:
         prior_epochs: total epochs already trained for this profile (from
         DB total_epochs_trained). Used to compute cumulative -te target and
         to skip pretrained weights on resume runs.
+
+        files_changed: True when audio files were added or removed since the
+        last training run (DB needs_retraining=1). Forces full re-extraction
+        of preprocess/F0/feature outputs even for the same profile, preventing
+        stale F0 data being paired with new audio segments.
 
         Raises ValueError("job already running") if any job is currently
         in status=="training" (HTTP 409 in the router layer).
@@ -967,7 +1022,7 @@ class TrainingManager:
         self._jobs[profile_id] = job
 
         asyncio.create_task(
-            _run_pipeline(job, sample_dir, rvc_root, total_epoch, save_every, batch_size, profile_dir, prior_epochs)
+            _run_pipeline(job, sample_dir, rvc_root, total_epoch, save_every, batch_size, profile_dir, prior_epochs, files_changed)
         )
 
         print(

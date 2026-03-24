@@ -158,7 +158,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     # Look up profile
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT id, name, status, sample_path, batch_size, profile_dir, total_epochs_trained FROM profiles WHERE id = ?",
+            "SELECT id, name, status, sample_path, batch_size, profile_dir, total_epochs_trained, needs_retraining FROM profiles WHERE id = ?",
             (request.profile_id,),
         )
         row = await cursor.fetchone()
@@ -221,6 +221,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
             batch_size=batch_size,
             profile_dir=profile_dir,
             prior_epochs=int(row["total_epochs_trained"] or 0),
+            files_changed=bool(row["needs_retraining"]),
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
