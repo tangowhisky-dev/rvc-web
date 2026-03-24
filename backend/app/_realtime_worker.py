@@ -19,6 +19,8 @@ Protocol (multiprocessing.Queue messages):
     {"event": "waveform_overflow", "detail": str}
     {"event": "save_complete",   "path": str, "duration_s": float}
     {"event": "save_error",      "error": str}
+    {"event": "infer_timing",    "block_ms": int, "avg_ms": float, "peak_ms": float,
+                                  "budget_pct": float, "n_blocks": int}
 
 Device selection:
   - Prefers MPS (Metal Performance Shaders) on Apple Silicon for inference
@@ -43,6 +45,7 @@ import os
 import queue
 import sys
 import threading
+import time as _time
 import uuid
 
 # Silence numba DEBUG flood before any library imports it.
@@ -488,6 +491,8 @@ def run_worker(
 
         # Extra samples needed from inference output to cover SOLA window + crossfade
         _min_infer_len = block_48k + sola_buf_48k + sola_search_48k
+        _block_i = 0
+        _infer_times: list[float] = []   # rolling window for timing log
 
         while True:
             # ── command check (non-blocking) ──────────────────────────────
@@ -562,6 +567,7 @@ def run_worker(
                 _gate_gain = 0.0
 
             # ── RVC inference (always runs to keep MPS kernels warm) ──────
+            _t_infer_start = _time.perf_counter()
             infer_raw = rvc.infer(
                 rolling_buf,
                 block_16k,
@@ -570,6 +576,30 @@ def run_worker(
                 "rmvpe",
                 protect,
             )
+            _infer_ms = (_time.perf_counter() - _t_infer_start) * 1000
+            _block_i += 1
+            _infer_times.append(_infer_ms)
+            if len(_infer_times) > 50:
+                _infer_times.pop(0)
+            # Log timing every 25 blocks (~5s at 200ms blocks) so we can
+            # measure real inference latency without adding per-block overhead.
+            if _block_i % 25 == 0:
+                _avg = sum(_infer_times) / len(_infer_times)
+                _pk  = max(_infer_times)
+                logging.getLogger("rvc_web.worker").info(
+                    "infer_timing: block_ms=%d  avg=%.1fms  peak=%.1fms  budget=%.0f%%  block=%d",
+                    block_ms, _avg, _pk, _avg / block_ms * 100, _block_i,
+                )
+                # Emit timing to frontend for diagnostics
+                evt_q.put({
+                    "event": "infer_timing",
+                    "block_ms": block_ms,
+                    "avg_ms":   round(_avg, 1),
+                    "peak_ms":  round(_pk,  1),
+                    "budget_pct": round(_avg / block_ms * 100, 1),
+                    "n_blocks": _block_i,
+                })
+
             infer_wav = (infer_raw if isinstance(infer_raw, _torch.Tensor)
                          else _torch.from_numpy(infer_raw))
             infer_wav = infer_wav.to(infer_device)

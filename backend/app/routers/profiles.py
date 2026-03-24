@@ -44,7 +44,12 @@ from fastapi.responses import FileResponse
 from fastapi import UploadFile
 from pydantic import BaseModel
 
-from backend.app.audio_preprocessing import get_duration, measure_speech_rms, normalize_rms_inplace
+from backend.app.audio_preprocessing import (
+    get_duration,
+    measure_speech_rms,
+    normalize_rms_inplace,
+    preprocess_audio_inplace,
+)
 from backend.app.db import get_db
 
 logger = logging.getLogger("rvc_web.profiles")
@@ -366,8 +371,16 @@ async def create_profile(
         shutil.rmtree(pdir, ignore_errors=True)
         raise
 
-    # Measure the speech-weighted RMS of this first file.  All subsequent files
-    # added to the profile will be normalized to match it.
+    # DC removal → highpass 80Hz → silence trim
+    try:
+        pp = await loop.run_in_executor(None, preprocess_audio_inplace, file_path)
+        clip_dur = pp["duration_after_s"] or clip_dur
+        logger.info("preprocessed first file: trimmed=%.0fms  dur=%.1fs", pp["trimmed_ms"], clip_dur)
+    except Exception as exc:
+        logger.warning("audio preprocessing failed for %s: %s — continuing without", file_path, exc)
+
+    # Measure the speech-weighted RMS of this first (preprocessed) file.
+    # All subsequent files added to the profile will be normalized to match it.
     profile_rms: Optional[float] = None
     try:
         profile_rms = await loop.run_in_executor(None, measure_speech_rms, file_path)
@@ -442,6 +455,13 @@ async def add_audio_file(
     file_path, filename, clip_dur = await _upload_and_clip(
         file, audio_dir, seg_start, seg_end, original_filename
     )
+
+    # DC removal → highpass 80Hz → silence trim
+    try:
+        pp = await loop.run_in_executor(None, preprocess_audio_inplace, file_path)
+        clip_dur = pp["duration_after_s"] or clip_dur
+    except Exception as exc:
+        logger.warning("audio preprocessing failed for %s: %s — continuing without", file_path, exc)
 
     # Normalize to the profile's RMS reference so all training files are
     # level-consistent.  If the profile has no stored RMS yet (legacy profile),
