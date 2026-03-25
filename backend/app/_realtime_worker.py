@@ -411,6 +411,7 @@ def run_worker(
         sola_buf_48k       = block_params["sola_buf_48k"]
         sola_search_48k    = block_params["sola_search_48k"]
         decim = max(1, block_48k // 800)
+        block_ms = block_48k * 1000 // _SR_48K   # 120ms for 5760-sample block at 48kHz
 
         # Silence gate: RMS threshold from dB
         _silence_rms = 10 ** (silence_threshold_db / 20.0)
