@@ -283,7 +283,12 @@ def get_hparams(init=True):
 
     args = parser.parse_args()
     name = args.experiment_dir
-    experiment_dir = os.path.join("./logs", args.experiment_dir)
+    # If the caller passes an absolute path, use it directly.
+    # Otherwise (bare name like "rvc_finetune_active"), prepend "./logs/" as before.
+    if os.path.isabs(args.experiment_dir):
+        experiment_dir = args.experiment_dir
+    else:
+        experiment_dir = os.path.join("./logs", args.experiment_dir)
 
     config_save_path = os.path.join(experiment_dir, "config.json")
     with open(config_save_path, "r") as f:

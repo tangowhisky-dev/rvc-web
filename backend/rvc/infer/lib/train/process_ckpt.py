@@ -10,6 +10,9 @@ from infer.modules.vc import model_hash_ckpt, hash_id
 
 i18n = I18nAuto()
 
+# Resolve the assets root — absolute from env var (set by training.py) or cwd-relative fallback.
+_ASSETS_ROOT = os.environ.get("ASSETS_ROOT", "assets")
+
 
 # add author sign
 def save_small_model(ckpt, sr, if_f0, name, epoch, version, hps):
@@ -51,7 +54,7 @@ def save_small_model(ckpt, sr, if_f0, name, epoch, version, hps):
         h = model_hash_ckpt(opt)
         opt["hash"] = h
         opt["id"] = hash_id(h)
-        torch.save(opt, "assets/weights/%s.pth" % name)
+        torch.save(opt, os.path.join(_ASSETS_ROOT, "weights", "%s.pth" % name))
         return "Success."
     except:
         return traceback.format_exc()
@@ -188,7 +191,7 @@ def extract_small_model(path, name, author, sr, if_f0, info, version):
         h = model_hash_ckpt(opt)
         opt["hash"] = h
         opt["id"] = hash_id(h)
-        torch.save(opt, "assets/weights/%s.pth" % name)
+        torch.save(opt, os.path.join(_ASSETS_ROOT, "weights", "%s.pth" % name))
         return "Success."
     except:
         return traceback.format_exc()
@@ -200,7 +203,7 @@ def change_info(path, info, name):
         ckpt["info"] = info
         if name == "":
             name = os.path.basename(path)
-        torch.save(ckpt, "assets/weights/%s" % name)
+        torch.save(ckpt, os.path.join(_ASSETS_ROOT, "weights", name))
         return "Success."
     except:
         return traceback.format_exc()
@@ -274,7 +277,7 @@ def merge(path1, path2, alpha1, sr, f0, info, name, version):
         h = model_hash_ckpt(opt)
         opt["hash"] = h
         opt["id"] = hash_id(h)
-        torch.save(opt, "assets/weights/%s.pth" % name)
+        torch.save(opt, os.path.join(_ASSETS_ROOT, "weights", "%s.pth" % name))
         return "Success."
     except:
         return traceback.format_exc()

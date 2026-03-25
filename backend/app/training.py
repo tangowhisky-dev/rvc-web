@@ -612,6 +612,7 @@ async def _run_pipeline(
     feat_env = base_env.copy()
     feat_env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
     feat_env["hubert_path"] = os.path.join(project_root, "assets", "hubert", "hubert_base.pt")
+    feat_env["ASSETS_ROOT"] = os.path.join(project_root, "assets")
 
     feat_args = [
         python,
@@ -651,6 +652,7 @@ async def _run_pipeline(
     train_env["MASTER_PORT"] = str(master_port)
     # save_small_model calls model_hash_ckpt → Pipeline.__init__ which needs rmvpe_root
     train_env["rmvpe_root"] = os.path.join(project_root, "assets", "rmvpe")
+    train_env["ASSETS_ROOT"] = os.path.join(project_root, "assets")
     # MPS memory tuning for Apple Silicon.
     # High watermark 0.0 = no limit (MPS manages all of unified memory).
     # This avoids spurious OOM kills on 48GB machines where the allocator
