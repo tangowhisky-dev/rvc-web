@@ -3,7 +3,7 @@
 Marked ``@pytest.mark.integration`` — skipped in normal CI runs and only
 executed when explicitly invoked:
 
-    RVC_ROOT=Retrieval-based-Voice-Conversion-WebUI \\
+    PROJECT_ROOT=/path/to/rvc-web \\
     conda run -n rvc pytest backend/tests/test_realtime_integration.py \\
       -v -s -m integration --timeout=60
 
