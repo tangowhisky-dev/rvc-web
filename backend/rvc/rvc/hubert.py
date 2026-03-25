@@ -1,4 +1,5 @@
 import math
+import os
 import random
 from typing import Optional, Tuple
 
@@ -262,11 +263,25 @@ def apply_mask(self, x, padding_mask, target_list):
     return x, mask_indices
 
 
-def get_hubert(model_path="assets/hubert/hubert_base.pt", device=torch.device("cpu")):
-    models, _, _ = load_model_ensemble_and_task(
-        [model_path],
-        suffix="",
-    )
+def get_hubert(model_path=None, device=torch.device("cpu")):
+    if model_path is None:
+        model_path = os.environ.get("hubert_path", "assets/hubert/hubert_base.pt")
+
+    # PyTorch >= 2.6 changed torch.load default to weights_only=True which
+    # breaks fairseq (it stores non-tensor globals like Dictionary).
+    _orig_load = torch.load
+    def _load_unsafe(*a, **kw):
+        kw.setdefault("weights_only", False)
+        return _orig_load(*a, **kw)
+    torch.load = _load_unsafe
+    try:
+        models, _, _ = load_model_ensemble_and_task(
+            [model_path],
+            suffix="",
+        )
+    finally:
+        torch.load = _orig_load
+
     hubert_model = models[0]
     hubert_model = hubert_model.to(device)
 

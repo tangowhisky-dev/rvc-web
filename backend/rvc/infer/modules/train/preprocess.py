@@ -86,15 +86,18 @@ class PreProcess:
             # Skip .DS_Store files
             if os.path.basename(path) == '.DS_Store':
                 return None
-            
+
             audio = load_audio(path, self.sr)
             if audio is None:
                 return None
-            
+
             # zero phased digital filter cause pre-ringing noise...
             # audio = signal.filtfilt(self.bh, self.ah, audio)
             audio = signal.lfilter(self.bh, self.ah, audio)
 
+            # Use just the stem (no extension) as idx0 so output filenames are
+            # stable and short regardless of whether path is absolute or relative.
+            idx0 = os.path.splitext(os.path.basename(path))[0]
             idx1 = 0
             for audio in self.slicer.slice(audio):
                 i = 0
@@ -103,13 +106,13 @@ class PreProcess:
                     i += 1
                     if len(audio[start:]) > self.tail * self.sr:
                         tmp_audio = audio[start : start + int(self.per * self.sr)]
-                        self.norm_write(tmp_audio, path, idx1)
+                        self.norm_write(tmp_audio, idx0, idx1)
                         idx1 += 1
                     else:
                         tmp_audio = audio[start:]
                         idx1 += 1
                         break
-                self.norm_write(tmp_audio, path, idx1)
+                self.norm_write(tmp_audio, idx0, idx1)
             println("%s\t-> Success" % path)
             return audio
         except Exception as e:

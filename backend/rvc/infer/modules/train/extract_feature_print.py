@@ -88,10 +88,24 @@ if os.access(model_path, os.F_OK) == False:
         % model_path
     )
     exit(0)
+
+# PyTorch >= 2.6 changed torch.load default to weights_only=True which breaks
+# fairseq's checkpoint loader (it uses non-tensor globals like Dictionary).
+# Patch torch.load to pass weights_only=False for this trusted internal call.
+import torch as _torch
+_orig_torch_load = _torch.load
+def _torch_load_unsafe(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_torch_load(*args, **kwargs)
+_torch.load = _torch_load_unsafe
+
 models, saved_cfg, task = fairseq.checkpoint_utils.load_model_ensemble_and_task(
     [model_path],
     suffix="",
 )
+
+_torch.load = _orig_torch_load  # restore immediately after
+
 model = models[0]
 model = model.to(device)
 printt("move model to %s" % device)

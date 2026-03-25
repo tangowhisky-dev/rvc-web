@@ -70,10 +70,24 @@ class RVC:
             Path(os.environ["rmvpe_root"]), is_half, 0, device, self.window, self.sr
         )
 
-        models, _, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task(
-            ["assets/hubert/hubert_base.pt"],
-            suffix="",
-        )
+        hubert_path = os.environ.get("hubert_path", "assets/hubert/hubert_base.pt")
+
+        # PyTorch >= 2.6: patch torch.load to allow weights_only=False for
+        # fairseq checkpoints that contain non-tensor globals (e.g. Dictionary).
+        import torch as _torch
+        _orig_load = _torch.load
+        def _load_unsafe(*a, **kw):
+            kw.setdefault("weights_only", False)
+            return _orig_load(*a, **kw)
+        _torch.load = _load_unsafe
+        try:
+            models, _, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task(
+                [hubert_path],
+                suffix="",
+            )
+        finally:
+            _torch.load = _orig_load
+
         hubert_model = models[0]
         hubert_model = hubert_model.to(self.device)
         if self.is_half:
