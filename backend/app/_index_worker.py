@@ -1,6 +1,9 @@
 """Standalone FAISS index builder — run as a subprocess to isolate native memory.
 
-Usage: python _index_worker.py <rvc_root>
+Usage: python _index_worker.py <project_root>
+
+project_root is the rvc-web/ directory (NOT the old RVC submodule root).
+The feature directory is at project_root/logs/rvc_finetune_active/3_feature768/.
 
 Prints the path to the added_IVF*.index file on stdout (last line).
 Exits 0 on success, 1 on failure (error on stderr).
@@ -13,12 +16,12 @@ import sys
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("usage: _index_worker.py <rvc_root>", file=sys.stderr)
+        print("usage: _index_worker.py <project_root>", file=sys.stderr)
         sys.exit(1)
 
-    rvc_root = sys.argv[1]
+    project_root = sys.argv[1]
     exp_name = "rvc_finetune_active"
-    exp_dir = os.path.join(rvc_root, "logs", exp_name)
+    exp_dir = os.path.join(project_root, "logs", exp_name)
     feature_dir = os.path.join(exp_dir, "3_feature768")
 
     try:

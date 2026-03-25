@@ -41,6 +41,7 @@ Retrieval-based-Voice-Conversion-WebUI
 /backend/data
 /data
 /data
+/logs/
 
 # Stray debug/fix scripts
 fix*.py

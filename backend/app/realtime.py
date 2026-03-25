@@ -154,7 +154,7 @@ class RealtimeManager:
 
         # Resolve rvc_root
         if rvc_root is None:
-            rvc_root = os.environ.get("RVC_ROOT", "Retrieval-based-Voice-Conversion-WebUI")
+            rvc_root = os.environ.get("PROJECT_ROOT", os.getcwd())
         rvc_root = os.path.abspath(rvc_root)
 
         # Validate profile in DB and fetch artifact paths

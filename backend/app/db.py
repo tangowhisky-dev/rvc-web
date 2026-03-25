@@ -12,7 +12,7 @@ from typing import AsyncGenerator
 
 import aiosqlite
 
-DB_PATH = "backend/data/rvc.db"
+DB_PATH = "data/rvc.db"
 
 _CREATE_PROFILES = """
 CREATE TABLE IF NOT EXISTS profiles (
@@ -91,15 +91,15 @@ async def init_db() -> None:
 
     Safe to call multiple times — all operations are idempotent.
     Creates:
-      - backend/data/      (SQLite DB directory)
-      - data/profiles/     (per-profile storage root)
+      - data/           (SQLite DB and profiles root)
+      - data/profiles/  (per-profile storage root)
       - profiles table     (CREATE TABLE IF NOT EXISTS)
       - audio_files table  (CREATE TABLE IF NOT EXISTS)
       - applies _MIGRATIONS for any columns missing from profiles
       - migrates legacy profiles (sample_path but no audio_files rows) to
         audio_files so the new UI always has rows to display
     """
-    os.makedirs("backend/data", exist_ok=True)
+    os.makedirs("data", exist_ok=True)
     os.makedirs("data/profiles", exist_ok=True)
 
     async with aiosqlite.connect(DB_PATH) as db:

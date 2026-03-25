@@ -27,19 +27,18 @@ logger = logging.getLogger("rvc_web.api")
 async def lifespan(app: FastAPI):
     # Startup
     db_path = await init_db()
-    rvc_root = os.environ.get("RVC_ROOT")
-    
+    project_root = os.environ.get("PROJECT_ROOT")
+
     # Ensure samples dir exists
     samples_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "samples"))
     os.makedirs(samples_dir, exist_ok=True)
-    
+
     print(json.dumps({
         "event": "startup",
         "db_path": db_path,
-        "rvc_root": rvc_root,
+        "project_root": project_root,
         "data_dir": "data/samples"
     }), flush=True)
-
     yield
 
     # Shutdown

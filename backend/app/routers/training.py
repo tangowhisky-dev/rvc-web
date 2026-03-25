@@ -152,7 +152,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
 
     Raises:
         HTTPException(404): Profile not found.
-        HTTPException(400): Profile has no sample_path or RVC_ROOT is not set.
+        HTTPException(400): Profile has no sample_path or PROJECT_ROOT is not set.
         HTTPException(409): A training job is already running for this profile.
     """
     # Look up profile
@@ -166,10 +166,10 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     if row is None:
         raise HTTPException(status_code=404, detail=f"Profile not found: {request.profile_id}")
 
-    rvc_root = os.environ.get("RVC_ROOT", "")
-    if not rvc_root:
-        raise HTTPException(status_code=400, detail="RVC_ROOT not set")
-    rvc_root = os.path.abspath(rvc_root)
+    project_root = os.environ.get("PROJECT_ROOT", "")
+    if not project_root:
+        raise HTTPException(status_code=400, detail="PROJECT_ROOT not set")
+    project_root = os.path.abspath(project_root)
 
     # Resolve profile_dir — new profiles have it stored; legacy ones derive it
     stored_profile_dir = row["profile_dir"] if "profile_dir" in row.keys() else None
@@ -183,7 +183,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     # sample_dir = profile_dir/audio/ so all audio files are picked up by
     # preprocess.py (it does os.listdir on this directory).
     # Fall back to legacy sample_path dirname for profiles without profile_dir.
-    # Use abspath — preprocess.py runs with cwd=rvc_root so relative paths
+    # Use abspath — preprocess.py runs with cwd=backend/rvc so relative paths
     # would resolve against the wrong directory.
     audio_dir = os.path.abspath(os.path.join(profile_dir, "audio"))
     if os.path.isdir(audio_dir):
@@ -215,7 +215,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
         job = manager.start_job(
             request.profile_id,
             sample_dir,
-            rvc_root,
+            project_root,
             total_epoch=request.epochs,
             save_every=request.save_every,
             batch_size=batch_size,

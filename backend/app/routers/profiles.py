@@ -789,9 +789,9 @@ async def delete_profile(profile_id: str) -> Response:
 
     # Wipe the shared RVC experiment workspace so a subsequent fresh profile
     # doesn't inherit stale checkpoints from this one.
-    rvc_root = os.environ.get("RVC_ROOT", "")
-    if rvc_root:
-        exp_dir = os.path.join(os.path.abspath(rvc_root), "logs", "rvc_finetune_active")
+    project_root = os.environ.get("PROJECT_ROOT", "")
+    if project_root:
+        exp_dir = os.path.join(os.path.abspath(project_root), "logs", "rvc_finetune_active")
         if os.path.isdir(exp_dir):
             shutil.rmtree(exp_dir, ignore_errors=True)
 

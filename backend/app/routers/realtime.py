@@ -87,7 +87,7 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
 
     Raises:
         HTTPException(404): Profile not found in DB.
-        HTTPException(400): Profile not trained, no index file, or RVC_ROOT not set.
+        HTTPException(400): Profile not trained, no index file, or PROJECT_ROOT not set.
         HTTPException(409): A session is already active.
     """
     # Check for an already-active session first (fast 409 path; no DB needed)
@@ -114,10 +114,10 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
             detail=f"Profile is not trained (status: {row['status']})",
         )
 
-    # Pass rvc_root to manager; if it's empty the manager will raise ValueError
-    rvc_root = os.environ.get("RVC_ROOT") or None
-    if rvc_root:
-        rvc_root = os.path.abspath(rvc_root)  # ensure absolute so inference paths resolve correctly
+    # Pass project_root to manager; if it's empty the manager will raise ValueError
+    project_root = os.environ.get("PROJECT_ROOT") or None
+    if project_root:
+        project_root = os.path.abspath(project_root)  # ensure absolute so inference paths resolve correctly
 
     try:
         result = manager.start_session(
@@ -128,7 +128,7 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
             index_rate=request.index_rate,
             protect=request.protect,
             silence_threshold_db=request.silence_threshold_db,
-            rvc_root=rvc_root,
+            rvc_root=project_root,
             save_path=request.save_path,
         )
         # start_session is async on the real manager; MagicMock returns sync in tests

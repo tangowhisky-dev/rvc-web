@@ -187,7 +187,7 @@ async def _tail_train_log(job: TrainingJob, log_path: str) -> None:
 # filelist.txt builder (adapts click_train() from web.py)
 # ---------------------------------------------------------------------------
 
-def _build_filelist(rvc_root: str, exp_dir: str) -> None:
+def _build_filelist(project_root: str, exp_dir: str) -> None:
     """Build logs/rvc_finetune_active/filelist.txt from feature directories.
 
     Adapts the filelist construction logic from click_train() in web.py.
@@ -217,6 +217,9 @@ def _build_filelist(rvc_root: str, exp_dir: str) -> None:
     fea_dim = 768  # v2 feature dimension
     sr_tag = "48k"
 
+    # Mute padding entries — absolute paths under logs/mute/ (project root)
+    mute_root = os.path.join(project_root, "logs", "mute")
+
     opt = []
     for name in names:
         opt.append(
@@ -237,9 +240,9 @@ def _build_filelist(rvc_root: str, exp_dir: str) -> None:
     # Append 2 mute padding entries (required by train.py DataLoader)
     for _ in range(2):
         opt.append(
-            "%s/logs/mute/0_gt_wavs/mute%s.wav|%s/logs/mute/3_feature%s/mute.npy|"
-            "%s/logs/mute/2a_f0/mute.wav.npy|%s/logs/mute/2b-f0nsf/mute.wav.npy|%s"
-            % (rvc_root, sr_tag, rvc_root, fea_dim, rvc_root, rvc_root, spk_id)
+            "%s/0_gt_wavs/mute%s.wav|%s/3_feature%s/mute.npy|"
+            "%s/2a_f0/mute.wav.npy|%s/2b-f0nsf/mute.wav.npy|%s"
+            % (mute_root, sr_tag, mute_root, fea_dim, mute_root, mute_root, spk_id)
         )
 
     shuffle(opt)
@@ -253,8 +256,8 @@ def _build_filelist(rvc_root: str, exp_dir: str) -> None:
 # config.json writer (idempotent)
 # ---------------------------------------------------------------------------
 
-def _write_config(rvc_root: str, exp_dir: str, batch_size: int = 8) -> None:
-    """Copy configs/inuse/v2/48k.json into exp_dir/config.json, patching
+def _write_config(project_root: str, exp_dir: str, batch_size: int = 8) -> None:
+    """Copy backend/rvc/configs/inuse/v2/48k.json into exp_dir/config.json, patching
     training hyperparameters for MPS performance.
 
     log_interval=10 (not 1) is the key MPS optimization:
@@ -270,7 +273,7 @@ def _write_config(rvc_root: str, exp_dir: str, batch_size: int = 8) -> None:
     import json as _json
 
     config_save_path = os.path.join(exp_dir, "config.json")
-    src = os.path.join(rvc_root, "configs", "inuse", "v2", "48k.json")
+    src = os.path.join(project_root, "backend", "rvc", "configs", "inuse", "v2", "48k.json")
 
     with open(src) as _f:
         cfg = _json.load(_f)
@@ -294,7 +297,7 @@ def _write_config(rvc_root: str, exp_dir: str, batch_size: int = 8) -> None:
 _INDEX_WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "_index_worker.py")
 
 
-def _build_index(rvc_root: str) -> str:
+def _build_index(project_root: str) -> str:
     """Build FAISS IVF index by spawning an isolated subprocess.
 
     Returns the path to the saved added_IVF*.index file.
@@ -304,7 +307,7 @@ def _build_index(rvc_root: str) -> str:
     import sys as _sys
 
     result = _sp.run(
-        [_sys.executable, _INDEX_WORKER_SCRIPT, rvc_root],
+        [_sys.executable, _INDEX_WORKER_SCRIPT, project_root],
         capture_output=True,
         text=True,
         timeout=300,
@@ -326,7 +329,7 @@ def _build_index(rvc_root: str) -> str:
 async def _run_pipeline(
     job: TrainingJob,
     sample_dir: str,
-    rvc_root: str,
+    project_root: str,
     total_epoch: int = 200,
     save_every: int = 10,
     batch_size: int = 8,
@@ -338,6 +341,13 @@ async def _run_pipeline(
 
     Chains: preprocess → f0 extract → feature extract → (config+filelist setup)
             → train (with log tailing) → FAISS index build → copy to profile_dir.
+
+    project_root: absolute path to rvc-web/ (the project root). Replaces the
+      old RVC_ROOT / submodule pattern. Layout under project_root:
+        assets/              — pretrained weights, hubert, rmvpe
+        logs/rvc_finetune_active/ — training workspace (exp_dir)
+        backend/rvc/         — RVC Python package + training scripts
+        backend/rvc/configs/ — v2/48k.json and inuse/ configs
 
     files_changed: True when audio files were added or removed since the last
       training run (needs_retraining flag from DB).  Forces a full wipe of the
@@ -366,7 +376,10 @@ async def _run_pipeline(
     """
     start_ts = time.monotonic()
     exp_name = "rvc_finetune_active"
-    exp_dir = os.path.join(rvc_root, "logs", exp_name)
+    # Training workspace: project_root/logs/rvc_finetune_active/
+    exp_dir = os.path.join(project_root, "logs", exp_name)
+    # backend/rvc is the cwd for all training subprocess scripts
+    rvc_pkg_dir = os.path.join(project_root, "backend", "rvc")
 
     # ------------------------------------------------------------------
     # Seed exp_dir with prior checkpoints (resume support).
@@ -563,7 +576,7 @@ async def _run_pipeline(
         "3.0",            # per (segment duration)
     ]
 
-    ok = await _run_subprocess(job, preprocess_args, base_env, rvc_root, "preprocess")
+    ok = await _run_subprocess(job, preprocess_args, base_env, rvc_pkg_dir, "preprocess")
     if not ok:
         await _fail("preprocess", "Preprocess phase failed (non-zero exit code)")
         return
@@ -574,7 +587,7 @@ async def _run_pipeline(
     _emit_phase("extract_f0", "Extracting pitch (F0)")
 
     f0_env = base_env.copy()
-    f0_env["rmvpe_root"] = os.path.join(rvc_root, "assets", "rmvpe")
+    f0_env["rmvpe_root"] = os.path.join(project_root, "assets", "rmvpe")
 
     f0_args = [
         python,
@@ -586,7 +599,7 @@ async def _run_pipeline(
         "False",   # is_half
     ]
 
-    ok = await _run_subprocess(job, f0_args, f0_env, rvc_root, "extract_f0")
+    ok = await _run_subprocess(job, f0_args, f0_env, rvc_pkg_dir, "extract_f0")
     if not ok:
         await _fail("extract_f0", "F0 extraction phase failed (non-zero exit code)")
         return
@@ -598,6 +611,7 @@ async def _run_pipeline(
 
     feat_env = base_env.copy()
     feat_env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    feat_env["hubert_path"] = os.path.join(project_root, "assets", "hubert", "hubert_base.pt")
 
     feat_args = [
         python,
@@ -611,7 +625,7 @@ async def _run_pipeline(
         "False", # is_half
     ]
 
-    ok = await _run_subprocess(job, feat_args, feat_env, rvc_root, "extract_feature")
+    ok = await _run_subprocess(job, feat_args, feat_env, rvc_pkg_dir, "extract_feature")
     if not ok:
         await _fail("extract_feature", "Feature extraction phase failed (non-zero exit code)")
         return
@@ -620,8 +634,8 @@ async def _run_pipeline(
     # Pre-phase 3 setup: config.json and filelist.txt
     # ------------------------------------------------------------------
     try:
-        _write_config(rvc_root, exp_dir, batch_size=batch_size)
-        _build_filelist(rvc_root, exp_dir)
+        _write_config(project_root, exp_dir, batch_size=batch_size)
+        _build_filelist(project_root, exp_dir)
     except Exception as exc:
         await _fail("setup", f"Pre-train setup failed: {exc}")
         return
@@ -636,7 +650,7 @@ async def _run_pipeline(
     train_env["MASTER_ADDR"] = "localhost"
     train_env["MASTER_PORT"] = str(master_port)
     # save_small_model calls model_hash_ckpt → Pipeline.__init__ which needs rmvpe_root
-    train_env["rmvpe_root"] = os.path.join(rvc_root, "assets", "rmvpe")
+    train_env["rmvpe_root"] = os.path.join(project_root, "assets", "rmvpe")
     # MPS memory tuning for Apple Silicon.
     # High watermark 0.0 = no limit (MPS manages all of unified memory).
     # This avoids spurious OOM kills on 48GB machines where the allocator
@@ -656,10 +670,9 @@ async def _run_pipeline(
     # from G_latest.pth) and runs until it hits this number.
     cumulative_epochs = prior_epochs + total_epoch
 
-    # Pretrain weights are only used on the first run for a profile.
-    # On resume, the loaded checkpoint takes over the LR schedule too.
-    pretrain_g = "assets/pretrained_v2/f0G48k.pth" if prior_epochs == 0 else ""
-    pretrain_d = "assets/pretrained_v2/f0D48k.pth" if prior_epochs == 0 else ""
+    # Pretrain weights — absolute paths into project_root/assets/
+    pretrain_g = os.path.join(project_root, "assets", "pretrained_v2", "f0G48k.pth") if prior_epochs == 0 else ""
+    pretrain_d = os.path.join(project_root, "assets", "pretrained_v2", "f0D48k.pth") if prior_epochs == 0 else ""
 
     await job.queue.put({
         "type": "log",
@@ -694,7 +707,7 @@ async def _run_pipeline(
         stdout=asyncio_subprocess.PIPE,    # capture stdout — root logger writes here (basicConfig)
         stderr=asyncio_subprocess.PIPE,    # capture stderr so crashes surface in job error
         env=train_env,
-        cwd=rvc_root,
+        cwd=rvc_pkg_dir,
     )
     job._proc = train_proc
 
@@ -823,7 +836,7 @@ async def _run_pipeline(
 
     loop = asyncio.get_event_loop()
     try:
-        added_index_path = await loop.run_in_executor(None, _build_index, rvc_root)
+        added_index_path = await loop.run_in_executor(None, _build_index, project_root)
         await job.queue.put({
             "type": "index_done",
             "message": f"FAISS index built: {os.path.basename(added_index_path)}",
@@ -853,7 +866,9 @@ async def _run_pipeline(
 
     g_latest = os.path.join(exp_dir, "G_latest.pth")
     d_latest = os.path.join(exp_dir, "D_latest.pth")
-    weights_pth = os.path.join(rvc_root, "assets", "weights", f"{exp_name}.pth")
+    # assets/weights/{exp}.pth is written by save_small_model() inside train.py
+    # (relative to backend/rvc/ cwd) → copy to profile_dir/model_infer.pth
+    weights_pth = os.path.join(rvc_pkg_dir, "assets", "weights", f"{exp_name}.pth")
 
     if not os.path.exists(g_latest):
         # Fallback: find any G_{step}.pth; pick the highest step
@@ -985,7 +1000,7 @@ class TrainingManager:
         self,
         profile_id: str,
         sample_dir: str,
-        rvc_root: str,
+        project_root: str,
         total_epoch: int = 200,
         save_every: int = 10,
         batch_size: int = 8,
@@ -1022,7 +1037,7 @@ class TrainingManager:
         self._jobs[profile_id] = job
 
         asyncio.create_task(
-            _run_pipeline(job, sample_dir, rvc_root, total_epoch, save_every, batch_size, profile_dir, prior_epochs, files_changed)
+            _run_pipeline(job, sample_dir, project_root, total_epoch, save_every, batch_size, profile_dir, prior_epochs, files_changed)
         )
 
         print(
@@ -1030,7 +1045,7 @@ class TrainingManager:
                 "event": "training_start",
                 "profile_id": profile_id,
                 "job_id": job_id,
-                "rvc_root": rvc_root,
+                "project_root": project_root,
             }),
             flush=True,
         )

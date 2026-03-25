@@ -240,9 +240,12 @@ def run_worker(
     os.environ["rmvpe_root"] = f"{rvc_root}/assets/rmvpe"
     os.environ["hubert_path"] = f"{rvc_root}/assets/hubert/hubert_base.pt"
 
-    os.chdir(rvc_root)
-    if rvc_root not in sys.path:
-        sys.path.insert(0, rvc_root)
+    # rvc_root here is project_root (rvc-web/). The RVC Python package lives at
+    # backend/rvc/ — add it to sys.path so `from rvc.f0 import ...` etc. resolve.
+    rvc_pkg_dir = os.path.join(rvc_root, "backend", "rvc")
+    os.chdir(rvc_pkg_dir)
+    if rvc_pkg_dir not in sys.path:
+        sys.path.insert(0, rvc_pkg_dir)
 
     session_id = uuid.uuid4().hex
 
