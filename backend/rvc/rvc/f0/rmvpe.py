@@ -4,9 +4,7 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import onnxruntime as ort
 
 from rvc.jit import load_inputs, get_jit_model, export_jit_model, save_pickle
 
@@ -39,42 +37,61 @@ def rmvpe_jit_export(
     return ckpt
 
 
-class RMVPE(nn.Module):
-    def __init__(self, model_path, device="cpu", is_half=True):
-        super().__init__()
-        self.device = device
+class RMVPE(F0Predictor):
+    def __init__(
+        self,
+        model_path: str,
+        is_half: bool,
+        device: str,
+        use_jit=False,
+    ):
+        hop_length = 160
+        f0_min = 30
+        f0_max = 8000
+        sampling_rate = 16000
+
+        super().__init__(
+            hop_length,
+            f0_min,
+            f0_max,
+            sampling_rate,
+            device,
+        )
+
         self.is_half = is_half
-        
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found: {model_path}")
-        
-        try:
-            # Load the model using torch.load instead of torch.jit.load
-            state_dict = torch.load(model_path, map_location=device, weights_only=False)
-            self.model = nn.Sequential(
-                nn.Conv2d(1, 32, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(32, 32, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        cents_mapping = 20 * np.arange(360) + 1997.3794084376191
+        self.cents_mapping = np.pad(cents_mapping, (4, 4))  # 368
+
+        self.mel_extractor = MelSpectrogram(
+            is_half=is_half,
+            n_mel_channels=128,
+            sampling_rate=sampling_rate,
+            win_length=1024,
+            hop_length=hop_length,
+            mel_fmin=f0_min,
+            mel_fmax=f0_max,
+            device=self.device,
+        ).to(self.device)
+
+        if "privateuseone" in str(self.device):
+            import onnxruntime as ort
+
+            self.model = ort.InferenceSession(
+                "%s/rmvpe.onnx" % os.environ["rmvpe_root"],
+                providers=["DmlExecutionProvider"],
             )
-            self.model.load_state_dict(state_dict)
-            self.model.eval()
-            if is_half:
-                self.model = self.model.half()
-            self.model = self.model.to(device)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load model: {str(e)}")
-    
-    def forward(self, x):
-        with torch.no_grad():
-            x = x.to(self.device)
-            if self.is_half:
-                x = x.half()
-            return self.model(x)
-            
-    def calculate(self, x):
-        return self.forward(x)
+        else:
+
+            def rmvpe_jit_model():
+                ckpt = get_jit_model(model_path, is_half, self.device, rmvpe_jit_export)
+                model = torch.jit.load(BytesIO(ckpt["model"]), map_location=self.device)
+                model = model.to(self.device)
+                return model
+
+            if use_jit and not (is_half and "cpu" in str(self.device)):
+                self.model = rmvpe_jit_model()
+            else:
+                self.model = get_rmvpe(model_path, self.device, is_half)
 
     def compute_f0(
         self,
@@ -100,7 +117,7 @@ class RMVPE(nn.Module):
         return self._interpolate_f0(self._resize_f0(f0, p_len))[0]
 
     def _to_local_average_cents(self, salience, threshold=0.05):
-        center = np.argmax(salience, axis=1)  # 帧长#index
+        center = np.argmax(salience, axis=1)
         salience = np.pad(salience, ((0, 0), (4, 4)))  # 帧长,368
         center += 4
         todo_salience = []
@@ -143,5 +160,4 @@ class RMVPE(nn.Module):
         cents_pred = self._to_local_average_cents(hidden, threshold=thred)
         f0 = 10 * (2 ** (cents_pred / 1200))
         f0[f0 == 10] = 0
-        # f0 = np.array([10 * (2 ** (cent_pred / 1200)) if cent_pred else 0 for cent_pred in cents_pred])
         return f0
