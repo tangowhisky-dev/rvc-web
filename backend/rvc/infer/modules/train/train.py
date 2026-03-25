@@ -17,7 +17,6 @@ hps = utils.get_hparams()
 os.environ["CUDA_VISIBLE_DEVICES"] = hps.gpus.replace("-", ",")
 n_gpus = len(hps.gpus.split("-"))
 from random import randint, shuffle
-
 import torch
 
 try:
@@ -30,9 +29,10 @@ try:
         GradScaler = gradscaler_init()
         ipex_init()
     else:
-        from torch.cuda.amp import GradScaler, autocast
+        # Use the device-agnostic torch.amp API (torch.cuda.amp is deprecated in PyTorch 2.x)
+        from torch.amp import GradScaler, autocast
 except Exception:
-    from torch.cuda.amp import GradScaler, autocast
+    from torch.amp import GradScaler, autocast
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
@@ -66,7 +66,6 @@ else:
         SynthesizerTrnMs768NSFsid as RVC_Model_f0,
         SynthesizerTrnMs768NSFsid_nono as RVC_Model_nof0,
     )
-
 from infer.lib.train.losses import (
     discriminator_loss,
     feature_loss,
@@ -131,24 +130,38 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-    try:
-        dist.init_process_group(
-            backend=(
-                "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
-            ),
-            init_method="env://",
-            world_size=n_gpus,
-            rank=rank,
-        )
-    except:
-        dist.init_process_group(
-            backend=(
-                "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
-            ),
-            init_method="env://?use_libuv=False",
-            world_size=n_gpus,
-            rank=rank,
-        )
+    # Determine compute device: CUDA > MPS > CPU
+    if torch.cuda.is_available():
+        _device = torch.device(f"cuda:{rank}")
+    elif torch.backends.mps.is_available():
+        _device = torch.device("mps")
+    else:
+        _device = torch.device("cpu")
+    _use_mps = _device.type == "mps"
+
+    # Init process group for distributed training (CUDA multi-GPU only).
+    # Skip for MPS: DDP collective ops not implemented for MPS, and single-device
+    # MPS doesn't need distributed gradient sync.
+    if not _use_mps:
+        try:
+            dist.init_process_group(
+                backend=(
+                    "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
+                ),
+                init_method="env://",
+                world_size=n_gpus,
+                rank=rank,
+            )
+        except:
+            dist.init_process_group(
+                backend=(
+                    "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
+                ),
+                init_method="env://?use_libuv=False",
+                world_size=n_gpus,
+                rank=rank,
+            )
+
     torch.manual_seed(hps.train.seed)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
@@ -172,15 +185,19 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         collate_fn = TextAudioCollateMultiNSFsid()
     else:
         collate_fn = TextAudioCollate()
+    # DataLoader workers re-import train.py (argparse at module-level makes num_workers>0
+    # crash under mp.spawn on macOS). Use num_workers=0 for MPS/CPU.
+    # MPS device placement (below) is the real performance win — not worker parallelism.
+    _use_cuda = torch.cuda.is_available()
     train_loader = DataLoader(
         train_dataset,
-        num_workers=4,
+        num_workers=4 if _use_cuda else 0,
         shuffle=False,
-        pin_memory=True,
+        pin_memory=_use_cuda,
         collate_fn=collate_fn,
         batch_sampler=train_sampler,
-        persistent_workers=True,
-        prefetch_factor=8,
+        persistent_workers=_use_cuda,
+        prefetch_factor=8 if _use_cuda else None,
     )
     mdl = hps.copy().model
     del mdl.use_spectral_norm
@@ -199,6 +216,8 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         )
     if torch.cuda.is_available():
         net_g = net_g.cuda(rank)
+    elif _use_mps:
+        net_g = net_g.to(_device)
     has_xpu = bool(hasattr(torch, "xpu") and torch.xpu.is_available())
     net_d = MultiPeriodDiscriminator(
         hps.version,
@@ -207,6 +226,8 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
     )
     if torch.cuda.is_available():
         net_d = net_d.cuda(rank)
+    elif _use_mps:
+        net_d = net_d.to(_device)
     optim_g = torch.optim.AdamW(
         net_g.parameters(),
         hps.train.learning_rate,
@@ -226,6 +247,10 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
     elif torch.cuda.is_available():
         net_g = DDP(net_g, device_ids=[rank])
         net_d = DDP(net_d, device_ids=[rank])
+    elif _use_mps:
+        # Skip DDP on MPS — allgather/allreduce collectives aren't implemented for MPS.
+        # Single-device MPS training doesn't need distributed gradient sync at all.
+        pass  # net_g and net_d stay as plain modules on MPS device
     else:
         net_g = DDP(net_g)
         net_d = DDP(net_d)
@@ -293,7 +318,7 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str - 2
     )
 
-    scaler = GradScaler(enabled=hps.train.fp16_run)
+    scaler = GradScaler(_device.type, enabled=hps.train.fp16_run)
 
     cache = []
     for epoch in range(epoch_str, hps.train.epochs + 1):
@@ -310,6 +335,8 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
                 logger,
                 [writer, writer_eval],
                 cache,
+                _device,
+                _use_mps,
             )
         else:
             train_and_evaluate(
@@ -324,6 +351,8 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
                 None,
                 None,
                 cache,
+                _device,
+                _use_mps,
             )
         scheduler_g.step()
         scheduler_d.step()
@@ -341,6 +370,8 @@ def train_and_evaluate(
     logger,
     writers,
     cache,
+    _device=None,
+    _use_mps=False,
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
@@ -384,7 +415,7 @@ def train_and_evaluate(
                         wave_lengths,
                         sid,
                     ) = info
-                # Load on CUDA
+                # Load on device (CUDA or MPS)
                 if torch.cuda.is_available():
                     phone = phone.cuda(rank, non_blocking=True)
                     phone_lengths = phone_lengths.cuda(rank, non_blocking=True)
@@ -396,6 +427,17 @@ def train_and_evaluate(
                     spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
                     wave = wave.cuda(rank, non_blocking=True)
                     wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
+                elif _use_mps:
+                    phone = phone.to(_device)
+                    phone_lengths = phone_lengths.to(_device)
+                    if hps.if_f0 == 1:
+                        pitch = pitch.to(_device)
+                        pitchf = pitchf.to(_device)
+                    sid = sid.to(_device)
+                    spec = spec.to(_device)
+                    spec_lengths = spec_lengths.to(_device)
+                    wave = wave.to(_device)
+                    wave_lengths = wave_lengths.to(_device)
                 # Cache on list
                 if hps.if_f0 == 1:
                     cache.append(
@@ -456,7 +498,7 @@ def train_and_evaluate(
             ) = info
         else:
             phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = info
-        ## Load on CUDA
+        ## Load on device (CUDA or MPS)
         if (hps.if_cache_data_in_gpu == False) and torch.cuda.is_available():
             phone = phone.cuda(rank, non_blocking=True)
             phone_lengths = phone_lengths.cuda(rank, non_blocking=True)
@@ -467,10 +509,20 @@ def train_and_evaluate(
             spec = spec.cuda(rank, non_blocking=True)
             spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
             wave = wave.cuda(rank, non_blocking=True)
+        elif (hps.if_cache_data_in_gpu == False) and _use_mps:
+            phone = phone.to(_device)
+            phone_lengths = phone_lengths.to(_device)
+            if hps.if_f0 == 1:
+                pitch = pitch.to(_device)
+                pitchf = pitchf.to(_device)
+            sid = sid.to(_device)
+            spec = spec.to(_device)
+            spec_lengths = spec_lengths.to(_device)
+            wave = wave.to(_device)
             # wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
 
         # Calculate
-        with autocast(enabled=hps.train.fp16_run):
+        with autocast(_device.type, enabled=hps.train.fp16_run):
             (
                 y_hat,
                 ids_slice,
@@ -489,7 +541,7 @@ def train_and_evaluate(
             y_mel = slice_on_last_dim(
                 mel, ids_slice, hps.train.segment_size // hps.data.hop_length
             )
-            with autocast(enabled=False):
+            with autocast(_device.type, enabled=False):
                 y_hat_mel = mel_spectrogram_torch(
                     y_hat.float().squeeze(1),
                     hps.data.filter_length,
@@ -508,7 +560,7 @@ def train_and_evaluate(
 
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
-            with autocast(enabled=False):
+            with autocast(_device.type, enabled=False):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
                     y_d_hat_r, y_d_hat_g
                 )
@@ -518,10 +570,10 @@ def train_and_evaluate(
         grad_norm_d = total_grad_norm(net_d.parameters())
         scaler.step(optim_d)
 
-        with autocast(enabled=hps.train.fp16_run):
+        with autocast(_device.type, enabled=hps.train.fp16_run):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
-            with autocast(enabled=False):
+            with autocast(_device.type, enabled=False):
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                 loss_fm = feature_loss(fmap_r, fmap_g)
@@ -627,6 +679,12 @@ def train_and_evaluate(
                 epoch,
                 os.path.join(hps.model_dir, "D_latest.pth"),
             )
+        # Release fragmented MPS allocator blocks back to the system after
+        # each checkpoint save. On macOS unified memory, the MPS allocator
+        # holds onto free blocks by default; flushing here keeps the memory
+        # footprint stable across long runs without impacting step latency.
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         if rank == 0 and hps.save_every_weights == "1":
             if hasattr(net_g, "module"):
                 ckpt = net_g.module.state_dict()
@@ -667,6 +725,8 @@ def train_and_evaluate(
             )
         )
         sleep(1)
+        # Flush all logging handlers before os._exit() bypasses normal cleanup
+        logging.shutdown()
         os._exit(0)
 
 
