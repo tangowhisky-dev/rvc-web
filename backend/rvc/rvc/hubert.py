@@ -267,20 +267,16 @@ def get_hubert(model_path=None, device=torch.device("cpu")):
     if model_path is None:
         model_path = os.environ.get("hubert_path", "assets/hubert/hubert_base.pt")
 
-    # PyTorch >= 2.6 changed torch.load default to weights_only=True which
-    # breaks fairseq (it stores non-tensor globals like Dictionary).
-    _orig_load = torch.load
-    def _load_unsafe(*a, **kw):
-        kw.setdefault("weights_only", False)
-        return _orig_load(*a, **kw)
-    torch.load = _load_unsafe
     try:
-        models, _, _ = load_model_ensemble_and_task(
-            [model_path],
-            suffix="",
-        )
-    finally:
-        torch.load = _orig_load
+        from fairseq.data.dictionary import Dictionary
+        torch.serialization.add_safe_globals([Dictionary])
+    except (ImportError, AttributeError):
+        pass
+
+    models, _, _ = load_model_ensemble_and_task(
+        [model_path],
+        suffix="",
+    )
 
     hubert_model = models[0]
     hubert_model = hubert_model.to(device)
