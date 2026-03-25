@@ -116,19 +116,20 @@ class HealthStatus(BaseModel):
 # Directory helpers
 # ---------------------------------------------------------------------------
 
+def _project_root() -> str:
+    return os.environ.get(
+        "PROJECT_ROOT",
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    )
+
+
 def _profiles_root() -> str:
-    data_dir = os.environ.get("DATA_DIR")
-    if data_dir:
-        return os.path.join(data_dir, "profiles")
-    return "data/profiles"
+    return os.path.join(_project_root(), "data", "profiles")
 
 
 def _samples_root() -> str:
     """Legacy samples root — kept for backward-compat path resolution."""
-    data_dir = os.environ.get("DATA_DIR")
-    if data_dir:
-        return os.path.join(data_dir, "samples")
-    return "data/samples"
+    return os.path.join(_project_root(), "data", "samples")
 
 
 def _profile_dir(profile_id: str, stored_dir: Optional[str] = None) -> str:

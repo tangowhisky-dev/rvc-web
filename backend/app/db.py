@@ -12,7 +12,13 @@ from typing import AsyncGenerator
 
 import aiosqlite
 
-DB_PATH = "data/rvc.db"
+# All persistent data lives under PROJECT_ROOT/data/.
+# Falls back to a path relative to this file so tests work without the env var.
+_project_root = os.environ.get(
+    "PROJECT_ROOT",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+)
+DB_PATH = os.path.join(_project_root, "data", "rvc.db")
 
 _CREATE_PROFILES = """
 CREATE TABLE IF NOT EXISTS profiles (
@@ -99,8 +105,8 @@ async def init_db() -> None:
       - migrates legacy profiles (sample_path but no audio_files rows) to
         audio_files so the new UI always has rows to display
     """
-    os.makedirs("data", exist_ok=True)
-    os.makedirs("data/profiles", exist_ok=True)
+    os.makedirs(os.path.join(_project_root, "data"), exist_ok=True)
+    os.makedirs(os.path.join(_project_root, "data", "profiles"), exist_ok=True)
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row

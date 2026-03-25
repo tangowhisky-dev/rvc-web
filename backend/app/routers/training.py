@@ -176,9 +176,8 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     if stored_profile_dir:
         profile_dir = os.path.abspath(stored_profile_dir)
     else:
-        # Legacy: derive from DATA_DIR or default
-        data_dir = os.environ.get("DATA_DIR", "data")
-        profile_dir = os.path.abspath(os.path.join(data_dir, "profiles", request.profile_id))
+        # Legacy: profiles created before profile_dir was stored — derive from PROJECT_ROOT
+        profile_dir = os.path.join(project_root, "data", "profiles", request.profile_id)
 
     # sample_dir = profile_dir/audio/ so all audio files are picked up by
     # preprocess.py (it does os.listdir on this directory).
