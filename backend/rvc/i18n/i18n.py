@@ -3,9 +3,11 @@ import locale
 import os
 from configs import singleton_variable
 
+_LOCALE_DIR = os.path.join(os.path.dirname(__file__), "locale")
+
 
 def load_language_list(language):
-    with open(f"./i18n/locale/{language}.json", "r", encoding="utf-8") as f:
+    with open(os.path.join(_LOCALE_DIR, f"{language}.json"), "r", encoding="utf-8") as f:
         language_list = json.load(f)
     return language_list
 
@@ -17,7 +19,7 @@ class I18nAuto:
             language = locale.getdefaultlocale(
                 envvars=("LANG", "LC_ALL", "LC_CTYPE", "LANGUAGE")
             )[0]
-        if not os.path.exists(f"./i18n/locale/{language}.json"):
+        if not os.path.exists(os.path.join(_LOCALE_DIR, f"{language}.json")):
             language = "en_US"
         self.language = language
         self.language_map = load_language_list(language)
