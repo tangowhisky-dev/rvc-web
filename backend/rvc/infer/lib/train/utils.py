@@ -282,13 +282,15 @@ def get_hparams(init=True):
     parser.add_argument("-a", "--author", type=str, default="", help="Model author")
 
     args = parser.parse_args()
-    name = args.experiment_dir
-    # If the caller passes an absolute path, use it directly.
-    # Otherwise (bare name like "rvc_finetune_active"), prepend "./logs/" as before.
+    # If the caller passes an absolute path, use it directly and derive the
+    # display name from the basename (so hps.name stays "rvc_finetune_active",
+    # not the full path). Otherwise (bare name) prepend "./logs/" as before.
     if os.path.isabs(args.experiment_dir):
         experiment_dir = args.experiment_dir
+        name = os.path.basename(args.experiment_dir)
     else:
         experiment_dir = os.path.join("./logs", args.experiment_dir)
+        name = args.experiment_dir
 
     config_save_path = os.path.join(experiment_dir, "config.json")
     with open(config_save_path, "r") as f:

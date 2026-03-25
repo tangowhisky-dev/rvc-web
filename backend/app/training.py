@@ -689,7 +689,7 @@ async def _run_pipeline(
     train_args = [
         python,
         "infer/modules/train/train.py",
-        "-e", exp_name,
+        "-e", exp_dir,   # absolute path — avoids cwd-relative ./logs/ resolution in train.py
         "-sr", "48k",
         "-f0", "1",
         "-bs", str(batch_size),
