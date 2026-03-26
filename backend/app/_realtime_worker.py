@@ -237,8 +237,6 @@ def run_worker(
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["rmvpe_root"] = f"{rvc_root}/assets/rmvpe"
-    os.environ["hubert_path"] = f"{rvc_root}/assets/hubert/hubert_base.pt"
 
     # rvc_root here is project_root (rvc-web/). The RVC Python package lives at
     # backend/rvc/ — add it to sys.path so `from rvc.f0 import ...` etc. resolve.

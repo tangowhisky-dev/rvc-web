@@ -47,10 +47,9 @@ mkdir -p .pids
 mkdir -p logs
 mkdir -p data/profiles
 
-# PROJECT_ROOT is rvc-web/ — the new single source of truth for all path resolution.
+# PROJECT_ROOT is rvc-web/ — the single source of truth for all path resolution.
 # Replaces the old RVC_ROOT which pointed at the Retrieval-based-Voice-Conversion-WebUI submodule.
-export PROJECT_ROOT
-PROJECT_ROOT="$(pwd)"
+export PROJECT_ROOT="$(pwd)"
 
 # Fix libomp duplicate-init crash when PyTorch and system OpenMP both load
 export KMP_DUPLICATE_LIB_OK=TRUE

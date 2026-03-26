@@ -56,7 +56,11 @@ def printt(strr):
 
 
 printt(" ".join(sys.argv))
-model_path = os.environ.get("hubert_path", "assets/hubert/hubert_base.pt")
+model_path = (
+    os.path.join(os.environ["PROJECT_ROOT"], "assets", "hubert", "hubert_base.pt")
+    if os.environ.get("PROJECT_ROOT")
+    else os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "assets", "hubert", "hubert_base.pt")
+)
 
 printt("exp_dir: " + exp_dir)
 wavPath = "%s/1_16k_wavs" % exp_dir

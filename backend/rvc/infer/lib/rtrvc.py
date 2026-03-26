@@ -20,7 +20,7 @@ class RVC:
         self,
         key: Union[int, float],
         formant: Union[int, float],
-        pth_path: torch.serialization.FILE_LIKE,
+        pth_path: "torch.serialization.FileLike",
         index_path: str,
         index_rate: Union[int, float],
         n_cpu: int = os.cpu_count(),
@@ -67,10 +67,19 @@ class RVC:
         self.resample_kernel = {}
 
         self.f0_gen = Generator(
-            Path(os.environ["rmvpe_root"]), is_half, 0, device, self.window, self.sr
+            Path(
+                os.path.join(os.environ["PROJECT_ROOT"], "assets", "rmvpe")
+                if os.environ.get("PROJECT_ROOT")
+                else os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "assets", "rmvpe")
+            ), is_half, 0, device, self.window, self.sr
         )
 
-        hubert_path = os.environ.get("hubert_path", "assets/hubert/hubert_base.pt")
+        project_root = os.environ.get("PROJECT_ROOT")
+        hubert_path = (
+            os.path.join(project_root, "assets", "hubert", "hubert_base.pt")
+            if project_root
+            else os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "assets", "hubert", "hubert_base.pt")
+        )
 
         try:
             from fairseq.data.dictionary import Dictionary

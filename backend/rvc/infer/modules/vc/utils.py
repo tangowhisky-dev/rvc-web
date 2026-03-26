@@ -22,7 +22,11 @@ def get_index_path_from_model(sid):
 
 
 def load_hubert(device, is_half):
-    hubert_path = os.environ.get("hubert_path", "assets/hubert/hubert_base.pt")
+    project_root = os.environ.get("PROJECT_ROOT")
+    if project_root:
+        hubert_path = os.path.join(project_root, "assets", "hubert", "hubert_base.pt")
+    else:
+        hubert_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "assets", "hubert", "hubert_base.pt")
     try:
         from fairseq.data.dictionary import Dictionary
         torch.serialization.add_safe_globals([Dictionary])

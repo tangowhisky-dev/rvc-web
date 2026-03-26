@@ -178,8 +178,14 @@ class RealtimeManager:
 
         # Check for per-profile canonical paths first
         if stored_profile_dir:
-            candidate_model = os.path.join(stored_profile_dir, "model.pth")
-            candidate_index = os.path.join(stored_profile_dir, "model.index")
+            # profile_dir may be stored as relative — resolve against PROJECT_ROOT
+            abs_profile_dir = os.path.abspath(
+                os.path.join(rvc_root, stored_profile_dir)
+                if not os.path.isabs(stored_profile_dir)
+                else stored_profile_dir
+            )
+            candidate_model = os.path.join(abs_profile_dir, "model_infer.pth")
+            candidate_index = os.path.join(abs_profile_dir, "model.index")
             if os.path.exists(candidate_model):
                 db_model_path = candidate_model
             if os.path.exists(candidate_index):

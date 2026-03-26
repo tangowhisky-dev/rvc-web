@@ -265,9 +265,10 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         _, _, _, epoch_str = utils.load_checkpoint(
             utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g
         )
+        # epoch_str is the epoch that was just *saved* (completed). Advance by
+        # one so the loop starts at the next unfinished epoch.
+        epoch_str += 1
         global_step = (epoch_str - 1) * len(train_loader)
-        # epoch_str = 1
-        # global_step = 0
     except:  # 如果首次不能加载，加载pretrain
         # traceback.print_exc()
         epoch_str = 1

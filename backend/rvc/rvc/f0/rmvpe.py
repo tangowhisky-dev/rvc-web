@@ -76,8 +76,13 @@ class RMVPE(F0Predictor):
         if "privateuseone" in str(self.device):
             import onnxruntime as ort
 
+            _rmvpe_dir = (
+                os.path.join(os.environ["PROJECT_ROOT"], "assets", "rmvpe")
+                if os.environ.get("PROJECT_ROOT")
+                else os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets", "rmvpe")
+            )
             self.model = ort.InferenceSession(
-                "%s/rmvpe.onnx" % os.environ["rmvpe_root"],
+                os.path.join(_rmvpe_dir, "rmvpe.onnx"),
                 providers=["DmlExecutionProvider"],
             )
         else:

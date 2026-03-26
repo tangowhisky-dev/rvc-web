@@ -49,3 +49,5 @@ fix*.py
 fix*.sh
 get_*.py
 test_*.py
+/_Retrieval-based-Voice-Conversion-WebUI
+/backend/data

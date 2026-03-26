@@ -265,7 +265,12 @@ def apply_mask(self, x, padding_mask, target_list):
 
 def get_hubert(model_path=None, device=torch.device("cpu")):
     if model_path is None:
-        model_path = os.environ.get("hubert_path", "assets/hubert/hubert_base.pt")
+        project_root = os.environ.get("PROJECT_ROOT")
+        model_path = (
+            os.path.join(project_root, "assets", "hubert", "hubert_base.pt")
+            if project_root
+            else os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets", "hubert", "hubert_base.pt")
+        )
 
     try:
         from fairseq.data.dictionary import Dictionary

@@ -51,7 +51,11 @@ class FeatureInput(object):
         self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
 
         self.f0_gen = Generator(
-            Path(os.environ["rmvpe_root"]),
+            Path(
+                os.path.join(os.environ["PROJECT_ROOT"], "assets", "rmvpe")
+                if os.environ.get("PROJECT_ROOT")
+                else os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "assets", "rmvpe")
+            ),
             is_half,
             0,
             device,

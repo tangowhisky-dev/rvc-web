@@ -233,9 +233,10 @@ class CPUConfig:
 
     @staticmethod
     def load_config_json() -> dict:
+        _configs_dir = os.path.join(os.path.dirname(__file__), "inuse")
         d = {}
         for config_file in version_config_list:
-            with open(f"configs/{config_file}", "r") as f:
+            with open(os.path.join(_configs_dir, config_file), "r") as f:
                 d[config_file] = json.load(f)
         return d
 

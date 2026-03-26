@@ -10,8 +10,14 @@ from infer.modules.vc import model_hash_ckpt, hash_id
 
 i18n = I18nAuto()
 
-# Resolve the assets root — absolute from env var (set by training.py) or cwd-relative fallback.
-_ASSETS_ROOT = os.environ.get("ASSETS_ROOT", "assets")
+def _assets_root() -> str:
+    """Derive assets root from PROJECT_ROOT, falling back to __file__-relative path."""
+    project_root = os.environ.get("PROJECT_ROOT")
+    if project_root:
+        return os.path.join(project_root, "assets")
+    # Fallback: process_ckpt.py lives at backend/rvc/infer/lib/train/
+    # so ../../../../.. is rvc-web/
+    return os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "assets")
 
 
 # add author sign
@@ -51,10 +57,17 @@ def save_small_model(ckpt, sr, if_f0, name, epoch, version, hps):
         opt["sr"] = sr
         opt["f0"] = if_f0
         opt["version"] = version
-        h = model_hash_ckpt(opt)
-        opt["hash"] = h
-        opt["id"] = hash_id(h)
-        torch.save(opt, os.path.join(_ASSETS_ROOT, "weights", "%s.pth" % name))
+        try:
+            h = model_hash_ckpt(opt)
+            opt["hash"] = h
+            opt["id"] = hash_id(h)
+        except Exception as hash_err:
+            # model_hash_ckpt loads hubert + runs full inference — skip
+            # gracefully when assets are unavailable or env is incomplete.
+            print(f"[process_ckpt] skipping model hash (non-fatal): {hash_err}")
+        out_path = os.path.join(_assets_root(), "weights", "%s.pth" % name)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        torch.save(opt, out_path)
         return "Success."
     except:
         return traceback.format_exc()
@@ -191,7 +204,7 @@ def extract_small_model(path, name, author, sr, if_f0, info, version):
         h = model_hash_ckpt(opt)
         opt["hash"] = h
         opt["id"] = hash_id(h)
-        torch.save(opt, os.path.join(_ASSETS_ROOT, "weights", "%s.pth" % name))
+        torch.save(opt, os.path.join(_assets_root(), "weights", "%s.pth" % name))
         return "Success."
     except:
         return traceback.format_exc()
@@ -203,7 +216,7 @@ def change_info(path, info, name):
         ckpt["info"] = info
         if name == "":
             name = os.path.basename(path)
-        torch.save(ckpt, os.path.join(_ASSETS_ROOT, "weights", name))
+        torch.save(ckpt, os.path.join(_assets_root(), "weights", name))
         return "Success."
     except:
         return traceback.format_exc()
@@ -277,7 +290,7 @@ def merge(path1, path2, alpha1, sr, f0, info, name, version):
         h = model_hash_ckpt(opt)
         opt["hash"] = h
         opt["id"] = hash_id(h)
-        torch.save(opt, os.path.join(_ASSETS_ROOT, "weights", "%s.pth" % name))
+        torch.save(opt, os.path.join(_assets_root(), "weights", "%s.pth" % name))
         return "Success."
     except:
         return traceback.format_exc()

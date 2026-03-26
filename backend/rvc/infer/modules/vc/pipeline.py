@@ -65,7 +65,11 @@ class Pipeline(object):
         self.device = config.device
 
         self.f0_gen = Generator(
-            Path(os.environ["rmvpe_root"]),
+            Path(
+                os.path.join(os.environ["PROJECT_ROOT"], "assets", "rmvpe")
+                if os.environ.get("PROJECT_ROOT")
+                else os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "assets", "rmvpe")
+            ),
             self.is_half,
             self.x_pad,
             self.device,
