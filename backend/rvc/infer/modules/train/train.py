@@ -55,6 +55,7 @@ from infer.lib.train.data_utils import (
 )
 
 from rvc.layers.discriminators import MultiPeriodDiscriminator
+from infer.lib.train.mel_processing import MultiScaleMelSpectrogramLoss
 
 if hps.version == "v1":
     from rvc.layers.synthesizers import SynthesizerTrnMs256NSFsid as RVC_Model_f0
@@ -207,6 +208,7 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
             hps.train.segment_size // hps.data.hop_length,
             **mdl,
             sr=hps.sample_rate,
+            vocoder=getattr(hps, "vocoder", "HiFi-GAN"),
         )
     else:
         net_g = RVC_Model_nof0(
@@ -219,8 +221,10 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
     elif _use_mps:
         net_g = net_g.to(_device)
     has_xpu = bool(hasattr(torch, "xpu") and torch.xpu.is_available())
+    _vocoder = getattr(hps, "vocoder", "HiFi-GAN")
+    _disc_version = "v3" if _vocoder == "RefineGAN" else hps.version
     net_d = MultiPeriodDiscriminator(
-        hps.version,
+        _disc_version,
         use_spectral_norm=hps.model.use_spectral_norm,
         has_xpu=has_xpu,
     )
@@ -321,6 +325,13 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
 
     scaler = GradScaler(_device.type, enabled=hps.train.fp16_run)
 
+    # Mel loss function — multiscale for RefineGAN, L1 for HiFi-GAN
+    _use_multiscale_mel = getattr(hps, "vocoder", "HiFi-GAN") == "RefineGAN"
+    if _use_multiscale_mel:
+        _fn_mel_loss = MultiScaleMelSpectrogramLoss(sample_rate=hps.data.sampling_rate)
+    else:
+        _fn_mel_loss = None  # use F.l1_loss directly
+
     cache = []
     for epoch in range(epoch_str, hps.train.epochs + 1):
         if rank == 0:
@@ -338,6 +349,7 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
                 cache,
                 _device,
                 _use_mps,
+                _fn_mel_loss,
             )
         else:
             train_and_evaluate(
@@ -354,6 +366,7 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
                 cache,
                 _device,
                 _use_mps,
+                _fn_mel_loss,
             )
         scheduler_g.step()
         scheduler_d.step()
@@ -373,6 +386,7 @@ def train_and_evaluate(
     cache,
     _device=None,
     _use_mps=False,
+    fn_mel_loss=None,
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
@@ -575,7 +589,11 @@ def train_and_evaluate(
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
             with autocast(_device.type, enabled=False):
-                loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+                if fn_mel_loss is not None:
+                    # RefineGAN: multi-scale mel loss on raw waveform slices
+                    loss_mel = fn_mel_loss(wave, y_hat) * hps.train.c_mel / 3.0
+                else:
+                    loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)

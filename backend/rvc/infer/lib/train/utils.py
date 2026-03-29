@@ -280,6 +280,14 @@ def get_hparams(init=True):
         help="if caching the dataset in GPU memory, 1 or 0",
     )
     parser.add_argument("-a", "--author", type=str, default="", help="Model author")
+    parser.add_argument(
+        "-voc", "--vocoder", type=str, default="HiFi-GAN",
+        help="Vocoder: HiFi-GAN or RefineGAN",
+    )
+    parser.add_argument(
+        "-emb", "--embedder", type=str, default="spin-v2",
+        help="Feature embedder: spin-v2, spin, contentvec, or hubert",
+    )
 
     args = parser.parse_args()
     # If the caller passes an absolute path, use it directly and derive the
@@ -313,6 +321,8 @@ def get_hparams(init=True):
     hparams.if_cache_data_in_gpu = args.if_cache_data_in_gpu
     hparams.data.training_files = "%s/filelist.txt" % experiment_dir
     hparams.author = args.author
+    hparams.vocoder = args.vocoder
+    hparams.embedder = args.embedder
     return hparams
 
 

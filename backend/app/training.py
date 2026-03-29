@@ -191,7 +191,7 @@ def _build_filelist(project_root: str, exp_dir: str) -> None:
     """Build logs/rvc_finetune_active/filelist.txt from feature directories.
 
     Adapts the filelist construction logic from click_train() in web.py.
-    Uses v2 feature dimensions (768) and 48k sample rate with f0 enabled.
+    Uses v2 feature dimensions (768) and 32k sample rate with f0 enabled.
 
     exp_dir: absolute path to logs/rvc_finetune_active/
     """
@@ -215,7 +215,7 @@ def _build_filelist(project_root: str, exp_dir: str) -> None:
 
     spk_id = 0  # speaker id; fixed for single-speaker fine-tuning
     fea_dim = 768  # v2 feature dimension
-    sr_tag = "48k"
+    sr_tag = "32k"
 
     # Mute padding entries — absolute paths under logs/mute/ (project root)
     mute_root = os.path.join(project_root, "logs", "mute")
@@ -257,7 +257,7 @@ def _build_filelist(project_root: str, exp_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _write_config(project_root: str, exp_dir: str, batch_size: int = 8) -> None:
-    """Copy backend/rvc/configs/inuse/v2/48k.json into exp_dir/config.json, patching
+    """Copy backend/rvc/configs/inuse/v2/32k.json into exp_dir/config.json, patching
     training hyperparameters for MPS performance.
 
     log_interval=10 (not 1) is the key MPS optimization:
@@ -273,7 +273,7 @@ def _write_config(project_root: str, exp_dir: str, batch_size: int = 8) -> None:
     import json as _json
 
     config_save_path = os.path.join(exp_dir, "config.json")
-    src = os.path.join(project_root, "backend", "rvc", "configs", "inuse", "v2", "48k.json")
+    src = os.path.join(project_root, "backend", "rvc", "configs", "inuse", "v2", "32k.json")
 
     with open(src) as _f:
         cfg = _json.load(_f)
@@ -336,6 +336,9 @@ async def _run_pipeline(
     profile_dir: str = "",
     prior_epochs: int = 0,
     files_changed: bool = False,
+    embedder: str = "spin-v2",
+    overtrain_threshold: int = 0,
+    vocoder: str = "HiFi-GAN",
 ) -> None:
     """Orchestrate the full training pipeline for one TrainingJob.
 
@@ -569,7 +572,7 @@ async def _run_pipeline(
         python,
         "infer/modules/train/preprocess.py",
         sample_dir,       # inp_root (directory, not the wav file itself)
-        "48000",          # sr
+        "32000",          # sr
         str(n_cpu),       # n_p
         exp_dir,          # exp_dir (absolute path)
         "False",          # noparallel
@@ -605,9 +608,20 @@ async def _run_pipeline(
         return
 
     # ------------------------------------------------------------------
-    # Phase 2b: Feature Extraction (HuBERT)
+    # Phase 2b: Feature Extraction (embedder)
     # ------------------------------------------------------------------
-    _emit_phase("extract_feature", "Extracting features (HuBERT)")
+    # Resolve embedder to an absolute path under assets/.
+    # "hubert" is the legacy fairseq .pt fallback (assets/hubert/hubert_base.pt).
+    # All others (spin-v2, spin, contentvec) are HuggingFace directories
+    # sitting directly under assets/<name>/.
+    # The embedder name is stored on the profile and locked after first training.
+    if embedder == "hubert":
+        embedder_path = os.path.join(project_root, "assets", "hubert", "hubert_base.pt")
+    else:
+        # spin-v2 → assets/spin-v2, spin → assets/spin, contentvec → assets/contentvec
+        embedder_path = os.path.join(project_root, "assets", embedder)
+
+    _emit_phase("extract_feature", f"Extracting features ({embedder})")
 
     feat_env = base_env.copy()
     feat_env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -616,13 +630,14 @@ async def _run_pipeline(
     feat_args = [
         python,
         "infer/modules/train/extract_feature_print.py",
-        "mps",   # device
-        "1",     # n_part
-        "0",     # i_part
-        "",      # i_gpu (empty → use device arg)
-        exp_dir, # exp_dir absolute
-        "v2",    # version
-        "False", # is_half
+        "mps",           # device
+        "1",             # n_part
+        "0",             # i_part
+        "",              # i_gpu (empty → use device arg)
+        exp_dir,         # exp_dir absolute
+        "v2",            # version
+        "False",         # is_half
+        embedder_path,   # embedder path (new arg)
     ]
 
     ok = await _run_subprocess(job, feat_args, feat_env, rvc_pkg_dir, "extract_feature")
@@ -670,8 +685,17 @@ async def _run_pipeline(
     cumulative_epochs = prior_epochs + total_epoch
 
     # Pretrain weights — absolute paths into project_root/assets/
-    pretrain_g = os.path.join(project_root, "assets", "pretrained_v2", "f0G48k.pth") if prior_epochs == 0 else ""
-    pretrain_d = os.path.join(project_root, "assets", "pretrained_v2", "f0D48k.pth") if prior_epochs == 0 else ""
+    # RefineGAN ships its own pretrained G/D under assets/refinegan/
+    if prior_epochs == 0:
+        if vocoder == "RefineGAN":
+            pretrain_g = os.path.join(project_root, "assets", "refinegan", "f0G32k.pth")
+            pretrain_d = os.path.join(project_root, "assets", "refinegan", "f0D32k.pth")
+        else:
+            pretrain_g = os.path.join(project_root, "assets", "pretrained_v2", "f0G32k.pth")
+            pretrain_d = os.path.join(project_root, "assets", "pretrained_v2", "f0D32k.pth")
+    else:
+        pretrain_g = ""
+        pretrain_d = ""
 
     await job.queue.put({
         "type": "log",
@@ -687,7 +711,7 @@ async def _run_pipeline(
         python,
         "infer/modules/train/train.py",
         "-e", exp_dir,   # absolute path — avoids cwd-relative ./logs/ resolution in train.py
-        "-sr", "48k",
+        "-sr", "32k",
         "-f0", "1",
         "-bs", str(batch_size),
         "-te", str(cumulative_epochs),
@@ -699,6 +723,8 @@ async def _run_pipeline(
         "-sw", "0",   # save_small_model at end only (we handle artifacts ourselves)
         "-v", "v2",
         "-a", "",
+        "-voc", vocoder,
+        "-emb", embedder,
     ]
 
     train_proc = await asyncio.create_subprocess_exec(
@@ -728,6 +754,14 @@ async def _run_pipeline(
         # Buffer the latest loss line and attach it to epoch_done.
         # All mid-epoch log noise is suppressed.
         last_loss_line: str = ""
+
+        # Overtraining detection state
+        # Mirrors the logic in ultimate-rvc's train.py but runs here so we can
+        # terminate the subprocess cleanly without modifying train.py.
+        _ot_lowest_gen: float = float("inf")
+        _ot_consecutive: int = 0
+        _ot_min_delta: float = 0.004   # must improve by at least this to count
+        _ot_triggered: bool = False
 
         async for raw_line in train_proc.stdout:
             line = raw_line.decode(errors="replace").rstrip()
@@ -772,14 +806,41 @@ async def _run_pipeline(
                                 losses[key] = float(lm.group(1))
                             except ValueError:
                                 pass
+
+                    # Overtraining detection — track generator loss trend.
+                    # Only active when overtrain_threshold > 0.
+                    ot_label = ""
+                    if overtrain_threshold > 0 and "loss_gen" in losses:
+                        gen_loss = losses["loss_gen"]
+                        if gen_loss < _ot_lowest_gen - _ot_min_delta:
+                            _ot_lowest_gen = gen_loss
+                            _ot_consecutive = 0
+                        else:
+                            _ot_consecutive += 1
+                        if _ot_consecutive >= overtrain_threshold and not _ot_triggered:
+                            _ot_triggered = True
+                            ot_label = f" ⚠ overtraining detected ({_ot_consecutive} epochs no improvement)"
+                            await job.queue.put({
+                                "type": "log",
+                                "message": f"Stopping early: generator loss has not improved for {_ot_consecutive} consecutive epochs (threshold={overtrain_threshold}).",
+                                "phase": "train",
+                            })
+                            # Terminate train.py cleanly
+                            try:
+                                train_proc.terminate()
+                            except Exception:
+                                pass
+
                     msg: dict = {
                         "type": "epoch_done",
-                        "message": f"Epoch {epoch_num} ({elapsed}){loss_suffix}",
+                        "message": f"Epoch {epoch_num} ({elapsed}){loss_suffix}{ot_label}",
                         "phase": "train",
                         "epoch": epoch_num,
                     }
                     if losses:
                         msg["losses"] = losses
+                    if overtrain_threshold > 0:
+                        msg["overtrain_consecutive"] = _ot_consecutive
                     await job.queue.put(msg)
                     # Persist losses to DB so the chart survives restarts
                     if losses:
@@ -822,10 +883,25 @@ async def _run_pipeline(
             pass
 
     if train_proc.returncode != 0:
-        # stderr already drained into job queue by _drain_stderr above
-        err_msg = f"Train phase failed (exit code {train_proc.returncode}) — see [stderr] lines above"
-        await _fail("train", err_msg)
-        return
+        # SIGTERM from overtraining detection (returncode = -15 on Unix) is a
+        # clean intentional stop — treat it as a successful partial run and
+        # proceed to index building + artifact copy.
+        import signal as _signal
+        is_overtrain_stop = (
+            overtrain_threshold > 0
+            and train_proc.returncode in (-_signal.SIGTERM, _signal.SIGTERM)
+        )
+        if not is_overtrain_stop:
+            # stderr already drained into job queue by _drain_stderr above
+            err_msg = f"Train phase failed (exit code {train_proc.returncode}) — see [stderr] lines above"
+            await _fail("train", err_msg)
+            return
+        # Overtraining stop — log it and continue to artifact phase
+        await job.queue.put({
+            "type": "log",
+            "message": "Training stopped early by overtraining detector — proceeding to index build.",
+            "phase": "train",
+        })
     # On success: stderr was already drained by the concurrent _drain_stderr task
 
     # ------------------------------------------------------------------
@@ -1006,6 +1082,9 @@ class TrainingManager:
         profile_dir: str = "",
         prior_epochs: int = 0,
         files_changed: bool = False,
+        embedder: str = "spin-v2",
+        overtrain_threshold: int = 0,
+        vocoder: str = "HiFi-GAN",
     ) -> TrainingJob:
         """Create and launch a training job for profile_id.
 
@@ -1020,6 +1099,11 @@ class TrainingManager:
         last training run (DB needs_retraining=1). Forces full re-extraction
         of preprocess/F0/feature outputs even for the same profile, preventing
         stale F0 data being paired with new audio segments.
+
+        embedder: feature embedder name, e.g. "spin-v2". Locked after first run.
+
+        overtrain_threshold: stop training when generator loss fails to improve
+        for this many consecutive epochs. 0 = disabled.
 
         Raises ValueError("job already running") if any job is currently
         in status=="training" (HTTP 409 in the router layer).
@@ -1036,7 +1120,11 @@ class TrainingManager:
         self._jobs[profile_id] = job
 
         asyncio.create_task(
-            _run_pipeline(job, sample_dir, project_root, total_epoch, save_every, batch_size, profile_dir, prior_epochs, files_changed)
+            _run_pipeline(
+                job, sample_dir, project_root, total_epoch, save_every, batch_size,
+                profile_dir, prior_epochs, files_changed, embedder, overtrain_threshold,
+                vocoder,
+            )
         )
 
         print(

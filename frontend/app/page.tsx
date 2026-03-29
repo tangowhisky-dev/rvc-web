@@ -30,6 +30,8 @@ interface Profile {
   index_path: string | null;
   total_epochs_trained: number;
   needs_retraining: boolean;
+  embedder: string;
+  vocoder: string;
   audio_files: AudioFile[];
 }
 
@@ -417,14 +419,30 @@ interface AudioFilePickerProps {
   /** If provided, shows a "Profile Name" field and creates a new profile. */
   newProfile?: boolean;
   /** For existing profiles, called with (profileId, file, segStart, segEnd) */
-  onSubmit: (args: { name?: string; file: File; segStart: number; segEnd: number }) => Promise<void>;
+  onSubmit: (args: { name?: string; file: File; segStart: number; segEnd: number; embedder?: string; vocoder?: string }) => Promise<void>;
   onCancel: () => void;
   submitLabel?: string;
   showNameField?: boolean;
+  /** Show embedder + vocoder selectors (new-profile creation only) */
+  showEmbedder?: boolean;
 }
 
-function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField }: AudioFilePickerProps) {
+const EMBEDDER_OPTIONS: { value: string; label: string; description: string }[] = [
+  { value: 'spin-v2',   label: 'SPIN-v2',        description: 'Best quality · recommended' },
+  { value: 'spin',      label: 'SPIN',            description: 'Good quality · faster extraction' },
+  { value: 'contentvec',label: 'ContentVec',      description: 'Reliable baseline · widely tested' },
+  { value: 'hubert',    label: 'HuBERT (legacy)', description: 'Original fairseq model · fallback only' },
+];
+
+const VOCODER_OPTIONS: { value: string; label: string; description: string }[] = [
+  { value: 'HiFi-GAN',  label: 'HiFi-GAN',   description: 'Fast · proven · widely supported' },
+  { value: 'RefineGAN', label: 'RefineGAN',   description: 'Better speech clarity · slower training' },
+];
+
+function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField, showEmbedder }: AudioFilePickerProps) {
   const [nameInput, setNameInput]           = useState('');
+  const [embedder, setEmbedder]             = useState('spin-v2');
+  const [vocoder, setVocoder]               = useState('HiFi-GAN');
   const [file, setFile]                     = useState<File | null>(null);
   const [fileDuration, setFileDuration]     = useState<number | null>(null);
   const [durationError, setDurationError]   = useState<string | null>(null);
@@ -485,7 +503,7 @@ function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField }: Aud
     setUploading(true);
     setError(null);
     try {
-      await onSubmit({ name: showNameField ? nameInput.trim() : undefined, file, segStart: startSec, segEnd: endSec });
+      await onSubmit({ name: showNameField ? nameInput.trim() : undefined, file, segStart: startSec, segEnd: endSec, embedder: showEmbedder ? embedder : undefined, vocoder: showEmbedder ? vocoder : undefined });
       // Reset on success
       setNameInput('');
       setFile(null);
@@ -544,6 +562,68 @@ function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField }: Aud
         </div>
       </div>
 
+      {/* Embedder selector — shown only for new profile creation */}
+      {showEmbedder && (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+              Feature Embedder
+            </label>
+            <span className="text-[10px] font-mono text-amber-500/80 bg-amber-950/30 border border-amber-800/40 px-1.5 py-0.5 rounded">
+              locked after first training run
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            {EMBEDDER_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setEmbedder(opt.value)}
+                className={`text-left px-3 py-2 rounded-lg border text-[12px] font-mono transition-colors ${
+                  embedder === opt.value
+                    ? 'bg-cyan-900/30 border-cyan-600/50 text-cyan-300'
+                    : 'bg-zinc-900 border-zinc-700 text-zinc-400 hover:border-zinc-600 hover:text-zinc-300'
+                }`}
+              >
+                <div className="font-semibold">{opt.label}</div>
+                <div className="text-[10px] opacity-70 mt-0.5">{opt.description}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Vocoder selector — shown only for new profile creation */}
+      {showEmbedder && (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+              Vocoder
+            </label>
+            <span className="text-[10px] font-mono text-amber-500/80 bg-amber-950/30 border border-amber-800/40 px-1.5 py-0.5 rounded">
+              locked after first training run
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            {VOCODER_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setVocoder(opt.value)}
+                className={`text-left px-3 py-2 rounded-lg border text-[12px] font-mono transition-colors ${
+                  vocoder === opt.value
+                    ? 'bg-violet-900/30 border-violet-600/50 text-violet-300'
+                    : 'bg-zinc-900 border-zinc-700 text-zinc-400 hover:border-zinc-600 hover:text-zinc-300'
+                }`}
+              >
+                <div className="font-semibold">{opt.label}</div>
+                <div className="text-[10px] opacity-70 mt-0.5">{opt.description}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {file && fileDuration != null && !durationError && (
         <WaveformViewer
           file={file}
@@ -588,12 +668,14 @@ interface UploadPanelProps {
 }
 
 function UploadPanel({ onUploaded, onCancel }: UploadPanelProps) {
-  async function handleSubmit({ name, file, segStart, segEnd }: { name?: string; file: File; segStart: number; segEnd: number }) {
+  async function handleSubmit({ name, file, segStart, segEnd, embedder, vocoder }: { name?: string; file: File; segStart: number; segEnd: number; embedder?: string; vocoder?: string }) {
     const form = new FormData();
     form.append('name', name!);
     form.append('file', file);
     form.append('seg_start', String(segStart));
     form.append('seg_end',   String(segEnd));
+    if (embedder) form.append('embedder', embedder);
+    if (vocoder)  form.append('vocoder',  vocoder);
 
     const res = await fetch(`${API}/api/profiles`, { method: 'POST', body: form });
     if (!res.ok) {
@@ -608,6 +690,7 @@ function UploadPanel({ onUploaded, onCancel }: UploadPanelProps) {
       <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500 mb-4">New Profile</h2>
       <AudioFilePicker
         showNameField
+        showEmbedder
         onSubmit={handleSubmit}
         onCancel={onCancel}
         submitLabel="↑ Create Profile"
@@ -867,6 +950,22 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
             {profile.total_epochs_trained > 0 && (
               <span className="text-cyan-600">{profile.total_epochs_trained} epochs</span>
             )}
+            {/* Embedder badge */}
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono
+                             bg-indigo-950/40 border border-indigo-800/40 text-indigo-400">
+              ◈ {profile.embedder || 'spin-v2'}
+              {profile.total_epochs_trained > 0 && (
+                <span className="text-indigo-600" title="Embedder locked after first training run">🔒</span>
+              )}
+            </span>
+            {/* Vocoder badge */}
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono
+                             bg-violet-950/40 border border-violet-800/40 text-violet-400">
+              ◈ {profile.vocoder || 'HiFi-GAN'}
+              {profile.total_epochs_trained > 0 && (
+                <span className="text-violet-600" title="Vocoder locked after first training run">🔒</span>
+              )}
+            </span>
             {profile.profile_dir && (
               <span title={profile.profile_dir} className="text-zinc-700 max-w-[220px] truncate">
                 📁 {profile.profile_dir.split('/').slice(-2).join('/')}

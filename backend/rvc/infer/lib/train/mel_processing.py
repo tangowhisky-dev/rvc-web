@@ -125,3 +125,69 @@ def mel_spectrogram_torch(
     melspec = spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax)
 
     return melspec
+
+
+class MultiScaleMelSpectrogramLoss(torch.nn.Module):
+    """Multi-scale mel spectrogram loss for RefineGAN training.
+
+    Computes L1 loss across 7 STFT scales, operating on log-mel spectrograms.
+    Ported from Applio/rvc/train/mel_processing.py.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 32000,
+        n_mels: list = [5, 10, 20, 40, 80, 160, 320],
+        window_lengths: list = [32, 64, 128, 256, 512, 1024, 2048],
+        loss_fn=None,
+    ):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.loss_fn = loss_fn or torch.nn.L1Loss()
+        self.log_base = torch.log(torch.tensor(10.0))
+        self.stft_params = list(zip(n_mels, window_lengths))
+        self.hann_window: dict = {}
+        self.mel_banks: dict = {}
+
+    def mel_spectrogram(self, wav: torch.Tensor, n_mels: int, window_length: int):
+        dtype_device = f"{wav.dtype}_{wav.device}"
+        win_key = f"{window_length}_{dtype_device}"
+        mel_key = f"{n_mels}_{dtype_device}"
+
+        if win_key not in self.hann_window:
+            self.hann_window[win_key] = torch.hann_window(
+                window_length, device=wav.device, dtype=torch.float32
+            )
+
+        wav_sq = wav.squeeze(1).float()
+        stft = torch.stft(
+            wav_sq,
+            n_fft=window_length,
+            hop_length=window_length // 4,
+            window=self.hann_window[win_key],
+            return_complex=True,
+        )
+        magnitude = torch.sqrt(stft.real.pow(2) + stft.imag.pow(2) + 1e-6)
+
+        if mel_key not in self.mel_banks:
+            self.mel_banks[mel_key] = torch.from_numpy(
+                librosa_mel_fn(
+                    sr=self.sample_rate,
+                    n_mels=n_mels,
+                    n_fft=window_length,
+                    fmin=0,
+                    fmax=None,
+                )
+            ).to(device=wav.device, dtype=torch.float32)
+
+        return torch.matmul(self.mel_banks[mel_key], magnitude)
+
+    def forward(self, real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
+        loss = 0.0
+        for n_mels, win in self.stft_params:
+            real_mels = self.mel_spectrogram(real, n_mels, win)
+            fake_mels = self.mel_spectrogram(fake, n_mels, win)
+            real_log = torch.log(real_mels.clamp(min=1e-5)) / self.log_base
+            fake_log = torch.log(fake_mels.clamp(min=1e-5)) / self.log_base
+            loss = loss + self.loss_fn(real_log, fake_log)
+        return loss

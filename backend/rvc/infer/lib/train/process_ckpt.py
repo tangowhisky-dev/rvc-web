@@ -57,6 +57,8 @@ def save_small_model(ckpt, sr, if_f0, name, epoch, version, hps):
         opt["sr"] = sr
         opt["f0"] = if_f0
         opt["version"] = version
+        opt["vocoder"] = getattr(hps, "vocoder", "HiFi-GAN")
+        opt["embedder"] = getattr(hps, "embedder", "hubert")
         try:
             h = model_hash_ckpt(opt)
             opt["hash"] = h
@@ -73,7 +75,7 @@ def save_small_model(ckpt, sr, if_f0, name, epoch, version, hps):
         return traceback.format_exc()
 
 
-def extract_small_model(path, name, author, sr, if_f0, info, version):
+def extract_small_model(path, name, author, sr, if_f0, info, version, vocoder="HiFi-GAN", embedder="hubert"):
     try:
         ckpt = torch.load(path, map_location="cpu")
         if "model" in ckpt:
@@ -200,6 +202,8 @@ def extract_small_model(path, name, author, sr, if_f0, info, version):
             opt["author"] = author
         opt["version"] = version
         opt["sr"] = sr
+        opt["vocoder"] = vocoder
+        opt["embedder"] = embedder
         opt["f0"] = int(if_f0)
         h = model_hash_ckpt(opt)
         opt["hash"] = h
@@ -286,6 +290,8 @@ def merge(path1, path2, alpha1, sr, f0, info, name, version):
         opt["sr"] = sr
         opt["f0"] = 1 if f0 == i18n("Yes") else 0
         opt["version"] = version
+        opt["vocoder"] = ckpt1.get("vocoder", "HiFi-GAN") if isinstance(ckpt1, dict) else "HiFi-GAN"
+        opt["embedder"] = ckpt1.get("embedder", "hubert") if isinstance(ckpt1, dict) else "hubert"
         opt["info"] = info
         h = model_hash_ckpt(opt)
         opt["hash"] = h

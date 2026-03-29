@@ -1,6 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { TipsPanel } from '../TipsPanel';
+import { SettingsGuide } from '../SettingsGuide';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -936,6 +938,84 @@ export default function RealtimePage() {
             </code>
           </p>
         </footer>
+
+        {/* Tips */}
+        <TipsPanel tips={[
+          {
+            icon: '🎛️',
+            title: 'Start with these defaults',
+            body: 'pitch=0, index_rate=0.75, protect=0.33. Adjust one parameter at a time so you can hear the effect clearly.',
+          },
+          {
+            icon: '🎵',
+            title: 'Pitch shift (semitones)',
+            body: 'Positive values raise the pitch; negative lower it. For male-to-female conversion try +10 to +12. For female-to-male try −10 to −12. Even multiples of 12 (octave shifts) are the least artefact-prone.',
+          },
+          {
+            icon: '🗂️',
+            title: 'Index rate — how much FAISS retrieval blends in',
+            body: 'Higher values (→1.0) pull the voice closer to the training speaker identity at the cost of occasional tonal artefacts. Lower values (→0) rely more on the neural synthesis alone.',
+          },
+          {
+            icon: '🔡',
+            title: 'Protect — consonant preservation',
+            body: 'Consonants (t, s, p, k) are easily mangled by pitch shifting. Values near 0.33 protect them. If speech sounds lisped or "watery" try raising this toward 0.5.',
+          },
+          {
+            icon: '🔕',
+            title: 'Silence threshold',
+            body: 'Segments below this level (dBFS) are passed through unprocessed to keep the model warm without converting silence. −45 dB is a good starting point; raise to −35 in noisy environments.',
+          },
+          {
+            icon: '⚡',
+            title: 'Latency',
+            body: 'Block size is fixed at 200 ms. Total round-trip latency ≈ 200 ms block + ~50–150 ms model inference + audio driver overhead. MPS (Apple Silicon) is fastest for this codebase.',
+          },
+        ]} />
+
+        {/* Parameter reference */}
+        <SettingsGuide settings={[
+          {
+            name: 'Pitch',
+            range: '−24 → +24 semitones',
+            default: '0',
+            badge: 'cyan',
+            summary: 'Shifts the pitch of the converted voice up or down in semitones. Does not change the voice identity — only the musical pitch of what the model outputs.',
+            details: 'Each semitone is one step on a piano keyboard. 12 semitones = one octave. Octave shifts (±12, ±24) sound the most natural because the harmonic relationships are preserved. Fractional or odd-number shifts can introduce slight tonal artefacts in some voices. This is applied post-synthesis, so it does not affect speaker identity retrieval.',
+            raise: 'Converting a male voice to sound female-range (+10 to +12), or when the converted voice sounds too low compared to the original speaker.',
+            lower: 'Converting a female voice to sound male-range (−10 to −12), or when the converted voice sounds unnaturally high or thin.',
+          },
+          {
+            name: 'Index Rate',
+            range: '0.0 → 1.0',
+            default: '0.75',
+            badge: 'violet',
+            summary: 'Controls how much the FAISS speaker index blends into the output. Higher values pull the voice identity closer to the training speaker; lower values rely more on the neural synthesis alone.',
+            details: 'During training, a FAISS index of HuBERT/SPIN feature vectors from the training audio is built. At inference, the input features are retrieved against this index and the nearest-neighbour cluster centroid is blended in. This "anchors" the voice identity to what was heard in training. At 0 the index is bypassed entirely — synthesis depends only on the model weights. At 1 the retrieved features dominate.',
+            raise: 'The converted voice doesn\'t sound enough like the target speaker, or the voice identity drifts mid-sentence. More index = stronger identity pull.',
+            lower: 'You hear tonal buzzing, metallic artefacts, or over-processing, especially on vowels. The index is over-correcting — dial it back toward 0.5.',
+          },
+          {
+            name: 'Protect',
+            range: '0.0 → 0.5',
+            default: '0.33',
+            badge: 'emerald',
+            summary: 'Protects unvoiced consonants (t, s, p, k, sh, f) from being pitch-shifted and over-processed by the model. These sounds have no fundamental pitch, so shifting them degrades clarity.',
+            details: 'The model detects segments where the signal is unvoiced (no clear F0) and passes them through with reduced voice conversion applied, preserving the sharpness of consonants. At 0 everything is converted fully — consonants may sound lisped, watery, or blurred. At 0.5 (maximum) consonants are almost untouched, preserving crispness at the cost of slightly less voice character on those segments.',
+            raise: 'Speech sounds lisped, words blend together, or "s" and "t" sounds are soft and indistinct. Consonant crispness is the priority.',
+            lower: 'Voice character sounds inconsistent — some phonemes clearly match the target voice but others don\'t. You want more uniform conversion across all sounds.',
+          },
+          {
+            name: 'Silence Gate',
+            range: '−70 → −10 dBFS',
+            default: '−45 dBFS',
+            badge: 'amber',
+            summary: 'Audio below this loudness threshold is passed through unprocessed instead of being converted. Prevents the model from "hallucinating" voice during pauses and keeps GPU kernels warm without wasted inference.',
+            details: 'Speech typically sits between −30 and −10 dBFS on peaks. Room noise and breath is usually below −50 dBFS. The gate compares the RMS level of each 200 ms block against this threshold. Blocks below threshold are zeroed before conversion and the silence is passed through directly. This also prevents subtle artefacts that occur when the model is fed near-silence and tries to generate phonemes.',
+            raise: 'Background noise is being converted and you hear a constant low-level voice-like texture in quiet sections. Raise toward −35 to cut it out.',
+            lower: 'Soft-spoken parts or quiet phrases are being silenced and not converted at all. Lower toward −55 to let quieter audio through the gate.',
+          },
+        ]} />
       </div>
     </main>
   );
