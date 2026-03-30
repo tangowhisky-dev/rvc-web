@@ -28,6 +28,51 @@ from pydantic import BaseModel
 
 from backend.app.db import get_db
 
+# MIME types for common audio formats
+_AUDIO_MIME = {
+    ".wav":  "audio/wav",
+    ".mp3":  "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg":  "audio/ogg",
+    ".m4a":  "audio/mp4",
+    ".aac":  "audio/aac",
+    ".aiff": "audio/aiff",
+    ".aif":  "audio/aiff",
+}
+
+# Formats soundfile can write natively (no ffmpeg needed)
+_SF_WRITE_EXTS = {".wav", ".flac", ".ogg", ".aiff", ".aif"}
+
+
+def _write_audio(path: str, audio: np.ndarray, sr: int, ext: str) -> None:
+    """Write audio to *path* in the format implied by *ext*.
+
+    Uses soundfile for lossless formats; pydub+ffmpeg for everything else
+    (MP3, M4A, AAC, …).
+    """
+    ext = ext.lower()
+    if ext in _SF_WRITE_EXTS:
+        fmt_map = {".wav": "WAV", ".flac": "FLAC", ".ogg": "OGG",
+                   ".aiff": "AIFF", ".aif": "AIFF"}
+        sf.write(path, audio, sr, format=fmt_map.get(ext, "WAV"))
+    else:
+        # Write to a temporary WAV first, then convert with pydub
+        from pydub import AudioSegment
+        import tempfile as _tmp
+        with _tmp.NamedTemporaryFile(suffix=".wav", delete=False) as t:
+            wav_path = t.name
+        try:
+            sf.write(wav_path, audio, sr, format="WAV")
+            seg = AudioSegment.from_wav(wav_path)
+            fmt_map = {".mp3": "mp3", ".m4a": "mp4", ".aac": "adts"}
+            fmt = fmt_map.get(ext, ext.lstrip("."))
+            seg.export(path, format=fmt)
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
 logger = logging.getLogger("rvc_web.offline")
 
 router = APIRouter(prefix="/api/offline", tags=["offline"])
@@ -49,13 +94,15 @@ class ProfileOut(BaseModel):
     model_path: Optional[str]
     index_path: Optional[str]
     total_epochs_trained: int
+    embedder: str = "spin-v2"
+    vocoder: str = "HiFi-GAN"
 
 
 @router.get("/profiles", response_model=list[ProfileOut])
 async def list_profiles():
     async with get_db() as db:
         cursor = await db.execute(
-            """SELECT id, name, profile_dir, checkpoint_path, total_epochs_trained
+            """SELECT id, name, profile_dir, checkpoint_path, total_epochs_trained, embedder, vocoder
                FROM profiles
                WHERE status != 'untrained'
                ORDER BY created_at DESC"""
@@ -83,6 +130,8 @@ async def list_profiles():
             model_path=model_path,
             index_path=index_path,
             total_epochs_trained=int(row["total_epochs_trained"] or 0),
+            embedder=row["embedder"] or "spin-v2",
+            vocoder=row["vocoder"] or "HiFi-GAN",
         ))
     return out
 
@@ -133,6 +182,7 @@ def _run_offline_inference(
     index_rate: float,
     protect: float,
     progress_cb,               # callable(fraction: float)
+    output_gain: float = 1.0,  # post-inference volume multiplier (1.0 = RMS-matched)
 ) -> np.ndarray:
     """Run chunked RVC inference on a full audio array.
 
@@ -293,6 +343,23 @@ def _run_offline_inference(
     expected_len = int(np.ceil(total_16k * tgt_sr / _SR_16K))
     result = result[:expected_len]
 
+    # ── RMS matching: scale output to match input loudness ───────────────
+    # Measure RMS of non-silent portions of input and output, then scale
+    # output so its RMS matches the input. This corrects the systematic
+    # level difference between the model's training distribution and the
+    # input file. output_gain is applied on top (default 1.0 = no extra gain).
+    if len(result) > 0 and len(audio_16k) > 0:
+        in_rms  = float(np.sqrt(np.mean(audio_16k ** 2)) + 1e-8)
+        out_rms = float(np.sqrt(np.mean(result ** 2)) + 1e-8)
+        rms_scale = in_rms / out_rms
+        # Cap at 10× to avoid runaway gain on near-silent outputs
+        rms_scale = float(np.clip(rms_scale, 0.1, 10.0))
+        result = result * rms_scale * output_gain
+        logger.info(
+            "RMS match: in=%.5f  out_raw=%.5f  scale=%.3f×  gain=%.3f×",
+            in_rms, out_rms, rms_scale, output_gain,
+        )
+
     return result, tgt_sr
 
 
@@ -391,12 +458,12 @@ async def convert_audio(
                     protect=protect,
                     progress_cb=_progress,
                 )
-                # Write result to temp file in original format
+                # Write result to temp file preserving original format
                 tmp = tempfile.NamedTemporaryFile(
                     suffix=orig_ext, delete=False, prefix=f"rvc_offline_{job_id}_"
                 )
                 tmp.close()
-                sf.write(tmp.name, result_audio, tgt_sr)
+                _write_audio(tmp.name, result_audio, tgt_sr, orig_ext)
                 _jobs[job_id] = {
                     "status": "done",
                     "result_path": tmp.name,
@@ -458,12 +525,13 @@ async def download_result(job_id: str):
 
     orig = job.get("orig_filename", "output.wav")
     stem = os.path.splitext(orig)[0]
-    ext  = os.path.splitext(result_path)[1] or ".wav"
+    ext  = os.path.splitext(result_path)[1].lower() or ".wav"
     download_name = f"{stem}_rvc{ext}"
+    mime = _AUDIO_MIME.get(ext, "application/octet-stream")
 
     return FileResponse(
         result_path,
-        media_type="audio/wav",
+        media_type=mime,
         filename=download_name,
         headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
     )

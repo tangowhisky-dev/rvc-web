@@ -375,7 +375,6 @@ async def create_profile(
     _VALID_VOCODERS = {"HiFi-GAN", "RefineGAN"}
     if vocoder not in _VALID_VOCODERS:
         raise HTTPException(status_code=400, detail=f"Invalid vocoder: {vocoder!r}")
-        raise HTTPException(status_code=400, detail=f"Invalid embedder: {embedder!r}")
 
     profile_id = uuid.uuid4().hex
     pdir = os.path.join(_profiles_root(), profile_id)
@@ -431,7 +430,7 @@ async def create_profile(
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms, embedder
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder
                FROM profiles WHERE id = ?""",
             (profile_id,),
         )
@@ -540,7 +539,7 @@ async def list_profiles() -> list[ProfileOut]:
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder
                FROM profiles ORDER BY created_at DESC"""
         )
         rows = await cursor.fetchall()
@@ -561,7 +560,7 @@ async def get_profile(profile_id: str) -> ProfileOut:
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder
                FROM profiles WHERE id = ?""",
             (profile_id,),
         )

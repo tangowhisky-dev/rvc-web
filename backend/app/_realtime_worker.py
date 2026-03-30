@@ -225,6 +225,7 @@ def run_worker(
     index_rate: float,
     protect: float,
     silence_threshold_db: float = -45.0,
+    output_gain: float = 1.0,
     save_path: str | None = None,
     model_path: str | None = None,
     index_path: str | None = None,
@@ -512,6 +513,8 @@ def run_worker(
                             protect = msg["protect"]
                         if "silence_threshold_db" in msg:
                             _silence_rms = 10 ** (msg["silence_threshold_db"] / 20.0)
+                        if "output_gain" in msg:
+                            output_gain = float(msg["output_gain"])
             except Exception:
                 pass
 
@@ -655,7 +658,7 @@ def run_worker(
                 rms_scale = (ref_rms / out_rms)
                 # Cap at 1.5× — tighter than before since smoothed RMS is stable.
                 rms_scale = min(rms_scale, 1.5)
-                infer_wav = infer_wav * rms_scale
+                infer_wav = infer_wav * rms_scale * output_gain
 
                 # ── Per-sample gate envelope ──────────────────────────────
                 # Interpolate gate gain linearly from _gate_gain_cur (end of

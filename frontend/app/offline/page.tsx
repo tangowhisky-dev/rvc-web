@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { TipsPanel } from '../TipsPanel';
+import { ProfilePicker } from '../ProfilePicker';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
@@ -15,6 +16,8 @@ interface Profile {
   model_path: string | null;
   index_path: string | null;
   total_epochs_trained: number;
+  embedder: string;
+  vocoder: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -519,36 +522,18 @@ export default function OfflinePage() {
           <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
             Voice Profile
           </label>
-          {profiles.length === 0 ? (
-            <p className="text-[12px] font-mono text-zinc-600">No trained profiles found.</p>
-          ) : (
-            <div className="grid grid-cols-1 gap-2">
-              {profiles.map(p => {
-                const ready = !!p.model_path && p.total_epochs_trained > 0;
-                const active = p.id === profileId;
-                return (
-                  <button
-                    key={p.id}
-                    disabled={!ready}
-                    onClick={() => setProfileId(p.id)}
-                    className={`flex items-center gap-3 px-3 py-2.5 rounded-lg border text-left
-                                text-[12px] font-mono transition-colors
-                                disabled:opacity-35 disabled:cursor-not-allowed
-                                ${active
-                                  ? 'bg-cyan-900/30 border-cyan-700/50 text-cyan-300'
-                                  : 'bg-zinc-900 border-zinc-700 text-zinc-300 hover:border-zinc-600'
-                                }`}
-                  >
-                    <span className={`w-2 h-2 rounded-full shrink-0 ${ready ? 'bg-emerald-400' : 'bg-zinc-600'}`} />
-                    <span className="flex-1">{p.name}</span>
-                    <span className="text-[10px] text-zinc-500 shrink-0">
-                      {p.total_epochs_trained > 0 ? `${p.total_epochs_trained} ep` : 'untrained'}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
+          <ProfilePicker
+            profiles={profiles.map(p => ({
+              id: p.id,
+              name: p.name,
+              total_epochs_trained: p.total_epochs_trained,
+              embedder: p.embedder,
+              vocoder: p.vocoder,
+            }))}
+            selectedId={profileId}
+            onChange={setProfileId}
+            emptyMessage="No trained profiles found."
+          />
         </section>
 
         {/* Inference params */}

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { TipsPanel } from '../TipsPanel';
 import { SettingsGuide } from '../SettingsGuide';
+import { ProfilePicker } from '../ProfilePicker';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -19,6 +20,9 @@ interface Profile {
   id: string;
   name: string;
   status: string;
+  total_epochs_trained: number;
+  embedder?: string;
+  vocoder?: string;
 }
 
 interface SessionParams {
@@ -26,6 +30,7 @@ interface SessionParams {
   index_rate: number;
   protect: number;
   silence_threshold_db: number;
+  output_gain: number;
 }
 
 type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
@@ -35,7 +40,7 @@ type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
 // ---------------------------------------------------------------------------
 
 const API = 'http://localhost:8000';
-const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.75, protect: 0.33, silence_threshold_db: -45 };
+const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.75, protect: 0.33, silence_threshold_db: -45, output_gain: 1.0 };
 
 // ---------------------------------------------------------------------------
 // Utility: find default device by name fragment
@@ -758,28 +763,13 @@ export default function RealtimePage() {
               <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
                 <span className="text-cyan-400">◈</span> Voice Profile
               </label>
-              {profiles.length === 0 ? (
-                <div className="bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
-                                font-mono text-zinc-500">
-                  No trained profiles — train one in the Training tab first
-                </div>
-              ) : (
-                <select
-                  value={profileId ?? ''}
-                  disabled={isActive || isBusy}
-                  onChange={(e) => setProfileId(e.target.value)}
-                  className="bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
-                             font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
-                             disabled:opacity-40 disabled:cursor-not-allowed
-                             hover:border-zinc-600 transition-colors"
-                >
-                  {profiles.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-                </select>
-              )}
+              <ProfilePicker
+                profiles={profiles}
+                selectedId={profileId}
+                onChange={setProfileId}
+                disabled={isActive || isBusy}
+                emptyMessage="No trained profiles — train one in the Training tab first"
+              />
             </div>
           </div>
         </section>
@@ -882,7 +872,7 @@ export default function RealtimePage() {
                 onChange={(v) => handleParamChange('protect', v)}
               />
             </div>
-            <div className="grid grid-cols-1 gap-6">
+            <div className="grid grid-cols-2 gap-6">
               <ParamSlider
                 label={`Silence Gate (${params.silence_threshold_db} dBFS)`}
                 value={params.silence_threshold_db}
@@ -891,6 +881,15 @@ export default function RealtimePage() {
                 step={1}
                 disabled={false}
                 onChange={(v) => handleParamChange('silence_threshold_db', v)}
+              />
+              <ParamSlider
+                label={`Output Volume (${params.output_gain.toFixed(2)}×)`}
+                value={params.output_gain}
+                min={0.1}
+                max={3.0}
+                step={0.05}
+                disabled={false}
+                onChange={(v) => handleParamChange('output_gain', v)}
               />
             </div>
 

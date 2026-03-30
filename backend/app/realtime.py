@@ -98,6 +98,7 @@ class RealtimeSession:
     index_rate: float = 0.75
     protect: float = 0.33
     silence_threshold_db: float = -45.0
+    output_gain: float = 1.0
     status: str = "starting"    # starting | active | stopped | error
     error: Optional[str] = None
 
@@ -139,6 +140,7 @@ class RealtimeManager:
         index_rate: float = 0.75,
         protect: float = 0.33,
         silence_threshold_db: float = -45.0,
+        output_gain: float = 1.0,
         rvc_root: Optional[str] = None,
         save_path: Optional[str] = None,
     ) -> RealtimeSession:
@@ -213,6 +215,7 @@ class RealtimeManager:
                 index_rate=index_rate,
                 protect=protect,
                 silence_threshold_db=silence_threshold_db,
+                output_gain=output_gain,
                 save_path=save_path,
                 model_path=db_model_path,
                 index_path=db_index_path,
@@ -270,6 +273,7 @@ class RealtimeManager:
             index_rate=index_rate,
             protect=protect,
             silence_threshold_db=silence_threshold_db,
+            output_gain=output_gain,
             status="active",
             _proc=proc,
             _cmd_q=cmd_q,
@@ -396,6 +400,7 @@ class RealtimeManager:
         index_rate: Optional[float] = None,
         protect: Optional[float] = None,
         silence_threshold_db: Optional[float] = None,
+        output_gain: Optional[float] = None,
     ) -> None:
         """Hot-update session parameters without restarting."""
         session = self._sessions.get(session_id)
@@ -415,6 +420,9 @@ class RealtimeManager:
         if silence_threshold_db is not None:
             session.silence_threshold_db = silence_threshold_db
             msg["silence_threshold_db"] = silence_threshold_db
+        if output_gain is not None:
+            session.output_gain = output_gain
+            msg["output_gain"] = output_gain
 
         try:
             session._cmd_q.put(msg)

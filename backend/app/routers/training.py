@@ -282,20 +282,16 @@ async def cancel_training(request: CancelTrainingRequest) -> dict:
 async def get_status(profile_id: str) -> StatusResponse:
     """Return current training job status for a profile.
 
-    Args:
-        profile_id: The profile to query.
-
-    Returns:
-        StatusResponse with phase, progress_pct, status, error.
-
-    Raises:
-        HTTPException(404): No active job for this profile.
+    Returns status='idle' (200) when no active job exists — callers use this
+    to distinguish "not running" from an actual error without noisy 404 logs.
     """
     job = manager.get_job(profile_id)
     if job is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No active training job for profile: {profile_id}",
+        return StatusResponse(
+            phase="idle",
+            progress_pct=0.0,
+            status="idle",
+            error=None,
         )
 
     return StatusResponse(

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { TipsPanel } from '../TipsPanel';
 import { LossGuide } from '../SettingsGuide';
+import { ProfilePicker } from '../ProfilePicker';
 
 const API = 'http://localhost:8000';
 const WS_BASE = 'ws://localhost:8000';
@@ -379,7 +380,7 @@ export default function TrainingPage() {
   const [selectedId, setSelectedId] = useState('');
   const [profilesError, setProfilesError] = useState<string | null>(null);
 
-  const [epochs, setEpochs] = useState(20);
+  const [epochs, setEpochs] = useState(50);
   const [batchSize, setBatchSize] = useState(8);
   const [overtrainThreshold, setOvertrainThreshold] = useState(0);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
@@ -683,37 +684,29 @@ export default function TrainingPage() {
           <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 flex flex-col gap-5">
 
             {/* Profile + Epochs row */}
-            <div className="grid grid-cols-2 gap-4">
-              <div className="flex flex-col gap-2">
+            {/* Profile + Epochs — profile list takes most of the width */}
+            <div className="flex gap-4 items-start">
+              {/* Profile list — flex-1 so it takes remaining space */}
+              <div className="flex flex-col gap-2 flex-1 min-w-0">
                 <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
                   <span className="text-cyan-400">◈</span> Voice Profile
                 </label>
                 {profiles.length === 0 ? (
-                  <div className="bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px] font-mono text-zinc-500">
+                  <div className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-[12px] font-mono text-zinc-500">
                     {profilesError ? 'Backend unreachable' : 'No profiles — upload one in Library'}
                   </div>
                 ) : (
-                  <select
-                    value={selectedId}
+                  <ProfilePicker
+                    profiles={profiles}
+                    selectedId={selectedId}
+                    onChange={setSelectedId}
                     disabled={isRunning}
-                    onChange={(e) => setSelectedId(e.target.value)}
-                    className="bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
-                               font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
-                               disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
-                  >
-                    {profiles.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                        {p.total_epochs_trained > 0 ? ` (${p.total_epochs_trained} ep)` : ''}
-                        {p.needs_retraining ? ' ⚠' : ''}
-                        {p.status === 'trained' ? ' ✓' : p.status === 'training' ? ' ⟳' : p.status === 'failed' ? ' ✗' : ''}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 )}
               </div>
 
-              <div className="flex flex-col gap-2">
+              {/* Epochs — narrow fixed width */}
+              <div className="flex flex-col gap-2 w-48 shrink-0">
                 <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
                   <span className="text-cyan-400">⟳</span> Epochs
                 </label>
@@ -721,24 +714,24 @@ export default function TrainingPage() {
                   type="number" value={epochs} min={1} max={200}
                   disabled={isRunning}
                   onChange={(e) => setEpochs(Math.max(1, Math.min(200, Number(e.target.value))))}
-                  className="bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
+                  className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
                              font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
                              disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
                 />
-                {/* Resume indicator / re-training warning */}
+                {/* Resume / retrain hint */}
                 {(() => {
                   const sel = profiles.find(p => p.id === selectedId);
                   if (!sel) return null;
                   return (
                     <div className="flex flex-col gap-1">
                       {sel.total_epochs_trained > 0 && (
-                        <span className="text-[10px] font-mono text-amber-500/80">
-                          ↳ resume from epoch {sel.total_epochs_trained} → {sel.total_epochs_trained + epochs} total
+                        <span className="text-[10px] font-mono text-amber-500/80 leading-tight">
+                          ↳ resume {sel.total_epochs_trained} → {sel.total_epochs_trained + epochs}
                         </span>
                       )}
                       {sel.needs_retraining && (
-                        <span className="text-[10px] font-mono text-amber-400">
-                          ⚠ audio files changed — re-training recommended
+                        <span className="text-[10px] font-mono text-amber-400 leading-tight">
+                          ⚠ retrain recommended
                         </span>
                       )}
                     </div>
@@ -755,61 +748,6 @@ export default function TrainingPage() {
                 disabled={isRunning}
                 hw={hw}
               />
-            </div>
-
-            {/* Embedder + Vocoder row — read-only, locked after first run */}
-            <div className="border-t border-zinc-800/60 pt-4 grid grid-cols-2 gap-4">
-              {/* Embedder */}
-              <div className="flex flex-col gap-2">
-                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
-                  <span className="text-indigo-400">◈</span> Feature Embedder
-                </label>
-                {(() => {
-                  const sel = profiles.find(p => p.id === selectedId);
-                  const emb = sel?.embedder || 'spin-v2';
-                  const locked = sel && sel.total_epochs_trained > 0;
-                  return (
-                    <div className={`flex items-center gap-2 rounded-md px-3 py-2 border text-[12px] font-mono
-                                    ${locked
-                                      ? 'bg-indigo-950/30 border-indigo-800/40 text-indigo-300'
-                                      : 'bg-zinc-900 border-zinc-700 text-zinc-300'}`}>
-                      {emb}
-                      {locked && (
-                        <span className="text-[10px] text-indigo-500 ml-auto" title="Locked after first training run">🔒 locked</span>
-                      )}
-                    </div>
-                  );
-                })()}
-                <span className="text-[10px] font-mono text-zinc-600">
-                  Set when creating the profile · cannot change after training
-                </span>
-              </div>
-
-              {/* Vocoder */}
-              <div className="flex flex-col gap-2">
-                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
-                  <span className="text-violet-400">◈</span> Vocoder
-                </label>
-                {(() => {
-                  const sel = profiles.find(p => p.id === selectedId);
-                  const voc = sel?.vocoder || 'HiFi-GAN';
-                  const locked = sel && sel.total_epochs_trained > 0;
-                  return (
-                    <div className={`flex items-center gap-2 rounded-md px-3 py-2 border text-[12px] font-mono
-                                    ${locked
-                                      ? 'bg-violet-950/30 border-violet-800/40 text-violet-300'
-                                      : 'bg-zinc-900 border-zinc-700 text-zinc-300'}`}>
-                      {voc}
-                      {locked && (
-                        <span className="text-[10px] text-violet-500 ml-auto" title="Locked after first training run">🔒 locked</span>
-                      )}
-                    </div>
-                  );
-                })()}
-                <span className="text-[10px] font-mono text-zinc-600">
-                  Set when creating the profile · cannot change after training
-                </span>
-              </div>
             </div>
 
             {/* Overtraining threshold */}
