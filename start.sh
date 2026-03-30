@@ -77,6 +77,10 @@ for i in $(seq 1 30); do
 done
 
 echo "[start] Starting frontend..."
+if [ ! -d "frontend/node_modules" ]; then
+  echo "[start] Installing frontend dependencies..."
+  (cd frontend && pnpm install)
+fi
 (cd frontend && pnpm dev) &
 FRONTEND_PID=$!
 echo "$FRONTEND_PID" > .pids/frontend.pid
