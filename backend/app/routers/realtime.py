@@ -41,9 +41,9 @@ class StartSessionRequest(BaseModel):
     input_device_id: int
     output_device_id: int
     pitch: float = 0.0
-    index_rate: float = 0.75
+    index_rate: float = 0.50
     protect: float = 0.33
-    silence_threshold_db: float = -45.0
+    silence_threshold_db: float = -55.0
     output_gain: float = 1.0
     save_path: Optional[str] = None
 

@@ -351,7 +351,7 @@ export default function OfflinePage() {
 
   // Inference params
   const [pitch, setPitch]           = useState(0);
-  const [indexRate, setIndexRate]   = useState(0.75);
+  const [indexRate, setIndexRate]   = useState(0.50);
   const [protect, setProtect]       = useState(0.33);
 
   // Job state
@@ -466,10 +466,18 @@ export default function OfflinePage() {
                 const blob = await dlRes.blob();
                 const blobUrl = URL.createObjectURL(blob);
                 setOutputUrl(blobUrl);
-                // Extract suggested filename from header
+                // Derive output filename from input file, preserving extension
                 const cd = dlRes.headers.get('content-disposition') ?? '';
                 const m = cd.match(/filename="?([^"]+)"?/);
-                setOutputFilename(m?.[1] ?? 'output.wav');
+                if (m?.[1]) {
+                  setOutputFilename(m[1]);
+                } else if (inputFile) {
+                  const stem = inputFile.name.replace(/\.[^.]+$/, '');
+                  const ext  = inputFile.name.match(/\.[^.]+$/)?.[0] ?? '.wav';
+                  setOutputFilename(`${stem}_rvc${ext}`);
+                } else {
+                  setOutputFilename('output_rvc.wav');
+                }
               }
             } else if (msg.type === 'error') {
               setJobStatus('error');
@@ -679,7 +687,7 @@ export default function OfflinePage() {
           {
             icon: '🎛️',
             title: 'Start with defaults',
-            body: 'pitch=0, index_rate=0.75, protect=0.33 match the realtime defaults. If the voice character sounds off, raise index_rate toward 1.0. If consonants sound mangled, lower protect toward 0.',
+            body: 'pitch=0, index_rate=0.50, protect=0.33 match the realtime defaults. If the voice character sounds off, raise index_rate toward 1.0. If consonants sound mangled, lower protect toward 0.',
           },
           {
             icon: '⏱️',

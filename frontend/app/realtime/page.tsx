@@ -40,7 +40,7 @@ type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
 // ---------------------------------------------------------------------------
 
 const API = 'http://localhost:8000';
-const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.75, protect: 0.33, silence_threshold_db: -45, output_gain: 1.0 };
+const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.50, protect: 0.33, silence_threshold_db: -55, output_gain: 1.0 };
 
 // ---------------------------------------------------------------------------
 // Utility: find default device by name fragment
@@ -168,7 +168,7 @@ export default function RealtimePage() {
     fetch(`${API}/api/realtime/default-save-dir`)
       .then((r) => r.json())
       .then((d) => setSavePath(d.path + '/rvc_output.mp3'))
-      .catch(() => setSavePath('~/Downloads/rvc_output.mp3'));
+      .catch(() => setSavePath('~/Documents/audio/rvc_output.mp3'));
   }, []);
 
   // The backend default-save-dir endpoint returns a full absolute path, so savePath
@@ -816,7 +816,7 @@ export default function RealtimePage() {
                     value={expandedSavePath}
                     disabled={isBusy || isActive}
                     onChange={(e) => setSavePath(e.target.value)}
-                    placeholder="/Users/tango16/Downloads/rvc_output.mp3"
+                    placeholder="/Users/tango16/Documents/audio/rvc_output.mp3"
                     className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-1.5
                                text-[12px] font-mono text-zinc-200 focus:outline-none
                                focus:border-cyan-600 disabled:opacity-40 disabled:cursor-not-allowed
@@ -943,7 +943,7 @@ export default function RealtimePage() {
           {
             icon: '🎛️',
             title: 'Start with these defaults',
-            body: 'pitch=0, index_rate=0.75, protect=0.33. Adjust one parameter at a time so you can hear the effect clearly.',
+            body: 'pitch=0, index_rate=0.50, protect=0.33. Adjust one parameter at a time so you can hear the effect clearly.',
           },
           {
             icon: '🎵',
@@ -1007,12 +1007,12 @@ export default function RealtimePage() {
           {
             name: 'Silence Gate',
             range: '−70 → −10 dBFS',
-            default: '−45 dBFS',
+            default: '−55 dBFS',
             badge: 'amber',
             summary: 'Audio below this loudness threshold is passed through unprocessed instead of being converted. Prevents the model from "hallucinating" voice during pauses and keeps GPU kernels warm without wasted inference.',
-            details: 'Speech typically sits between −30 and −10 dBFS on peaks. Room noise and breath is usually below −50 dBFS. The gate compares the RMS level of each 200 ms block against this threshold. Blocks below threshold are zeroed before conversion and the silence is passed through directly. This also prevents subtle artefacts that occur when the model is fed near-silence and tries to generate phonemes.',
-            raise: 'Background noise is being converted and you hear a constant low-level voice-like texture in quiet sections. Raise toward −35 to cut it out.',
-            lower: 'Soft-spoken parts or quiet phrases are being silenced and not converted at all. Lower toward −55 to let quieter audio through the gate.',
+            details: 'Speech typically sits between −30 and −10 dBFS on peaks. Room noise and breath is usually below −60 dBFS. The gate compares the RMS level of each 200 ms block against this threshold. Blocks below threshold are zeroed before conversion and the silence is passed through directly. This also prevents subtle artefacts that occur when the model is fed near-silence and tries to generate phonemes.',
+            raise: 'Background noise is being converted and you hear a constant low-level voice-like texture in quiet sections. Raise toward −40 to cut it out.',
+            lower: 'Soft-spoken parts or quiet phrases are being silenced and not converted at all. Lower toward −65 to let even quieter audio through the gate.',
           },
         ]} />
       </div>

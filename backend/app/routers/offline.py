@@ -182,7 +182,7 @@ def _run_offline_inference(
     index_rate: float,
     protect: float,
     progress_cb,               # callable(fraction: float)
-    output_gain: float = 1.0,  # post-inference volume multiplier (1.0 = RMS-matched)
+    output_gain: float = 1.0,  # post-inference volume multiplier (1.0 = no change)
 ) -> np.ndarray:
     """Run chunked RVC inference on a full audio array.
 
@@ -264,8 +264,8 @@ def _run_offline_inference(
 
     rolling_buf = torch.zeros(total_16k_samples, device=device)
 
-    # SOLA state
-    fade_in_win  = torch.linspace(0.0, 1.0, sola_buf_tgt, device=device)
+    # SOLA state — sin² fade windows, same as realtime worker
+    fade_in_win  = torch.sin(0.5 * np.pi * torch.linspace(0.0, 1.0, sola_buf_tgt, device=device)) ** 2
     fade_out_win = 1.0 - fade_in_win
     sola_buf     = torch.zeros(sola_buf_tgt, device=device)
     output_parts: list[np.ndarray] = []
@@ -285,9 +285,7 @@ def _run_offline_inference(
         rolling_buf[-block_16k:] = chunk_t
 
         infer_out = rvc.infer(rolling_buf, block_16k, skip_head, return_length, "rmvpe", protect)
-        # infer_out is at tgt_sr already (rtrvc handles resampling internally)
-        # But rtrvc returns tgt_sr samples: return_length * window * (tgt_sr/16k)
-        infer_tgt = infer_out  # shape: (return_length * window * tgt_sr/16k,)
+        infer_tgt = infer_out
 
         # SOLA: find best alignment in search window
         if infer_tgt.shape[0] >= sola_buf_tgt + sola_search_tgt:
@@ -326,10 +324,15 @@ def _run_offline_inference(
                 sola_buf * fade_out_win + out_block[:sola_buf_tgt] * fade_in_win
             )
             sola_buf = out_block[block_tgt: block_tgt + sola_buf_tgt].clone()
-            output_parts.append(out_block[:block_tgt].cpu().numpy())
+            block_out = out_block[:block_tgt]
+            output_parts.append(block_out.cpu().numpy())
         else:
-            # infer_out too short (end of file) — just use as-is
-            output_parts.append(infer_tgt.cpu().numpy())
+            # infer_out too short (end of file) — use as-is, update sola_buf from tail
+            tail = infer_tgt
+            if tail.shape[0] > sola_buf_tgt:
+                sola_buf[:] = tail[-sola_buf_tgt:]
+            block_out = tail
+            output_parts.append(block_out.cpu().numpy())
 
         progress_cb((block_idx + 1) / n_blocks)
 
@@ -343,22 +346,19 @@ def _run_offline_inference(
     expected_len = int(np.ceil(total_16k * tgt_sr / _SR_16K))
     result = result[:expected_len]
 
-    # ── RMS matching: scale output to match input loudness ───────────────
-    # Measure RMS of non-silent portions of input and output, then scale
-    # output so its RMS matches the input. This corrects the systematic
-    # level difference between the model's training distribution and the
-    # input file. output_gain is applied on top (default 1.0 = no extra gain).
+    # RMS matching — corrects the model's inherent output level difference so
+    # the output matches input loudness.  This is not a gain addition; the model
+    # naturally outputs at a different RMS than the input (measured ~3.8× higher).
+    # Without this the output is significantly louder than the source file.
     if len(result) > 0 and len(audio_16k) > 0:
         in_rms  = float(np.sqrt(np.mean(audio_16k ** 2)) + 1e-8)
         out_rms = float(np.sqrt(np.mean(result ** 2)) + 1e-8)
         rms_scale = in_rms / out_rms
-        # Cap at 10× to avoid runaway gain on near-silent outputs
         rms_scale = float(np.clip(rms_scale, 0.1, 10.0))
-        result = result * rms_scale * output_gain
-        logger.info(
-            "RMS match: in=%.5f  out_raw=%.5f  scale=%.3f×  gain=%.3f×",
-            in_rms, out_rms, rms_scale, output_gain,
-        )
+        result = result * rms_scale
+
+    if output_gain != 1.0 and len(result) > 0:
+        result = result * output_gain
 
     return result, tgt_sr
 
@@ -371,7 +371,7 @@ def _run_offline_inference(
 async def convert_audio(
     profile_id: str = Form(...),
     pitch: float = Form(0.0),
-    index_rate: float = Form(0.75),
+    index_rate: float = Form(0.50),
     protect: float = Form(0.33),
     file: UploadFile = File(...),
 ):

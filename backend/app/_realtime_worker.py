@@ -65,62 +65,59 @@ import torch
 _SR_16K = 16000
 _SR_48K = 48000
 _WINDOW = 160              # HuBERT/RMVPE hop size in samples at 16kHz
-_BLOCK_48K = 5760          # 120ms output block at 48kHz
+_BLOCK_48K = 9600          # 200ms output block at 48kHz (matches offline; better gate hold coverage)
 _EXTRA_TIME = 2.0          # seconds of historical context fed to the model
 _ZC = _SR_48K // 100       # zero-crossing unit = 10ms at 48kHz = 480 samples
-_SOLA_BUF_48K = 2 * _ZC   # 20ms SOLA crossfade buffer (4 cycles @ 200Hz — sufficient for xcorr)
+_SOLA_BUF_48K = 2 * _ZC   # 20ms SOLA crossfade buffer
 _SOLA_SEARCH_48K = _ZC     # 10ms search window for best alignment offset
 
 
-def _compute_block_params(block_48k: int = _BLOCK_48K, extra_time: float = _EXTRA_TIME) -> dict:
+def _compute_block_params(block_48k: int = _BLOCK_48K, extra_time: float = _EXTRA_TIME,
+                          tgt_sr: int = _SR_48K) -> dict:
     """Compute all buffer sizes needed by the audio loop.
 
-    The RVC model (HuBERT + RMVPE + net_g) needs substantial historical context
-    to produce good pitch and feature estimates. In practice 2s of lookahead
-    produces clearly intelligible output (Vonovox: recommended 2.0s).
-
-    total_16k = extra_16k + f0_extractor_frame so that rtrvc.py sees the full
-    context window; skip_head discards the extra context from the output.
+    All SOLA sizes are computed in tgt_sr space (matching the offline pipeline).
+    rtrvc.infer() returns samples at tgt_sr, so return_length_frames must be
+    derived from tgt_sr-space block sizes — not 48kHz sizes.
     """
     block_16k = int(block_48k * _SR_16K / _SR_48K)
 
-    # Minimum valid buffer for rtrvc.py RMVPE frame constraint
     f0_min = block_16k + 800
     f0_extractor_frame = 5120 * ((f0_min - 1) // 5120 + 1) - _WINDOW
-
-    # Extra context rounded to WINDOW boundary so p_len stays integer
     extra_16k = (int(extra_time * _SR_16K) // _WINDOW) * _WINDOW
-
     total_16k_samples = extra_16k + f0_extractor_frame
     p_len = total_16k_samples // _WINDOW
 
-    # CRITICAL: request block + sola_buf + sola_search from rtrvc.infer() so that
-    # after the SOLA offset shift there are still sola_buf_48k samples available
-    # to save into sola_buf for the next block's crossfade.
-    #
-    # rtrvc.py return_length is in 16kHz FRAMES (each frame = window=160 samples).
-    # rtrvc output at 48kHz = return_length * window * (48000/16000) = return_length * 480.
-    # So: return_length = total_48k_output / 480.
-    #
-    # RVC-WebUI-MacOS uses: return_length = (block + sola_buf + sola_search) / zc
-    # where zc=480.  This gives exactly enough output to fill block+sola_buf+sola_search.
-    total_out_48k = block_48k + _SOLA_BUF_48K + _SOLA_SEARCH_48K   # 9600+1920+480 = 12000
-    return_length_frames = total_out_48k // _ZC                       # 12000/480 = 25
+    # Convert 48k block/SOLA sizes to tgt_sr space — this is what rtrvc.infer()
+    # actually produces. Using 48k here caused the SR mismatch bug.
+    block_tgt       = int(block_48k       * tgt_sr / _SR_48K)
+    sola_buf_tgt    = int(_SOLA_BUF_48K   * tgt_sr / _SR_48K)
+    sola_search_tgt = int(_SOLA_SEARCH_48K * tgt_sr / _SR_48K)
+
+    # return_length in 16kHz frames: how many tgt_sr samples do we need?
+    # rtrvc output = return_length * _WINDOW * (tgt_sr / _SR_16K)
+    # so: return_length = total_out_tgt / (_WINDOW * tgt_sr / _SR_16K)
+    total_out_tgt = block_tgt + sola_buf_tgt + sola_search_tgt
+    zc_tgt = tgt_sr // 100   # e.g. 320 at 32kHz
+    return_length_frames = total_out_tgt // zc_tgt
 
     skip_head_frames = p_len - return_length_frames
-
     block_44k = int(block_48k * 44100 / _SR_48K)
 
     return {
         "block_48k":            block_48k,
         "block_44k":            block_44k,
         "block_16k":            block_16k,
+        "block_tgt":            block_tgt,
+        "sola_buf_tgt":         sola_buf_tgt,
+        "sola_search_tgt":      sola_search_tgt,
         "f0_extractor_frame":   f0_extractor_frame,
         "total_16k_samples":    total_16k_samples,
         "extra_16k":            extra_16k,
         "p_len":                p_len,
         "return_length_frames": return_length_frames,
         "skip_head_frames":     skip_head_frames,
+        # keep 48k versions for stream_out blocksize and waveform emit
         "sola_buf_48k":         _SOLA_BUF_48K,
         "sola_search_48k":      _SOLA_SEARCH_48K,
     }
@@ -224,7 +221,7 @@ def run_worker(
     pitch: float,
     index_rate: float,
     protect: float,
-    silence_threshold_db: float = -45.0,
+    silence_threshold_db: float = -55.0,
     output_gain: float = 1.0,
     save_path: str | None = None,
     model_path: str | None = None,
@@ -328,7 +325,10 @@ def run_worker(
             is_half=False,
         )
 
-        block_params = _compute_block_params(_BLOCK_48K)
+        # tgt_sr is model-specific (32kHz for our 32k models).
+        # ALL SOLA buffer sizes must be in tgt_sr space to match rtrvc.infer() output.
+        tgt_sr = rvc.tgt_sr
+        block_params = _compute_block_params(_BLOCK_48K, tgt_sr=tgt_sr)
 
         # ------------------------------------------------------------------
         # Patch rvc._get_f0: pad pitch/pitchf at head to match p_len.
@@ -373,11 +373,15 @@ def run_worker(
         from torchaudio.transforms import Resample as _Resample
         import torch.nn.functional as _F
 
-        # On-device resamplers: 44100 → 16k and 44100 → 48k
-        _resample_44_16 = _Resample(orig_freq=44100, new_freq=16000,
-                                    dtype=_torch.float32).to(infer_device)
-        _resample_44_48 = _Resample(orig_freq=44100, new_freq=_SR_48K,
-                                    dtype=_torch.float32).to(infer_device)
+        # 44100 → 16k  (input capture → inference)
+        # 44100 → 48k  (input capture → waveform visualiser / save)
+        # tgt_sr → 48k (inference output → output device)
+        _resample_44_16  = _Resample(orig_freq=44100, new_freq=16000,
+                                     dtype=_torch.float32).to(infer_device)
+        _resample_44_48  = _Resample(orig_freq=44100, new_freq=_SR_48K,
+                                     dtype=_torch.float32).to(infer_device)
+        _resample_tgt_48 = _Resample(orig_freq=tgt_sr, new_freq=_SR_48K,
+                                     dtype=_torch.float32).to(infer_device)
 
         stream_in = sd.InputStream(
             device=input_device_id,
@@ -404,68 +408,43 @@ def run_worker(
         # ------------------------------------------------------------------
         # Audio loop locals
         # ------------------------------------------------------------------
-        block_44k          = block_params["block_44k"]
-        block_48k          = block_params["block_48k"]
-        block_16k          = block_params["block_16k"]
-        total_16k_samples  = block_params["total_16k_samples"]
-        skip_head_frames   = block_params["skip_head_frames"]
+        block_44k            = block_params["block_44k"]
+        block_48k            = block_params["block_48k"]
+        block_16k            = block_params["block_16k"]
+        block_tgt            = block_params["block_tgt"]
+        total_16k_samples    = block_params["total_16k_samples"]
+        skip_head_frames     = block_params["skip_head_frames"]
         return_length_frames = block_params["return_length_frames"]
-        sola_buf_48k       = block_params["sola_buf_48k"]
-        sola_search_48k    = block_params["sola_search_48k"]
+        sola_buf_tgt         = block_params["sola_buf_tgt"]
+        sola_search_tgt      = block_params["sola_search_tgt"]
         decim = max(1, block_48k // 800)
-        block_ms = block_48k * 1000 // _SR_48K   # 120ms for 5760-sample block at 48kHz
+        block_ms = block_48k * 1000 // _SR_48K
 
         # Silence gate: RMS threshold from dB
         _silence_rms = 10 ** (silence_threshold_db / 20.0)
 
+        # Rolling-max window for gate trigger — 3 blocks @ 200ms = 600ms lookback.
+        # The gate opens if ANY of the last _RMS_WIN blocks exceeded the threshold.
+        # This prevents the gate from closing on a block whose RMS dipped because
+        # speech ended mid-block (word tail), while still closing cleanly after
+        # 600ms of sustained silence.  Hold/release runs unchanged from the trigger.
+        _RMS_WIN = 3
+        from collections import deque as _deque
+        _rms_window: _deque[float] = _deque([0.0] * _RMS_WIN, maxlen=_RMS_WIN)
+
         # Hold/release gate — prevents abrupt cut-off mid-word.
-        # At 200ms blocks: HOLD=3→600ms, RELEASE=5→1s fade.
-        # _gate_gain is smoothed per-sample with an exponential envelope
-        # applied across the output block to avoid hard amplitude jumps.
         _HOLD_BLOCKS    = 3
         _RELEASE_BLOCKS = 5
         _hold_count     = 0
         _release_count  = 0
         _gate_gain      = 0.0   # block-level target gain
-        _gate_gain_cur  = 0.0   # sample-level smoothed gain (avoids step discontinuity)
+        _gate_gain_cur  = 0.0   # sample-level smoothed gain
 
-        # RMS envelope: EWMA of input RMS over recent blocks.
-        # The per-block scaler uses the smoothed value instead of the instantaneous
-        # one to prevent single quiet-frame spikes from triggering 50× amplification.
-        _rms_alpha   = 0.15          # EWMA weight (higher = faster tracking)
-        _rms_smooth  = None          # initialized on first speech frame
-
-        # Input pre-gain: scales the microphone signal to match the RMS level of
-        # the training data before it reaches the model.  This is the single most
-        # important inference-time fix for cross-speaker RMS mismatch.
-        #
-        # How it works:
-        #   profile_rms is the speech-weighted RMS of the first uploaded training
-        #   file, measured during upload and stored in the profiles table.
-        #   At inference time we want the model to see input at the same level it
-        #   was trained on.  _pre_gain = profile_rms / live_rms is computed as a
-        #   running estimate using the EWMA of the live microphone RMS.
-        #
-        #   To avoid instability on the very first block (EWMA not yet warmed up),
-        #   we set an initial static pre-gain from the ratio of profile_rms to a
-        #   reasonable default mic level (0.03 ≈ typical speech at -30 dBFS).
-        #   The EWMA then adapts it block by block.
-        #
-        #   Gain is clamped to [_PRE_GAIN_MIN, _PRE_GAIN_MAX] to prevent extreme
-        #   amplification of silence or breath noise.
-        _PRE_GAIN_MIN = 0.1
-        _PRE_GAIN_MAX = 10.0
-        _MIC_RMS_DEFAULT = 0.03   # assumed initial mic RMS before EWMA warms up
-        if profile_rms is not None and profile_rms > 0:
-            _pre_gain = float(np.clip(profile_rms / _MIC_RMS_DEFAULT,
-                                      _PRE_GAIN_MIN, _PRE_GAIN_MAX))
-            logging.getLogger("rvc_web.worker").info(
-                "input pre-gain enabled: profile_rms=%.5f  initial_gain=%.3f×",
-                profile_rms, _pre_gain,
-            )
-        else:
-            _pre_gain = 1.0   # no normalization — legacy profile or RMS not measured
-        _mic_rms_ewma: float = _MIC_RMS_DEFAULT  # adaptive mic-level EWMA
+        # Per-block output RMS matching — corrects the model's inherent level
+        # difference without touching the input signal.  Uses an EWMA of input
+        # RMS so a single near-silent frame can't cause a spike.
+        _rms_alpha  = 0.15
+        _rms_smooth = None   # seeded on first voiced frame
 
         # Rolling 16k context buffer — circular shift, no torch.roll (avoids copy)
         rolling_buf = _torch.zeros(total_16k_samples, dtype=_torch.float32,
@@ -487,13 +466,13 @@ def run_worker(
         #  3. During silence we output zeros but DO NOT reset sola_buf — resetting
         #     it would cause a pop/click when speech resumes.
         # ------------------------------------------------------------------
-        sola_buf  = _torch.zeros(sola_buf_48k, dtype=_torch.float32, device=infer_device)
+        sola_buf  = _torch.zeros(sola_buf_tgt, dtype=_torch.float32, device=infer_device)
         fade_in   = _torch.sin(0.5 * np.pi * _torch.linspace(
-                        0., 1., sola_buf_48k, device=infer_device)) ** 2
+                        0., 1., sola_buf_tgt, device=infer_device)) ** 2
         fade_out  = 1.0 - fade_in
 
-        # Extra samples needed from inference output to cover SOLA window + crossfade
-        _min_infer_len = block_48k + sola_buf_48k + sola_search_48k
+        # Minimum inference output needed to run SOLA
+        _min_infer_len = block_tgt + sola_buf_tgt + sola_search_tgt
         _block_i = 0
         _infer_times: list[float] = []   # rolling window for timing log
 
@@ -513,6 +492,8 @@ def run_worker(
                             protect = msg["protect"]
                         if "silence_threshold_db" in msg:
                             _silence_rms = 10 ** (msg["silence_threshold_db"] / 20.0)
+                            _rms_window.clear()
+                            _rms_window.extend([0.0] * _RMS_WIN)
                         if "output_gain" in msg:
                             output_gain = float(msg["output_gain"])
             except Exception:
@@ -531,21 +512,6 @@ def run_worker(
             x_44k_t = _torch.from_numpy(x_44k).to(infer_device)
             x_16k_t = _resample_44_16(x_44k_t.unsqueeze(0)).squeeze(0)
 
-            # ── input RMS pre-gain ────────────────────────────────────────
-            # Normalise microphone input to the training-data RMS level so the
-            # model always sees the distribution it was trained on.
-            # The gain adapts block-by-block: on every voiced frame we update a
-            # slow EWMA of the live mic RMS and recompute _pre_gain from it.
-            # Clamped to [_PRE_GAIN_MIN, _PRE_GAIN_MAX] for stability.
-            _raw_rms = float(_torch.sqrt(_torch.mean(x_16k_t ** 2)).item())
-            if profile_rms is not None and profile_rms > 0 and _raw_rms > _silence_rms:
-                # Update mic-level EWMA only on voiced frames (avoids drift from breath/noise)
-                _mic_rms_ewma = _rms_alpha * _raw_rms + (1 - _rms_alpha) * _mic_rms_ewma
-                _pre_gain = float(np.clip(profile_rms / _mic_rms_ewma,
-                                          _PRE_GAIN_MIN, _PRE_GAIN_MAX))
-            if _pre_gain != 1.0:
-                x_16k_t = x_16k_t * _pre_gain
-
             # ── update rolling 16k buffer (circular shift) ────────────────
             # Equivalent to torch.roll but avoids the internal copy overhead.
             rolling_buf[:-block_16k] = rolling_buf[block_16k:].clone()
@@ -553,11 +519,12 @@ def run_worker(
 
             # ── hold/release silence gate ─────────────────────────────────
             input_rms = float(_torch.sqrt(_torch.mean(x_16k_t ** 2)).item())
-            if input_rms >= _silence_rms:
+            _rms_window.append(input_rms)
+            _rolling_max_rms = max(_rms_window)
+            if _rolling_max_rms >= _silence_rms:
                 _gate_gain      = 1.0
                 _hold_count     = _HOLD_BLOCKS
                 _release_count  = _RELEASE_BLOCKS
-                # Seed the EWMA on the first voiced frame
                 if _rms_smooth is None:
                     _rms_smooth = input_rms
                 else:
@@ -609,67 +576,62 @@ def run_worker(
                          else _torch.from_numpy(infer_raw))
             infer_wav = infer_wav.to(infer_device)
 
-            # ── SOLA crossfade (run on every block, gate applied after) ───
-            #
-            # We always run SOLA to keep sola_buf up-to-date. If the gate is
-            # closed we still update sola_buf from the inference output so
-            # the crossfade on the next voiced block is correctly aligned.
-            # Only the final audio_device write (and file save) are zeroed.
-            # This prevents the "pop at word onset" artifact caused by
-            # sola_buf containing zeros when the gate reopens.
+            # ── SOLA crossfade in tgt_sr space ────────────────────────────
+            # infer_wav is at tgt_sr (e.g. 32kHz). All sizes are tgt_sr-space.
+            # We always run SOLA to keep sola_buf up-to-date even during silence.
 
             if infer_wav.shape[0] < _min_infer_len:
                 pad = _min_infer_len - infer_wav.shape[0]
                 infer_wav = _F.pad(infer_wav, (0, pad))
 
-            search_len = sola_buf_48k + sola_search_48k
+            search_len = sola_buf_tgt + sola_search_tgt
             conv_input = infer_wav[None, None, :search_len]
             cor_nom = _F.conv1d(conv_input, sola_buf[None, None, :])
             cor_den = _torch.sqrt(
                 _F.conv1d(conv_input ** 2,
-                           _torch.ones(1, 1, sola_buf_48k, device=infer_device))
+                           _torch.ones(1, 1, sola_buf_tgt, device=infer_device))
                 + 1e-8
             )
             sola_offset = int(_torch.argmax(cor_nom[0, 0] / cor_den[0, 0]).item())
             infer_wav = infer_wav[sola_offset:]
-            infer_wav[:sola_buf_48k] = (infer_wav[:sola_buf_48k] * fade_in
-                                         + sola_buf * fade_out)
-            # Update sola_buf for next block
-            tail_end = block_48k + sola_buf_48k
+            infer_wav[:sola_buf_tgt] = (infer_wav[:sola_buf_tgt] * fade_in
+                                        + sola_buf * fade_out)
+            # Update sola_buf from tail of this block
+            tail_end = block_tgt + sola_buf_tgt
             if infer_wav.shape[0] >= tail_end:
-                sola_buf[:] = infer_wav[block_48k:tail_end]
+                sola_buf[:] = infer_wav[block_tgt:tail_end]
             else:
-                available = infer_wav.shape[0] - block_48k
+                available = infer_wav.shape[0] - block_tgt
                 if available > 0:
-                    sola_buf[:available] = infer_wav[block_48k:]
+                    sola_buf[:available] = infer_wav[block_tgt:]
                 sola_buf[max(0, available):] = 0.0
 
             if _gate_gain == 0.0:
                 # Gate closed — output silence; sola_buf already updated above
                 out_48k = np.zeros(block_48k, dtype=np.float32)
             else:
-                # ── RMS envelope matching ─────────────────────────────────
-                # Use smoothed input RMS (EWMA) as the target amplitude to
-                # prevent single near-silence frames from causing 50× spikes.
-                # If rms_smooth hasn't been seeded yet (no voiced frame seen),
-                # fall back to raw input_rms.
-                ref_rms = _rms_smooth if _rms_smooth is not None else input_rms
-                out_rms = float(_torch.sqrt(_torch.mean(infer_wav[:block_48k] ** 2)).item()) + 1e-8
-                rms_scale = (ref_rms / out_rms)
-                # Cap at 1.5× — tighter than before since smoothed RMS is stable.
-                rms_scale = min(rms_scale, 1.5)
-                infer_wav = infer_wav * rms_scale * output_gain
+                # Output RMS matching — correct model's inherent level difference
+                if _rms_smooth is not None:
+                    out_rms = float(_torch.sqrt(_torch.mean(infer_wav[:block_tgt] ** 2)).item()) + 1e-8
+                    rms_scale = min(_rms_smooth / out_rms, 1.5)
+                    infer_wav = infer_wav * rms_scale
 
-                # ── Per-sample gate envelope ──────────────────────────────
-                # Interpolate gate gain linearly from _gate_gain_cur (end of
-                # last block) to _gate_gain (target for this block).
-                # This converts the block-level step into a sample-level ramp,
-                # eliminating the amplitude discontinuity at block boundaries
-                # when the gate opens or closes.
+                if output_gain != 1.0:
+                    infer_wav = infer_wav * output_gain
+
+                # Per-sample gate ramp (block_tgt space)
                 gain_ramp = _torch.linspace(_gate_gain_cur, _gate_gain,
-                                             block_48k, device=infer_device)
-                out_block = _torch.clamp(infer_wav[:block_48k] * gain_ramp, -1.0, 1.0)
-                out_48k = out_block.cpu().numpy().astype(np.float32)
+                                             block_tgt, device=infer_device)
+                out_tgt = _torch.clamp(infer_wav[:block_tgt] * gain_ramp, -1.0, 1.0)
+
+                # Resample tgt_sr → 48kHz for output device
+                out_48k = _resample_tgt_48(out_tgt.unsqueeze(0)).squeeze(0)
+                # Ensure exactly block_48k samples (resampler may give ±1)
+                if out_48k.shape[0] < block_48k:
+                    out_48k = _F.pad(out_48k, (0, block_48k - out_48k.shape[0]))
+                else:
+                    out_48k = out_48k[:block_48k]
+                out_48k = out_48k.cpu().numpy().astype(np.float32)
 
             _gate_gain_cur = _gate_gain   # carry current gain into next block
 
