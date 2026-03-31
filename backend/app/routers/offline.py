@@ -207,6 +207,8 @@ def _run_offline_inference(
 
     device = "mps" if torch.backends.mps.is_available() else \
              ("cuda" if torch.cuda.is_available() else "cpu")
+    # fp16 on CUDA only — MPS and CPU require fp32
+    is_half = device.startswith("cuda")
 
     rvc = RVC(
         key=pitch,
@@ -215,7 +217,7 @@ def _run_offline_inference(
         index_path=index_path,
         index_rate=index_rate,
         device=device,
-        is_half=False,
+        is_half=is_half,
     )
     tgt_sr = rvc.tgt_sr
 

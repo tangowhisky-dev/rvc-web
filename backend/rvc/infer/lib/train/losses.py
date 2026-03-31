@@ -1,4 +1,19 @@
 import torch
+import torch.nn.functional as F
+
+
+def speaker_loss(gen_emb, ref_emb):
+    """Cosine speaker identity loss.
+
+    Args:
+        gen_emb: Speaker embedding of generated audio [B, D].
+        ref_emb: Speaker embedding of target audio [B, D] (detached).
+
+    Returns:
+        Scalar loss: 1 - cosine_similarity. Range [0, 2].
+    """
+    sim = F.cosine_similarity(gen_emb, ref_emb).mean()
+    return 1.0 - sim
 
 
 def feature_loss(fmap_r, fmap_g):

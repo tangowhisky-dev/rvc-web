@@ -1,0 +1,86 @@
+# =============================================================================
+# rvc-web — Python requirements
+# Python 3.11 required (fairseq + numba + llvmlite constraint)
+# =============================================================================
+# Install order matters — run install.sh / install.bat instead of pip install
+# directly, so that torch is fetched from the correct index URL for your
+# platform before these packages are resolved.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Web framework + async I/O
+# ---------------------------------------------------------------------------
+fastapi
+uvicorn[standard]
+python-multipart          # FastAPI file upload support
+websockets
+httpx
+aiofiles
+aiosqlite
+python-dotenv
+pydantic
+
+# ---------------------------------------------------------------------------
+# Audio processing
+# ---------------------------------------------------------------------------
+librosa
+soundfile
+sounddevice
+pydub
+resampy
+audioread                 # transitive: required by librosa
+noisereduce
+av
+praat-parselmouth
+pyworld==0.3.2            # pinned — API changed in 0.3.3+
+
+# ---------------------------------------------------------------------------
+# Machine learning / inference
+# ---------------------------------------------------------------------------
+numpy
+scipy
+scikit-learn
+joblib                    # transitive: required by scikit-learn, librosa, noisereduce
+numba
+llvmlite
+faiss-cpu                 # replaced by faiss-gpu on CUDA installs — see install.sh
+torchcrepe
+torchfcpe
+pybase16384
+
+# onnxruntime: CPU build on macOS/CPU-only, GPU build on CUDA Linux/Windows
+onnxruntime; sys_platform == "darwin"
+onnxruntime; sys_platform == "linux" and platform_machine != "x86_64"
+onnxruntime-gpu; sys_platform == "linux" and platform_machine == "x86_64"
+onnxruntime-gpu; sys_platform == "win32"
+
+# ---------------------------------------------------------------------------
+# Training utilities
+# ---------------------------------------------------------------------------
+tensorboard               # used directly: torch.utils.tensorboard.SummaryWriter
+tensorboardX
+matplotlib
+Pillow                    # transitive: required by matplotlib, tensorboard
+tqdm                      # transitive: required by fairseq, torchcrepe, transformers
+psutil
+sympy                     # transitive: required by torch, onnxruntime
+PyYAML                    # transitive: required by omegaconf (fairseq), transformers
+Cython                    # build dep for fairseq + pyworld
+absl-py                   # transitive: required by tensorboard
+Jinja2                    # transitive: required by torch
+fsspec                    # transitive: required by torch, huggingface_hub
+colorama                  # transitive: required by sacrebleu (fairseq dep)
+Markdown                  # transitive: required by tensorboard
+pyasn1                    # transitive: required by pyasn1-modules chain
+
+# ---------------------------------------------------------------------------
+# Development / testing
+# ---------------------------------------------------------------------------
+pytest
+
+# ---------------------------------------------------------------------------
+# fairseq — use One-sixth fork for Python 3.10+ compatibility
+# (official pytorch/fairseq requires Python ≤3.9 and has broken setup.py on
+# modern pip; One-sixth fork patches those issues and tracks the same weights)
+# ---------------------------------------------------------------------------
+fairseq @ git+https://github.com/One-sixth/fairseq.git

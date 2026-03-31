@@ -72,6 +72,7 @@ from infer.lib.train.losses import (
     feature_loss,
     generator_loss,
     kl_loss,
+    speaker_loss as _spk_loss_fn,
 )
 from infer.lib.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from infer.lib.train.process_ckpt import save_small_model
@@ -80,6 +81,29 @@ from rvc.layers.utils import (
     slice_on_last_dim,
     total_grad_norm,
 )
+
+# ---------------------------------------------------------------------------
+# Speaker encoder (ECAPA-TDNN) — loaded once at module level if c_spk > 0
+# ---------------------------------------------------------------------------
+_speaker_encoder = None
+
+
+def _get_speaker_encoder(device: torch.device):
+    """Lazy-load the ECAPA-TDNN speaker encoder."""
+    global _speaker_encoder
+    if _speaker_encoder is None:
+        from infer.lib.train.speaker_encoder import SpeakerEncoder
+
+        project_root = os.environ.get(
+            "PROJECT_ROOT",
+            os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+            ),
+        )
+        pt_path = os.path.join(project_root, "assets", "ecapa", "ecapa_tdnn.pt")
+        _speaker_encoder = SpeakerEncoder(pt_path=pt_path, device=device)
+    return _speaker_encoder
+
 
 global_step = 0
 
@@ -147,7 +171,9 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         try:
             dist.init_process_group(
                 backend=(
-                    "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
+                    "gloo"
+                    if os.name == "nt" or not torch.cuda.is_available()
+                    else "nccl"
                 ),
                 init_method="env://",
                 world_size=n_gpus,
@@ -156,7 +182,9 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         except:
             dist.init_process_group(
                 backend=(
-                    "gloo" if os.name == "nt" or not torch.cuda.is_available() else "nccl"
+                    "gloo"
+                    if os.name == "nt" or not torch.cuda.is_available()
+                    else "nccl"
                 ),
                 init_method="env://?use_libuv=False",
                 world_size=n_gpus,
@@ -332,6 +360,36 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
     else:
         _fn_mel_loss = None  # use F.l1_loss directly
 
+    # Speaker encoder + profile embedding — loaded once if c_spk > 0
+    _spk_encoder = None
+    _profile_emb = None
+    _c_spk = getattr(hps.train, "c_spk", 0.0)
+    if _c_spk > 0 and rank == 0:
+        try:
+            _spk_encoder = _get_speaker_encoder(_device)
+            logger.info(f"Speaker encoder loaded (c_spk={_c_spk})")
+
+            # Load profile-level speaker embedding
+            profile_emb_path = os.path.join(hps.model_dir, "profile_embedding.pt")
+            if os.path.exists(profile_emb_path):
+                prof_data = torch.load(
+                    profile_emb_path, map_location=_device, weights_only=False
+                )
+                _profile_emb = prof_data["profile_embedding"]  # [192]
+                logger.info(
+                    f"Profile embedding loaded: norm={_profile_emb.norm().item():.4f}"
+                )
+            else:
+                logger.warning(
+                    f"Profile embedding not found at {profile_emb_path} — speaker loss disabled"
+                )
+                _c_spk = 0.0
+        except Exception as e:
+            logger.warning(
+                f"Failed to load speaker encoder/profile embedding: {e} — speaker loss disabled"
+            )
+            _c_spk = 0.0
+
     cache = []
     for epoch in range(epoch_str, hps.train.epochs + 1):
         if rank == 0:
@@ -350,6 +408,9 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
                 _device,
                 _use_mps,
                 _fn_mel_loss,
+                _spk_encoder,
+                _c_spk,
+                _profile_emb,
             )
         else:
             train_and_evaluate(
@@ -367,6 +428,9 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
                 _device,
                 _use_mps,
                 _fn_mel_loss,
+                None,
+                0.0,
+                None,
             )
         scheduler_g.step()
         scheduler_d.step()
@@ -387,6 +451,9 @@ def train_and_evaluate(
     _device=None,
     _use_mps=False,
     fn_mel_loss=None,
+    spk_encoder=None,
+    c_spk=0.0,
+    profile_emb=None,
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
@@ -597,7 +664,35 @@ def train_and_evaluate(
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
+
+                # Speaker loss — profile-level embedding vs generated segment
+                loss_spk = torch.tensor(0.0, device=_device)
+                if spk_encoder is not None and c_spk > 0 and profile_emb is not None:
+                    # Resample to 16kHz for ECAPA-TDNN
+                    _sr = hps.data.sampling_rate
+                    # wave and y_hat are [B, 1, T] — squeeze to [B, T]
+                    _yhat = y_hat.squeeze(1)
+                    if _sr != 16000:
+                        _ratio = 16000 / _sr
+                        _new_len = int(_yhat.shape[-1] * _ratio)
+                        _yhat_16k = F.interpolate(
+                            _yhat.unsqueeze(1),
+                            size=_new_len,
+                            mode="linear",
+                            align_corners=False,
+                        ).squeeze(1)
+                    else:
+                        _yhat_16k = _yhat
+
+                    gen_emb = spk_encoder.get_embedding(_yhat_16k)  # [B, 192]
+                    # Normalize embeddings for cosine similarity
+                    gen_emb = F.normalize(gen_emb, p=2, dim=1)
+                    ref_emb = profile_emb.unsqueeze(
+                        0
+                    )  # [1, 192] → [B, 192] via broadcast
+                    loss_spk = _spk_loss_fn(gen_emb, ref_emb) * c_spk
+
+                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_spk
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
@@ -621,7 +716,7 @@ def train_and_evaluate(
 
                 logger.info([global_step, lr])
                 logger.info(
-                    f"loss_disc={loss_disc:.3f}, loss_gen={loss_gen:.3f}, loss_fm={loss_fm:.3f},loss_mel={loss_mel:.3f}, loss_kl={loss_kl:.3f}"
+                    f"loss_disc={loss_disc:.3f}, loss_gen={loss_gen:.3f}, loss_fm={loss_fm:.3f},loss_mel={loss_mel:.3f}, loss_kl={loss_kl:.3f}, loss_spk={loss_spk:.3f}"
                 )
                 scalar_dict = {
                     "loss/g/total": loss_gen_all,
@@ -635,6 +730,7 @@ def train_and_evaluate(
                         "loss/g/fm": loss_fm,
                         "loss/g/mel": loss_mel,
                         "loss/g/kl": loss_kl,
+                        "loss/g/spk": loss_spk,
                     }
                 )
 

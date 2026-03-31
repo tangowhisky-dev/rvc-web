@@ -15,8 +15,7 @@ import aiosqlite
 # All persistent data lives under PROJECT_ROOT/data/.
 # Falls back to a path relative to this file so tests work without the env var.
 _project_root = os.environ.get(
-    "PROJECT_ROOT",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    "PROJECT_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 )
 DB_PATH = os.path.join(_project_root, "data", "rvc.db")
 
@@ -66,6 +65,7 @@ CREATE TABLE IF NOT EXISTS epoch_losses (
     loss_disc   REAL,
     loss_fm     REAL,
     loss_kl     REAL,
+    loss_spk    REAL,
     trained_at  TEXT NOT NULL,
     UNIQUE (profile_id, epoch),
     FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE
@@ -76,32 +76,37 @@ CREATE TABLE IF NOT EXISTS epoch_losses (
 # Each entry: (column_name, column_definition)
 # init_db() runs ALTER TABLE for any that are missing.
 _MIGRATIONS: list[tuple[str, str]] = [
-    ("batch_size",           "INTEGER NOT NULL DEFAULT 8"),
-    ("audio_duration",       "REAL"),
-    ("preprocessed_path",    "TEXT"),
-    ("profile_dir",          "TEXT"),
+    ("batch_size", "INTEGER NOT NULL DEFAULT 8"),
+    ("audio_duration", "REAL"),
+    ("preprocessed_path", "TEXT"),
+    ("profile_dir", "TEXT"),
     ("total_epochs_trained", "INTEGER NOT NULL DEFAULT 0"),
-    ("checkpoint_path",      "TEXT"),   # G_latest.pth — resume checkpoint
-    ("needs_retraining",     "INTEGER NOT NULL DEFAULT 0"),
+    ("checkpoint_path", "TEXT"),  # G_latest.pth — resume checkpoint
+    ("needs_retraining", "INTEGER NOT NULL DEFAULT 0"),
     # Speech-weighted RMS of the first uploaded audio file for this profile.
     # All subsequent uploads are normalized to this value so the training corpus
     # is level-consistent.  Also used at inference time to match microphone input
     # level to the training distribution.  NULL on profiles created before this
     # migration — the worker falls back gracefully (no pre-gain applied).
-    ("profile_rms",          "REAL"),
+    ("profile_rms", "REAL"),
     # Feature embedder model name (e.g. "spin-v2", "contentvec", "hubert").
     # Locked after the first training run: switching embedder mid-training would
     # corrupt the stored feature vectors in 3_feature768/. NULL = "spin-v2"
     # (default for profiles created before this migration).
-    ("embedder",             "TEXT NOT NULL DEFAULT 'spin-v2'"),
+    ("embedder", "TEXT NOT NULL DEFAULT 'spin-v2'"),
     # Overtraining detection threshold — number of consecutive epochs where
     # generator loss does not improve before training is stopped early.
     # 0 = disabled.  NULL treated as 0.
-    ("overtrain_threshold",  "INTEGER NOT NULL DEFAULT 0"),
+    ("overtrain_threshold", "INTEGER NOT NULL DEFAULT 0"),
     # Vocoder used to train this profile: "HiFi-GAN" or "RefineGAN".
     # Locked after the first training run — the decoder architecture is baked
     # into the G_latest.pth checkpoint and cannot be swapped mid-training.
-    ("vocoder",              "TEXT NOT NULL DEFAULT 'HiFi-GAN'"),
+    ("vocoder", "TEXT NOT NULL DEFAULT 'HiFi-GAN'"),
+]
+
+# Migrations for epoch_losses table
+_EPOCH_LOSSES_MIGRATIONS: list[tuple[str, str]] = [
+    ("loss_spk", "REAL"),
 ]
 
 
@@ -137,6 +142,16 @@ async def init_db() -> None:
             if col_name not in existing:
                 await db.execute(
                     f"ALTER TABLE profiles ADD COLUMN {col_name} {col_def}"
+                )
+
+        # Column-level migrations on epoch_losses (idempotent)
+        cursor = await db.execute("PRAGMA table_info(epoch_losses)")
+        existing_el = {row[1] for row in await cursor.fetchall()}
+
+        for col_name, col_def in _EPOCH_LOSSES_MIGRATIONS:
+            if col_name not in existing_el:
+                await db.execute(
+                    f"ALTER TABLE epoch_losses ADD COLUMN {col_name} {col_def}"
                 )
 
         await db.commit()
@@ -181,7 +196,15 @@ async def init_db() -> None:
             await db.execute(
                 """INSERT INTO audio_files (id, profile_id, filename, file_path, duration, is_cleaned, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (_uuid.uuid4().hex, pid, filename, file_path, duration, 1 if is_cleaned else 0, created_at),
+                (
+                    _uuid.uuid4().hex,
+                    pid,
+                    filename,
+                    file_path,
+                    duration,
+                    1 if is_cleaned else 0,
+                    created_at,
+                ),
             )
 
         await db.commit()
@@ -221,8 +244,8 @@ async def save_epoch_loss(
     async with get_db() as db:
         await db.execute(
             """INSERT INTO epoch_losses
-                   (id, profile_id, epoch, loss_mel, loss_gen, loss_disc, loss_fm, loss_kl, trained_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   (id, profile_id, epoch, loss_mel, loss_gen, loss_disc, loss_fm, loss_kl, loss_spk, trained_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(profile_id, epoch)
                DO UPDATE SET
                    loss_mel=excluded.loss_mel,
@@ -230,6 +253,7 @@ async def save_epoch_loss(
                    loss_disc=excluded.loss_disc,
                    loss_fm=excluded.loss_fm,
                    loss_kl=excluded.loss_kl,
+                   loss_spk=excluded.loss_spk,
                    trained_at=excluded.trained_at
             """,
             (
@@ -241,6 +265,7 @@ async def save_epoch_loss(
                 losses.get("loss_disc"),
                 losses.get("loss_fm"),
                 losses.get("loss_kl"),
+                losses.get("loss_spk"),
                 now,
             ),
         )

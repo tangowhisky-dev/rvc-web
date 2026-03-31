@@ -47,6 +47,7 @@ from backend.app.db import get_db, save_epoch_loss
 # TrainingJob
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class TrainingJob:
     """Holds all runtime state for a single training run."""
@@ -65,6 +66,7 @@ class TrainingJob:
 # DB helper
 # ---------------------------------------------------------------------------
 
+
 async def _update_db_status(profile_id: str, status: str) -> None:
     """Open a fresh DB connection and update profile status.
 
@@ -82,6 +84,7 @@ async def _update_db_status(profile_id: str, status: str) -> None:
 # ---------------------------------------------------------------------------
 # Subprocess helper
 # ---------------------------------------------------------------------------
+
 
 async def _run_subprocess(
     job: TrainingJob,
@@ -118,6 +121,7 @@ async def _run_subprocess(
 # Log-file tailer for train.py
 # ---------------------------------------------------------------------------
 
+
 async def _tail_train_log(job: TrainingJob, log_path: str) -> None:
     """Poll train.log for new lines and put them into job.queue.
 
@@ -131,11 +135,13 @@ async def _tail_train_log(job: TrainingJob, log_path: str) -> None:
     deadline = time.monotonic() + 10.0
     while not os.path.exists(log_path):
         if time.monotonic() >= deadline:
-            await job.queue.put({
-                "type": "log",
-                "message": "Warning: train.log did not appear within 10s; skipping tail",
-                "phase": "train",
-            })
+            await job.queue.put(
+                {
+                    "type": "log",
+                    "message": "Warning: train.log did not appear within 10s; skipping tail",
+                    "phase": "train",
+                }
+            )
             return
         await asyncio.sleep(0.2)
 
@@ -151,34 +157,42 @@ async def _tail_train_log(job: TrainingJob, log_path: str) -> None:
                     # Detect epoch-start lines: "Train Epoch: N [N%]"
                     if "Train Epoch:" in stripped:
                         import re as _re
+
                         m = _re.search(r"Train Epoch:\s*(\d+)", stripped)
                         if m:
                             epoch_num = int(m.group(1))
-                            await job.queue.put({
-                                "type": "epoch",
-                                "message": f"Epoch {epoch_num} started",
-                                "phase": "train",
-                                "epoch": epoch_num,
-                            })
+                            await job.queue.put(
+                                {
+                                    "type": "epoch",
+                                    "message": f"Epoch {epoch_num} started",
+                                    "phase": "train",
+                                    "epoch": epoch_num,
+                                }
+                            )
                             continue  # don't also emit the raw line
                     # Detect epoch-done lines: "====> Epoch: N [timestamp] | (elapsed)"
                     if "====> Epoch:" in stripped:
                         import re as _re
+
                         m = _re.search(r"====> Epoch:\s*(\d+)", stripped)
                         if m:
                             epoch_num = int(m.group(1))
-                            await job.queue.put({
-                                "type": "epoch_done",
-                                "message": f"Epoch {epoch_num} complete",
-                                "phase": "train",
-                                "epoch": epoch_num,
-                            })
+                            await job.queue.put(
+                                {
+                                    "type": "epoch_done",
+                                    "message": f"Epoch {epoch_num} complete",
+                                    "phase": "train",
+                                    "epoch": epoch_num,
+                                }
+                            )
                             continue
-                    await job.queue.put({
-                        "type": "log",
-                        "message": stripped,
-                        "phase": "train",
-                    })
+                    await job.queue.put(
+                        {
+                            "type": "log",
+                            "message": stripped,
+                            "phase": "train",
+                        }
+                    )
             else:
                 await asyncio.sleep(0.2)
 
@@ -186,6 +200,7 @@ async def _tail_train_log(job: TrainingJob, log_path: str) -> None:
 # ---------------------------------------------------------------------------
 # filelist.txt builder (adapts click_train() from web.py)
 # ---------------------------------------------------------------------------
+
 
 def _build_filelist(project_root: str, exp_dir: str) -> None:
     """Build logs/rvc_finetune_active/filelist.txt from feature directories.
@@ -207,10 +222,7 @@ def _build_filelist(project_root: str, exp_dir: str) -> None:
         return {name.split(".")[0] for name in os.listdir(d)}
 
     names = (
-        _stems(gt_wavs_dir)
-        & _stems(feature_dir)
-        & _stems(f0_dir)
-        & _stems(f0nsf_dir)
+        _stems(gt_wavs_dir) & _stems(feature_dir) & _stems(f0_dir) & _stems(f0nsf_dir)
     )
 
     spk_id = 0  # speaker id; fixed for single-speaker fine-tuning
@@ -256,7 +268,10 @@ def _build_filelist(project_root: str, exp_dir: str) -> None:
 # config.json writer (idempotent)
 # ---------------------------------------------------------------------------
 
-def _write_config(project_root: str, exp_dir: str, batch_size: int = 8) -> None:
+
+def _write_config(
+    project_root: str, exp_dir: str, batch_size: int = 8, c_spk: float = 2.0
+) -> None:
     """Copy backend/rvc/configs/inuse/v2/32k.json into exp_dir/config.json, patching
     training hyperparameters for MPS performance.
 
@@ -273,7 +288,9 @@ def _write_config(project_root: str, exp_dir: str, batch_size: int = 8) -> None:
     import json as _json
 
     config_save_path = os.path.join(exp_dir, "config.json")
-    src = os.path.join(project_root, "backend", "rvc", "configs", "inuse", "v2", "32k.json")
+    src = os.path.join(
+        project_root, "backend", "rvc", "configs", "inuse", "v2", "32k.json"
+    )
 
     with open(src) as _f:
         cfg = _json.load(_f)
@@ -282,6 +299,7 @@ def _write_config(project_root: str, exp_dir: str, batch_size: int = 8) -> None:
     # Loss values attached to epoch_done still come from the final batch since
     # _drain_stdout buffers and overwrites last_loss_line on each emitted loss line.
     cfg["train"]["log_interval"] = 10
+    cfg["train"]["c_spk"] = c_spk
     with open(config_save_path, "w") as _f:
         _json.dump(cfg, _f, indent=2)
 
@@ -313,7 +331,9 @@ def _build_index(project_root: str) -> str:
         timeout=300,
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr[-2000:].strip() or "index worker exited non-zero")
+        raise RuntimeError(
+            result.stderr[-2000:].strip() or "index worker exited non-zero"
+        )
 
     # Worker prints the added index path as last stdout line
     added_path = result.stdout.strip().splitlines()[-1].strip()
@@ -325,6 +345,7 @@ def _build_index(project_root: str) -> str:
 # ---------------------------------------------------------------------------
 # Core pipeline coroutine
 # ---------------------------------------------------------------------------
+
 
 async def _run_pipeline(
     job: TrainingJob,
@@ -339,6 +360,7 @@ async def _run_pipeline(
     embedder: str = "spin-v2",
     overtrain_threshold: int = 0,
     vocoder: str = "HiFi-GAN",
+    c_spk: float = 2.0,
 ) -> None:
     """Orchestrate the full training pipeline for one TrainingJob.
 
@@ -401,11 +423,13 @@ async def _run_pipeline(
             if os.path.exists(src):
                 shutil.copy2(src, dst)
                 seeded_checkpoint = True
-                await job.queue.put({
-                    "type": "log",
-                    "message": f"Seeded {ckpt_file} from profile checkpoints (resuming from epoch {prior_epochs})",
-                    "phase": "setup",
-                })
+                await job.queue.put(
+                    {
+                        "type": "log",
+                        "message": f"Seeded {ckpt_file} from profile checkpoints (resuming from epoch {prior_epochs})",
+                        "phase": "setup",
+                    }
+                )
 
     # ------------------------------------------------------------------
     # Clean stale training artifacts before each run so we always start
@@ -430,16 +454,20 @@ async def _run_pipeline(
         except OSError:
             pass
 
-    different_profile = prev_profile_id is not None and prev_profile_id != job.profile_id
+    different_profile = (
+        prev_profile_id is not None and prev_profile_id != job.profile_id
+    )
 
     # If a different profile last used this workspace, treat as completely fresh:
     # wipe feature dirs too so preprocessing reruns for the new audio.
     if different_profile:
-        await job.queue.put({
-            "type": "log",
-            "message": f"Detected stale workspace from profile {prev_profile_id[:8]}… — clearing all cached features",
-            "phase": "setup",
-        })
+        await job.queue.put(
+            {
+                "type": "log",
+                "message": f"Detected stale workspace from profile {prev_profile_id[:8]}… — clearing all cached features",
+                "phase": "setup",
+            }
+        )
         if os.path.isdir(exp_dir):
             shutil.rmtree(exp_dir, ignore_errors=True)
         os.makedirs(exp_dir, exist_ok=True)
@@ -458,11 +486,13 @@ async def _run_pipeline(
         # WRONG audio segments because sorted(listdir) indices shifted.
         _FEATURE_DIRS = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
         _KEEP_FILES = {"G_latest.pth", "D_latest.pth"} if seeded_checkpoint else set()
-        await job.queue.put({
-            "type": "log",
-            "message": "Audio files changed — clearing cached features for full re-extraction",
-            "phase": "setup",
-        })
+        await job.queue.put(
+            {
+                "type": "log",
+                "message": "Audio files changed — clearing cached features for full re-extraction",
+                "phase": "setup",
+            }
+        )
         if os.path.isdir(exp_dir):
             for entry in os.listdir(exp_dir):
                 if entry in _KEEP_FILES:
@@ -484,7 +514,7 @@ async def _run_pipeline(
                 if os.path.exists(src):
                     shutil.copy2(src, dst)
     else:
-        _KEEP_DIRS  = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
+        _KEEP_DIRS = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
         _KEEP_FILES = {"G_latest.pth", "D_latest.pth"} if seeded_checkpoint else set()
         if os.path.isdir(exp_dir):
             for entry in os.listdir(exp_dir):
@@ -525,17 +555,22 @@ async def _run_pipeline(
                 except OSError:
                     pass
         if removed_specs:
-            await job.queue.put({
-                "type": "log",
-                "message": f"Cleared {removed_specs} stale .spec.pt cache files from 0_gt_wavs",
-                "phase": "setup",
-            })
+            await job.queue.put(
+                {
+                    "type": "log",
+                    "message": f"Cleared {removed_specs} stale .spec.pt cache files from 0_gt_wavs",
+                    "phase": "setup",
+                }
+            )
 
     n_cpu = multiprocessing.cpu_count()
     python = sys.executable
 
     # Base environment: inherit everything, then layer overrides
     base_env = os.environ.copy()
+    base_env["PROJECT_ROOT"] = project_root
+    base_env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    base_env["PROJECT_ROOT"] = project_root
 
     def _emit_phase(phase: str, message: str) -> None:
         """Helper: put a phase-transition message to the queue (fire-and-forget for sync)."""
@@ -543,7 +578,13 @@ async def _run_pipeline(
         job.queue.put_nowait({"type": "phase", "message": message, "phase": phase})
         # Structured observability log
         print(
-            json.dumps({"event": "training_phase", "phase": phase, "profile_id": job.profile_id}),
+            json.dumps(
+                {
+                    "event": "training_phase",
+                    "phase": phase,
+                    "profile_id": job.profile_id,
+                }
+            ),
             flush=True,
         )
 
@@ -554,12 +595,14 @@ async def _run_pipeline(
         await _update_db_status(job.profile_id, "failed")
         elapsed = time.monotonic() - start_ts
         print(
-            json.dumps({
-                "event": "training_failed",
-                "profile_id": job.profile_id,
-                "error": message,
-                "elapsed_s": round(elapsed, 1),
-            }),
+            json.dumps(
+                {
+                    "event": "training_failed",
+                    "profile_id": job.profile_id,
+                    "error": message,
+                    "elapsed_s": round(elapsed, 1),
+                }
+            ),
             flush=True,
         )
 
@@ -571,18 +614,47 @@ async def _run_pipeline(
     preprocess_args = [
         python,
         "infer/modules/train/preprocess.py",
-        sample_dir,       # inp_root (directory, not the wav file itself)
-        "32000",          # sr
-        str(n_cpu),       # n_p
-        exp_dir,          # exp_dir (absolute path)
-        "False",          # noparallel
-        "3.0",            # per (segment duration)
+        sample_dir,  # inp_root (directory, not the wav file itself)
+        "32000",  # sr
+        str(n_cpu),  # n_p
+        exp_dir,  # exp_dir (absolute path)
+        "False",  # noparallel
+        "3.0",  # per (segment duration)
     ]
 
-    ok = await _run_subprocess(job, preprocess_args, base_env, rvc_pkg_dir, "preprocess")
+    ok = await _run_subprocess(
+        job, preprocess_args, base_env, rvc_pkg_dir, "preprocess"
+    )
     if not ok:
         await _fail("preprocess", "Preprocess phase failed (non-zero exit code)")
         return
+
+    # ------------------------------------------------------------------
+    # Resolve compute device for all subprocess phases.
+    # Reads RVC_DEVICE exported by start.sh; falls back to auto-detect so
+    # the pipeline works even when started manually without start.sh.
+    # ------------------------------------------------------------------
+    import torch as _torch_detect
+
+    _rvc_device: str = base_env.get("RVC_DEVICE") or (
+        "cuda"
+        if _torch_detect.cuda.is_available()
+        else "mps"
+        if _torch_detect.backends.mps.is_available()
+        else "cpu"
+    )
+    # is_half: fp16 on CUDA only (not supported on MPS or CPU)
+    _is_half_str: str = "True" if _rvc_device.startswith("cuda") else "False"
+    # CUDA device index for tools that accept i_gpu as a separate arg
+    _cuda_device_idx: str = base_env.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+
+    await job.queue.put(
+        {
+            "type": "log",
+            "message": f"Using device: {_rvc_device}  is_half={_is_half_str}",
+            "phase": "setup",
+        }
+    )
 
     # ------------------------------------------------------------------
     # Phase 2a: F0 Extraction
@@ -591,15 +663,17 @@ async def _run_pipeline(
 
     f0_env = base_env.copy()
     f0_env["PROJECT_ROOT"] = project_root
+    if _rvc_device == "mps":
+        f0_env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
     f0_args = [
         python,
         "infer/modules/train/extract_f0_print.py",
-        exp_dir,   # exp_dir absolute
+        exp_dir,  # exp_dir absolute
         str(n_cpu),
-        "rmvpe",   # f0method
-        "mps",     # device (with PYTORCH_ENABLE_MPS_FALLBACK fallback)
-        "False",   # is_half
+        "rmvpe",  # f0method
+        _rvc_device,  # device — resolved at runtime
+        _is_half_str,  # is_half
     ]
 
     ok = await _run_subprocess(job, f0_args, f0_env, rvc_pkg_dir, "extract_f0")
@@ -630,26 +704,81 @@ async def _run_pipeline(
     feat_args = [
         python,
         "infer/modules/train/extract_feature_print.py",
-        "mps",           # device
-        "1",             # n_part
-        "0",             # i_part
-        "",              # i_gpu (empty → use device arg)
-        exp_dir,         # exp_dir absolute
-        "v2",            # version
-        "False",         # is_half
-        embedder_path,   # embedder path (new arg)
+        _rvc_device,  # device — resolved at runtime
+        "1",  # n_part
+        "0",  # i_part
+        _cuda_device_idx,  # i_gpu — CUDA device index (empty-safe for MPS/CPU)
+        exp_dir,  # exp_dir absolute
+        "v2",  # version
+        _is_half_str,  # is_half
+        embedder_path,  # embedder path (new arg)
     ]
 
     ok = await _run_subprocess(job, feat_args, feat_env, rvc_pkg_dir, "extract_feature")
     if not ok:
-        await _fail("extract_feature", "Feature extraction phase failed (non-zero exit code)")
+        await _fail(
+            "extract_feature", "Feature extraction phase failed (non-zero exit code)"
+        )
         return
+
+    # ------------------------------------------------------------------
+    # Pre-phase 3: Extract profile-level speaker embedding (if c_spk > 0)
+    # ------------------------------------------------------------------
+    profile_emb_path = os.path.join(exp_dir, "profile_embedding.pt")
+    if c_spk > 0:
+        _emit_phase("extract_profile_emb", "Extracting profile speaker embedding")
+        gt_wavs_dir = os.path.join(exp_dir, "0_gt_wavs")
+        # Use MPS if available (same logic as in train.py)
+        emb_device = _rvc_device
+        emb_extract_args = [
+            python,
+            "infer/modules/train/extract_profile_embedding.py",
+            gt_wavs_dir,
+            profile_emb_path,
+            emb_device,
+        ]
+        await job.queue.put(
+            {
+                "type": "log",
+                "message": f"Extracting profile embedding: {gt_wavs_dir} → {profile_emb_path} (device={emb_device})",
+                "phase": "extract_profile_emb",
+            }
+        )
+        ok = await _run_subprocess(
+            job, emb_extract_args, base_env, rvc_pkg_dir, "extract_profile_emb"
+        )
+        if not ok:
+            # Non-fatal — speaker embedding extraction failed, disable speaker loss
+            await job.queue.put(
+                {
+                    "type": "log",
+                    "message": "WARNING: Profile embedding extraction failed — speaker loss disabled",
+                    "phase": "extract_profile_emb",
+                }
+            )
+            c_spk = 0.0
+        else:
+            await job.queue.put(
+                {
+                    "type": "log",
+                    "message": f"Profile speaker embedding saved to {profile_emb_path}",
+                    "phase": "extract_profile_emb",
+                }
+            )
+    else:
+        await job.queue.put(
+            {
+                "type": "log",
+                "message": f"Speaker loss disabled (c_spk={c_spk})",
+                "phase": "setup",
+            }
+        )
 
     # ------------------------------------------------------------------
     # Pre-phase 3 setup: config.json and filelist.txt
     # ------------------------------------------------------------------
     try:
-        _write_config(project_root, exp_dir, batch_size=batch_size)
+        _write_config(project_root, exp_dir, batch_size=batch_size, c_spk=c_spk)
         _build_filelist(project_root, exp_dir)
     except Exception as exc:
         await _fail("setup", f"Pre-train setup failed: {exc}")
@@ -665,15 +794,13 @@ async def _run_pipeline(
     train_env["MASTER_ADDR"] = "localhost"
     train_env["MASTER_PORT"] = str(master_port)
     train_env["PROJECT_ROOT"] = project_root
-    # MPS memory tuning for Apple Silicon.
-    # High watermark 0.0 = no limit (MPS manages all of unified memory).
-    # This avoids spurious OOM kills on 48GB machines where the allocator
-    # would otherwise cap itself at a fraction of available memory.
-    # PYTORCH_MPS_PREFER_SHARED_MEMORY keeps tensors in shared (CPU-visible)
-    # memory, reducing copy overhead for host-device transfers during checkpoint
-    # saves and gradient norm computation.
-    train_env.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
-    train_env.setdefault("PYTORCH_MPS_PREFER_SHARED_MEMORY", "1")
+    # MPS memory tuning — Apple Silicon only.
+    # High watermark 0.0 = no limit; shared memory reduces copy overhead for
+    # checkpoint saves and gradient norm computation on unified memory.
+    if _rvc_device == "mps":
+        train_env.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+        train_env.setdefault("PYTORCH_MPS_PREFER_SHARED_MEMORY", "1")
+        train_env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
     # Checkpoint save schedule: every 25% of the run or every 10 epochs,
     # whichever is smaller — ensures at least 4 saves and no more than
@@ -691,46 +818,81 @@ async def _run_pipeline(
             pretrain_g = os.path.join(project_root, "assets", "refinegan", "f0G32k.pth")
             pretrain_d = os.path.join(project_root, "assets", "refinegan", "f0D32k.pth")
         else:
-            pretrain_g = os.path.join(project_root, "assets", "pretrained_v2", "f0G32k.pth")
-            pretrain_d = os.path.join(project_root, "assets", "pretrained_v2", "f0D32k.pth")
+            pretrain_g = os.path.join(
+                project_root, "assets", "pretrained_v2", "f0G32k.pth"
+            )
+            pretrain_d = os.path.join(
+                project_root, "assets", "pretrained_v2", "f0D32k.pth"
+            )
     else:
         pretrain_g = ""
         pretrain_d = ""
 
-    await job.queue.put({
-        "type": "log",
-        "message": (
-            f"Training epochs {prior_epochs + 1}–{cumulative_epochs} "
-            f"(save every {effective_save_every})"
-            + (" [resume]" if prior_epochs > 0 else " [fresh]")
-        ),
-        "phase": "train",
-    })
+    await job.queue.put(
+        {
+            "type": "log",
+            "message": (
+                f"Training epochs {prior_epochs + 1}–{cumulative_epochs} "
+                f"(save every {effective_save_every})"
+                + (" [resume]" if prior_epochs > 0 else " [fresh]")
+            ),
+            "phase": "train",
+        }
+    )
+
+    # GPU cache: on CUDA/MPS cache dataset to device memory for speed.
+    # On CPU set to 0 — there is no GPU memory to cache into and the flag
+    # causes confusion (train.py still tries to move tensors to "cuda:0").
+    _cache_gpu = "1" if _rvc_device in ("cuda", "mps") else "0"
+
+    # GPU index string for train.py (-g flag).  train.py uses this to set
+    # CUDA_VISIBLE_DEVICES internally.  Pass through whatever the caller
+    # already exported so multi-GPU Linux works correctly.
+    _gpus_str = (
+        base_env.get("CUDA_VISIBLE_DEVICES", "0") if _rvc_device == "cuda" else "0"
+    )
 
     train_args = [
         python,
         "infer/modules/train/train.py",
-        "-e", exp_dir,   # absolute path — avoids cwd-relative ./logs/ resolution in train.py
-        "-sr", "32k",
-        "-f0", "1",
-        "-bs", str(batch_size),
-        "-te", str(cumulative_epochs),
-        "-se", str(effective_save_every),
-        "-pg", pretrain_g,
-        "-pd", pretrain_d,
-        "-l", "1",    # save latest only (G_latest.pth / D_latest.pth)
-        "-c", "1",    # cache dataset in GPU memory
-        "-sw", "0",   # save_small_model at end only (we handle artifacts ourselves)
-        "-v", "v2",
-        "-a", "",
-        "-voc", vocoder,
-        "-emb", embedder,
+        "-e",
+        exp_dir,  # absolute path — avoids cwd-relative ./logs/ resolution in train.py
+        "-sr",
+        "32k",
+        "-f0",
+        "1",
+        "-bs",
+        str(batch_size),
+        "-te",
+        str(cumulative_epochs),
+        "-se",
+        str(effective_save_every),
+        "-g",
+        _gpus_str,  # GPU index(es) — prevents train.py overriding CUDA_VISIBLE_DEVICES
+        "-pg",
+        pretrain_g,
+        "-pd",
+        pretrain_d,
+        "-l",
+        "1",  # save latest only (G_latest.pth / D_latest.pth)
+        "-c",
+        _cache_gpu,  # cache dataset in GPU memory (0 on CPU to avoid OOM)
+        "-sw",
+        "0",  # save_small_model at end only (we handle artifacts ourselves)
+        "-v",
+        "v2",
+        "-a",
+        "",
+        "-voc",
+        vocoder,
+        "-emb",
+        embedder,
     ]
 
     train_proc = await asyncio.create_subprocess_exec(
         *train_args,
-        stdout=asyncio_subprocess.PIPE,    # capture stdout — root logger writes here (basicConfig)
-        stderr=asyncio_subprocess.PIPE,    # capture stderr so crashes surface in job error
+        stdout=asyncio_subprocess.PIPE,  # capture stdout — root logger writes here (basicConfig)
+        stderr=asyncio_subprocess.PIPE,  # capture stderr so crashes surface in job error
         env=train_env,
         cwd=rvc_pkg_dir,
     )
@@ -750,6 +912,7 @@ async def _run_pipeline(
         if train_proc.stdout is None:
             return
         import re as _re
+
         # With log_interval=10, loss lines fire every 10 batches (4-5 times/epoch).
         # Buffer the latest loss line and attach it to epoch_done.
         # All mid-epoch log noise is suppressed.
@@ -760,7 +923,7 @@ async def _run_pipeline(
         # terminate the subprocess cleanly without modifying train.py.
         _ot_lowest_gen: float = float("inf")
         _ot_consecutive: int = 0
-        _ot_min_delta: float = 0.004   # must improve by at least this to count
+        _ot_min_delta: float = 0.004  # must improve by at least this to count
         _ot_triggered: bool = False
 
         async for raw_line in train_proc.stdout:
@@ -799,7 +962,14 @@ async def _run_pipeline(
                     # Parse individual loss scalars from the buffered loss line
                     # so the frontend can plot them without parsing log text.
                     losses: dict = {}
-                    for key in ("loss_disc", "loss_gen", "loss_fm", "loss_mel", "loss_kl"):
+                    for key in (
+                        "loss_disc",
+                        "loss_gen",
+                        "loss_fm",
+                        "loss_mel",
+                        "loss_kl",
+                        "loss_spk",
+                    ):
                         lm = _re.search(rf"{key}=([0-9.]+)", last_loss_line)
                         if lm:
                             try:
@@ -820,11 +990,13 @@ async def _run_pipeline(
                         if _ot_consecutive >= overtrain_threshold and not _ot_triggered:
                             _ot_triggered = True
                             ot_label = f" ⚠ overtraining detected ({_ot_consecutive} epochs no improvement)"
-                            await job.queue.put({
-                                "type": "log",
-                                "message": f"Stopping early: generator loss has not improved for {_ot_consecutive} consecutive epochs (threshold={overtrain_threshold}).",
-                                "phase": "train",
-                            })
+                            await job.queue.put(
+                                {
+                                    "type": "log",
+                                    "message": f"Stopping early: generator loss has not improved for {_ot_consecutive} consecutive epochs (threshold={overtrain_threshold}).",
+                                    "phase": "train",
+                                }
+                            )
                             # Terminate train.py cleanly
                             try:
                                 train_proc.terminate()
@@ -863,7 +1035,9 @@ async def _run_pipeline(
         async for raw_line in train_proc.stderr:
             line = raw_line.decode(errors="replace").rstrip()
             if line:
-                await job.queue.put({"type": "log", "message": f"[stderr] {line}", "phase": "train"})
+                await job.queue.put(
+                    {"type": "log", "message": f"[stderr] {line}", "phase": "train"}
+                )
 
     stderr_task = asyncio.create_task(_drain_stderr())
 
@@ -887,9 +1061,10 @@ async def _run_pipeline(
         # clean intentional stop — treat it as a successful partial run and
         # proceed to index building + artifact copy.
         import signal as _signal
-        is_overtrain_stop = (
-            overtrain_threshold > 0
-            and train_proc.returncode in (-_signal.SIGTERM, _signal.SIGTERM)
+
+        is_overtrain_stop = overtrain_threshold > 0 and train_proc.returncode in (
+            -_signal.SIGTERM,
+            _signal.SIGTERM,
         )
         if not is_overtrain_stop:
             # stderr already drained into job queue by _drain_stderr above
@@ -897,11 +1072,13 @@ async def _run_pipeline(
             await _fail("train", err_msg)
             return
         # Overtraining stop — log it and continue to artifact phase
-        await job.queue.put({
-            "type": "log",
-            "message": "Training stopped early by overtraining detector — proceeding to index build.",
-            "phase": "train",
-        })
+        await job.queue.put(
+            {
+                "type": "log",
+                "message": "Training stopped early by overtraining detector — proceeding to index build.",
+                "phase": "train",
+            }
+        )
     # On success: stderr was already drained by the concurrent _drain_stderr task
 
     # ------------------------------------------------------------------
@@ -912,11 +1089,13 @@ async def _run_pipeline(
     loop = asyncio.get_event_loop()
     try:
         added_index_path = await loop.run_in_executor(None, _build_index, project_root)
-        await job.queue.put({
-            "type": "index_done",
-            "message": f"FAISS index built: {os.path.basename(added_index_path)}",
-            "phase": "index",
-        })
+        await job.queue.put(
+            {
+                "type": "index_done",
+                "message": f"FAISS index built: {os.path.basename(added_index_path)}",
+                "phase": "index",
+            }
+        )
     except Exception as exc:
         await _fail("index", f"FAISS index build failed: {exc}")
         return
@@ -935,8 +1114,8 @@ async def _run_pipeline(
     #     save_small_model() at the end of every completed run. This is what
     #     rtrvc.py / load_synthesizer() expects (has 'weight', 'config', 'f0',
     #     'sr', 'version' keys).
-    dest_model_path: Optional[str] = None    # → DB model_path (checkpoint for resume)
-    dest_infer_path: Optional[str] = None    # → DB inference_model_path
+    dest_model_path: Optional[str] = None  # → DB model_path (checkpoint for resume)
+    dest_infer_path: Optional[str] = None  # → DB inference_model_path
     dest_index_path: Optional[str] = None
 
     g_latest = os.path.join(exp_dir, "G_latest.pth")
@@ -950,11 +1129,13 @@ async def _run_pipeline(
         g_candidates = sorted(glob.glob(os.path.join(exp_dir, "G_*.pth")))
         if g_candidates:
             g_latest = g_candidates[-1]
-            await job.queue.put({
-                "type": "log",
-                "message": f"G_latest.pth not found; using {os.path.basename(g_latest)}",
-                "phase": "index",
-            })
+            await job.queue.put(
+                {
+                    "type": "log",
+                    "message": f"G_latest.pth not found; using {os.path.basename(g_latest)}",
+                    "phase": "index",
+                }
+            )
 
     if profile_dir:
         dest_ckpt_dir = os.path.join(profile_dir, "checkpoints")
@@ -969,48 +1150,60 @@ async def _run_pipeline(
             if os.path.exists(g_latest):
                 shutil.copy2(g_latest, dest_g)
                 dest_model_path = dest_g
-                await job.queue.put({
-                    "type": "log",
-                    "message": f"Saved resume checkpoint → {dest_g}",
-                    "phase": "index",
-                })
+                await job.queue.put(
+                    {
+                        "type": "log",
+                        "message": f"Saved resume checkpoint → {dest_g}",
+                        "phase": "index",
+                    }
+                )
             else:
-                await job.queue.put({
-                    "type": "log",
-                    "message": f"Warning: no checkpoint found at {g_latest}",
-                    "phase": "index",
-                })
+                await job.queue.put(
+                    {
+                        "type": "log",
+                        "message": f"Warning: no checkpoint found at {g_latest}",
+                        "phase": "index",
+                    }
+                )
 
             if os.path.exists(d_latest):
                 shutil.copy2(d_latest, dest_d)
 
             if os.path.exists(weights_pth):
                 shutil.copy2(weights_pth, dest_infer_path)
-                await job.queue.put({
-                    "type": "log",
-                    "message": f"Saved inference model → {dest_infer_path}",
-                    "phase": "index",
-                })
+                await job.queue.put(
+                    {
+                        "type": "log",
+                        "message": f"Saved inference model → {dest_infer_path}",
+                        "phase": "index",
+                    }
+                )
             else:
-                await job.queue.put({
-                    "type": "log",
-                    "message": f"Warning: inference weights not found at {weights_pth}",
-                    "phase": "index",
-                })
+                await job.queue.put(
+                    {
+                        "type": "log",
+                        "message": f"Warning: inference weights not found at {weights_pth}",
+                        "phase": "index",
+                    }
+                )
                 dest_infer_path = None
 
             shutil.copy2(added_index_path, dest_index_path)
-            await job.queue.put({
-                "type": "log",
-                "message": f"Saved index → {dest_index_path}",
-                "phase": "index",
-            })
+            await job.queue.put(
+                {
+                    "type": "log",
+                    "message": f"Saved index → {dest_index_path}",
+                    "phase": "index",
+                }
+            )
         except Exception as exc:
-            await job.queue.put({
-                "type": "log",
-                "message": f"Warning: failed to copy artifacts to profile dir: {exc}",
-                "phase": "index",
-            })
+            await job.queue.put(
+                {
+                    "type": "log",
+                    "message": f"Warning: failed to copy artifacts to profile dir: {exc}",
+                    "phase": "index",
+                }
+            )
             dest_model_path = None
             dest_infer_path = None
             dest_index_path = None
@@ -1039,20 +1232,30 @@ async def _run_pipeline(
                    total_epochs_trained = ?,
                    needs_retraining = 0
                WHERE id = ?""",
-            (dest_infer_path, dest_model_path, dest_index_path, new_total_epochs, job.profile_id),
+            (
+                dest_infer_path,
+                dest_model_path,
+                dest_index_path,
+                new_total_epochs,
+                job.profile_id,
+            ),
         )
         await db.commit()
 
     elapsed = time.monotonic() - start_ts
-    await job.queue.put({"type": "done", "message": "Training complete", "phase": "done"})
+    await job.queue.put(
+        {"type": "done", "message": "Training complete", "phase": "done"}
+    )
 
     print(
-        json.dumps({
-            "event": "training_done",
-            "profile_id": job.profile_id,
-            "job_id": job.job_id,
-            "elapsed_s": round(elapsed, 1),
-        }),
+        json.dumps(
+            {
+                "event": "training_done",
+                "profile_id": job.profile_id,
+                "job_id": job.job_id,
+                "elapsed_s": round(elapsed, 1),
+            }
+        ),
         flush=True,
     )
 
@@ -1060,6 +1263,7 @@ async def _run_pipeline(
 # ---------------------------------------------------------------------------
 # TrainingManager
 # ---------------------------------------------------------------------------
+
 
 class TrainingManager:
     """Singleton managing in-memory training job state.
@@ -1085,6 +1289,7 @@ class TrainingManager:
         embedder: str = "spin-v2",
         overtrain_threshold: int = 0,
         vocoder: str = "HiFi-GAN",
+        c_spk: float = 2.0,
     ) -> TrainingJob:
         """Create and launch a training job for profile_id.
 
@@ -1121,19 +1326,31 @@ class TrainingManager:
 
         asyncio.create_task(
             _run_pipeline(
-                job, sample_dir, project_root, total_epoch, save_every, batch_size,
-                profile_dir, prior_epochs, files_changed, embedder, overtrain_threshold,
+                job,
+                sample_dir,
+                project_root,
+                total_epoch,
+                save_every,
+                batch_size,
+                profile_dir,
+                prior_epochs,
+                files_changed,
+                embedder,
+                overtrain_threshold,
                 vocoder,
+                c_spk,
             )
         )
 
         print(
-            json.dumps({
-                "event": "training_start",
-                "profile_id": profile_id,
-                "job_id": job_id,
-                "project_root": project_root,
-            }),
+            json.dumps(
+                {
+                    "event": "training_start",
+                    "profile_id": profile_id,
+                    "job_id": job_id,
+                    "project_root": project_root,
+                }
+            ),
             flush=True,
         )
 
@@ -1156,6 +1373,7 @@ class TrainingManager:
                 # Kill only the direct subprocess and its children via psutil,
                 # NOT os.killpg which would kill uvicorn's process group too.
                 import psutil
+
                 try:
                     parent = psutil.Process(job._proc.pid)
                     for child in parent.children(recursive=True):
@@ -1175,11 +1393,13 @@ class TrainingManager:
 
         job.status = "cancelled"
         job.error = "Training cancelled by user"
-        job.queue.put_nowait({
-            "type": "error",
-            "message": "Training cancelled by user",
-            "phase": job.phase,
-        })
+        job.queue.put_nowait(
+            {
+                "type": "error",
+                "message": "Training cancelled by user",
+                "phase": job.phase,
+            }
+        )
 
         # Fire-and-forget DB update (best-effort; manager is sync)
         try:

@@ -123,6 +123,22 @@ class Config:
             return False
 
     @staticmethod
+    def use_insecure_load() -> None:
+        """Register legacy fairseq globals so torch.load(weights_only=True) accepts them.
+
+        PyTorch 2.6 added strict weights_only=True semantics that reject arbitrary
+        Python objects embedded in .pt checkpoints (fairseq Dictionary, etc.).
+        Calling this before loading any checkpoint allows those classes through.
+        Safe to call multiple times — add_safe_globals is idempotent.
+        """
+        try:
+            import torch as _t
+            from fairseq.data.dictionary import Dictionary
+            _t.serialization.add_safe_globals([Dictionary])
+        except (ImportError, AttributeError):
+            pass
+
+    @staticmethod
     def has_xpu() -> bool:
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             return True

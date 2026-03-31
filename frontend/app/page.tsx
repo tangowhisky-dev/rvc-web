@@ -379,6 +379,7 @@ function WaveformViewer({ file, duration, startSec, endSec, onRangeChange }: Wav
       {/* Controls row: play preview + validity + segment times */}
       <div className="flex items-center gap-3">
         <button
+          type="button"
           onClick={togglePlay}
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md border text-[11px] font-mono
                       transition-colors shrink-0 ${

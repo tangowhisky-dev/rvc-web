@@ -276,7 +276,9 @@ def run_worker(
         import faiss as _faiss
         _faiss.omp_set_num_threads(1)
 
-        if _torch.backends.mps.is_available():
+        if _torch.cuda.is_available():
+            infer_device = "cuda"
+        elif _torch.backends.mps.is_available():
             infer_device = "mps"
         else:
             infer_device = "cpu"
@@ -315,6 +317,9 @@ def run_worker(
                 )
             resolved_index_path = matches[0]
 
+        # fp16 on CUDA only — MPS and CPU require fp32
+        _is_half = infer_device.startswith("cuda")
+
         rvc = RVC(
             key=pitch,
             formant=0,
@@ -322,7 +327,7 @@ def run_worker(
             index_path=resolved_index_path,
             index_rate=index_rate,
             device=infer_device,
-            is_half=False,
+            is_half=_is_half,
         )
 
         # tgt_sr is model-specific (32kHz for our 32k models).
@@ -373,23 +378,41 @@ def run_worker(
         from torchaudio.transforms import Resample as _Resample
         import torch.nn.functional as _F
 
-        # 44100 → 16k  (input capture → inference)
-        # 44100 → 48k  (input capture → waveform visualiser / save)
-        # tgt_sr → 48k (inference output → output device)
-        _resample_44_16  = _Resample(orig_freq=44100, new_freq=16000,
+        # Query the actual default sample rate reported by PortAudio for this
+        # input device.  Most macOS and Linux devices default to 44100 Hz, but
+        # some Windows WASAPI devices default to 48000 Hz.  Using the wrong
+        # rate causes sounddevice to throw "Invalid sample rate" on startup.
+        try:
+            _in_dev_info  = sd.query_devices(input_device_id,  "input")
+            _native_sr_in = int(_in_dev_info.get("default_samplerate", 44100))
+        except Exception:
+            _native_sr_in = 44100
+
+        # Portable latency hint: the string "low" is not reliable on all
+        # PortAudio backends (Windows WASAPI in particular may reject it).
+        # Use a small fixed latency in seconds instead.
+        _LATENCY_S = 0.1  # 100 ms — low enough for real-time, safe on all backends
+
+        # Derived block sizes scaled from native input SR instead of hardcoded 44100
+        _block_native_in = int(block_params["block_48k"] * _native_sr_in / _SR_48K)
+
+        # Input SR → 16k  (inference)
+        # Input SR → 48k  (waveform visualiser / save)
+        # tgt_sr   → 48k  (inference output → output device)
+        _resample_in_16  = _Resample(orig_freq=_native_sr_in, new_freq=16000,
                                      dtype=_torch.float32).to(infer_device)
-        _resample_44_48  = _Resample(orig_freq=44100, new_freq=_SR_48K,
+        _resample_in_48  = _Resample(orig_freq=_native_sr_in, new_freq=_SR_48K,
                                      dtype=_torch.float32).to(infer_device)
         _resample_tgt_48 = _Resample(orig_freq=tgt_sr, new_freq=_SR_48K,
                                      dtype=_torch.float32).to(infer_device)
 
         stream_in = sd.InputStream(
             device=input_device_id,
-            samplerate=44100,
+            samplerate=_native_sr_in,
             channels=1,
             dtype="float32",
-            blocksize=block_params["block_44k"],
-            latency="low",
+            blocksize=_block_native_in,
+            latency=_LATENCY_S,
         )
         stream_out = sd.OutputStream(
             device=output_device_id,
@@ -397,7 +420,7 @@ def run_worker(
             channels=1,
             dtype="float32",
             blocksize=block_params["block_48k"],
-            latency="low",
+            latency=_LATENCY_S,
         )
 
         stream_in.start()
@@ -408,7 +431,7 @@ def run_worker(
         # ------------------------------------------------------------------
         # Audio loop locals
         # ------------------------------------------------------------------
-        block_44k            = block_params["block_44k"]
+        block_in             = _block_native_in  # input capture blocksize (native SR)
         block_48k            = block_params["block_48k"]
         block_16k            = block_params["block_16k"]
         block_tgt            = block_params["block_tgt"]
@@ -501,16 +524,16 @@ def run_worker(
 
             # ── read input block ──────────────────────────────────────────
             try:
-                data, overflowed = stream_in.read(block_44k)
+                data, overflowed = stream_in.read(block_in)
             except Exception as e:
                 evt_q.put({"event": "waveform_overflow", "detail": str(e)})
                 continue
             if overflowed:
                 evt_q.put({"event": "waveform_overflow", "detail": "overflow"})
 
-            x_44k = data.squeeze()
-            x_44k_t = _torch.from_numpy(x_44k).to(infer_device)
-            x_16k_t = _resample_44_16(x_44k_t.unsqueeze(0)).squeeze(0)
+            x_in   = data.squeeze()
+            x_in_t = _torch.from_numpy(x_in).to(infer_device)
+            x_16k_t = _resample_in_16(x_in_t.unsqueeze(0)).squeeze(0)
 
             # ── update rolling 16k buffer (circular shift) ────────────────
             # Equivalent to torch.roll but avoids the internal copy overhead.
@@ -650,7 +673,7 @@ def run_worker(
 
             if audio_in_save_q is not None:
                 try:
-                    x_48k = (_resample_44_48(x_44k_t.unsqueeze(0))
+                    x_48k = (_resample_in_48(x_in_t.unsqueeze(0))
                              .squeeze(0).cpu().numpy().astype(np.float32))
                     audio_in_save_q.put_nowait(x_48k.copy())
                 except queue.Full:
@@ -659,7 +682,7 @@ def run_worker(
             # ── emit waveform snapshots for frontend visualiser ───────────
             evt_q.put({
                 "event": "waveform_in",
-                "samples": base64.b64encode(x_44k[::decim].tobytes()).decode(),
+                "samples": base64.b64encode(x_in[::decim].tobytes()).decode(),
                 "sr": 48000,
             })
             evt_q.put({

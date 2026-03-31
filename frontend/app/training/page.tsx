@@ -1,6 +1,11 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import {
+  AreaChart, Area, LineChart, Line,
+  XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine,
+  ResponsiveContainer, Legend,
+} from 'recharts';
 import { TipsPanel } from '../TipsPanel';
 import { LossGuide } from '../SettingsGuide';
 import { ProfilePicker } from '../ProfilePicker';
@@ -30,6 +35,9 @@ interface HardwareInfo {
   cpu_cores: number;
   mps_available: boolean;
   mps_allocated_mb: number;
+  cuda_available: boolean;
+  gpu_name?: string | null;
+  gpu_vram_gb?: number | null;
   sweet_spot_batch_size: number;
   max_safe_batch_size: number;
 }
@@ -46,6 +54,7 @@ interface TrainingMsg {
     loss_fm?: number;
     loss_mel?: number;
     loss_kl?: number;
+    loss_spk?: number;
   };
 }
 
@@ -56,6 +65,7 @@ interface EpochPoint {
   loss_disc: number;
   loss_fm: number;
   loss_kl: number;
+  loss_spk: number;
 }
 
 interface EpochLossPoint {
@@ -65,6 +75,7 @@ interface EpochLossPoint {
   loss_disc: number | null;
   loss_fm: number | null;
   loss_kl: number | null;
+  loss_spk: number | null;
   trained_at: string;
 }
 type JobState = 'idle' | 'running' | 'done' | 'failed';
@@ -113,15 +124,68 @@ function PhaseBar({ currentPhase, jobDone }: { currentPhase: string | null; jobD
 // Loss chart — SVG sparklines for key training signals
 // ---------------------------------------------------------------------------
 
-const LOSS_SERIES = [
-  { key: 'loss_mel',  label: 'Mel',   color: '#06b6d4' }, // cyan   — most important: audio quality
-  { key: 'loss_gen',  label: 'Gen',   color: '#a78bfa' }, // violet — generator adversarial
-  { key: 'loss_disc', label: 'Disc',  color: '#f59e0b' }, // amber  — discriminator health
-  { key: 'loss_fm',   label: 'FM',    color: '#34d399' }, // emerald — feature matching
-  { key: 'loss_kl',   label: 'KL',    color: '#f87171' }, // red    — latent regularisation
+// ---------------------------------------------------------------------------
+// Generator loss components that stack to form loss_gen_all
+// (matches train.py: loss_gen + loss_fm + loss_mel + loss_kl + loss_spk)
+// ---------------------------------------------------------------------------
+const GEN_STACK = [
+  { key: 'loss_spk', label: 'Spk',  color: '#ec4899' }, // pink    — rendered bottom → up
+  { key: 'loss_kl',  label: 'KL',   color: '#f87171' }, // red
+  { key: 'loss_fm',  label: 'FM',   color: '#34d399' }, // emerald
+  { key: 'loss_gen', label: 'Gen',  color: '#a78bfa' }, // violet
+  { key: 'loss_mel', label: 'Mel',  color: '#06b6d4' }, // cyan — top (most important)
 ] as const;
 
+// Custom tooltip: shows epoch, all component values, total gen loss, disc loss
+function ChartTooltip({ active, payload, label }: {
+  active?: boolean;
+  payload?: Array<{ name: string; value: number; color: string; dataKey: string }>;
+  label?: number;
+}) {
+  if (!active || !payload?.length) return null;
+
+  // Collect component values from stacked areas
+  const vals: Record<string, number> = {};
+  for (const entry of payload) {
+    vals[entry.dataKey] = entry.value ?? 0;
+  }
+  const total = GEN_STACK.reduce((s, g) => s + (vals[g.key] ?? 0), 0);
+  const disc  = vals['loss_disc'] ?? null;
+
+  return (
+    <div className="bg-zinc-900/95 border border-zinc-700 rounded-md px-3 py-2 font-mono text-[10px] shadow-xl min-w-[140px]">
+      <div className="text-zinc-400 mb-1.5">epoch {label}</div>
+      {GEN_STACK.slice().reverse().map(g => vals[g.key] != null && (
+        <div key={g.key} className="flex justify-between gap-4">
+          <span style={{ color: g.color }}>{g.label}</span>
+          <span className="text-zinc-300">{(vals[g.key] ?? 0).toFixed(3)}</span>
+        </div>
+      ))}
+      <div className="border-t border-zinc-700 mt-1 pt-1 flex justify-between gap-4">
+        <span className="text-white font-semibold">Total Gen</span>
+        <span className="text-white font-semibold">{total.toFixed(3)}</span>
+      </div>
+      {disc != null && (
+        <div className="flex justify-between gap-4 mt-0.5">
+          <span style={{ color: '#f59e0b' }}>Disc</span>
+          <span className="text-zinc-300">{disc.toFixed(3)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LossChart({ points, totalEpochs: totalEpochsProp }: { points: EpochPoint[]; totalEpochs?: number }) {
+  // Which generator components are visible (all on by default)
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
+
+  const toggle = (key: string) =>
+    setHidden(prev => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+
   if (points.length < 2) {
     return (
       <div className="h-36 flex items-center justify-center text-zinc-600 font-mono text-[11px]">
@@ -131,85 +195,195 @@ function LossChart({ points, totalEpochs: totalEpochsProp }: { points: EpochPoin
   }
 
   const totalEpochs = totalEpochsProp ?? Math.max(...points.map(p => p.epoch));
+  const currentEpoch = points[points.length - 1].epoch;
 
-  const W = 560; // viewBox width
-  const H = 120; // viewBox height
-  const PAD = { top: 8, right: 8, bottom: 20, left: 38 };
-  const plotW = W - PAD.left - PAD.right;
-  const plotH = H - PAD.top - PAD.bottom;
+  // Build data array for Recharts — one object per epoch point
+  const data = points.map(p => ({
+    epoch:     p.epoch,
+    loss_mel:  hidden.has('loss_mel')  ? 0 : (p.loss_mel  ?? 0),
+    loss_gen:  hidden.has('loss_gen')  ? 0 : (p.loss_gen  ?? 0),
+    loss_fm:   hidden.has('loss_fm')   ? 0 : (p.loss_fm   ?? 0),
+    loss_kl:   hidden.has('loss_kl')   ? 0 : (p.loss_kl   ?? 0),
+    loss_spk:  hidden.has('loss_spk')  ? 0 : (p.loss_spk  ?? 0),
+    loss_disc: p.loss_disc ?? 0,
+  }));
 
-  // Compute per-series paths
-  function polyline(key: string, color: string) {
-    const vals = points.map(p => p[key as keyof EpochPoint] as number);
-    const allVals = LOSS_SERIES.flatMap(s => points.map(p => p[s.key as keyof EpochPoint] as number));
-    const yMin = Math.min(...allVals) * 0.97;
-    const yMax = Math.max(...allVals) * 1.03;
-    const xScale = (i: number) => PAD.left + (i / (points.length - 1)) * plotW;
-    const yScale = (v: number) => PAD.top + (1 - (v - yMin) / (yMax - yMin)) * plotH;
-    const pts = vals.map((v, i) => `${xScale(i).toFixed(1)},${yScale(v).toFixed(1)}`).join(' ');
-    return <polyline key={key} points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" opacity="0.9" />;
-  }
+  // Latest values for the status row
+  const last  = points[points.length - 1];
+  const first = points[0];
+  const totalLast  = GEN_STACK.reduce((s, g) => s + (last[g.key as keyof EpochPoint]  as number ?? 0), 0);
+  const totalFirst = GEN_STACK.reduce((s, g) => s + (first[g.key as keyof EpochPoint] as number ?? 0), 0);
 
-  // Y-axis ticks
-  const allVals = LOSS_SERIES.flatMap(s => points.map(p => p[s.key as keyof EpochPoint] as number));
-  const yMin = Math.min(...allVals) * 0.97;
-  const yMax = Math.max(...allVals) * 1.03;
-  const yTicks = [yMax, (yMax + yMin) / 2, yMin];
-  const yScale = (v: number) => PAD.top + (1 - (v - yMin) / (yMax - yMin)) * plotH;
-
-  // X-axis ticks (epochs)
-  const xScale = (i: number) => PAD.left + (i / Math.max(totalEpochs - 1, points.length - 1)) * plotW;
-  const epochTicks = [1, Math.round(totalEpochs / 2), totalEpochs];
+  const axisStyle = { fontSize: 9, fontFamily: 'monospace', fill: '#71717a' };
 
   return (
-    <div>
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" style={{ overflow: 'visible' }}>
-        {/* Grid lines */}
-        {yTicks.map((v, i) => (
-          <g key={i}>
-            <line x1={PAD.left} x2={W - PAD.right} y1={yScale(v)} y2={yScale(v)}
-              stroke="#3f3f46" strokeWidth="0.5" strokeDasharray="3,3" />
-            <text x={PAD.left - 5} y={yScale(v) + 4} textAnchor="end"
-              fill="#71717a" fontSize="9" fontFamily="monospace">
-              {v.toFixed(1)}
-            </text>
-          </g>
-        ))}
-        {/* X-axis epoch markers */}
-        {epochTicks.map(ep => (
-          <text key={ep} x={xScale(ep - 1)} y={H - 4} textAnchor="middle"
-            fill="#52525b" fontSize="9" fontFamily="monospace">
-            {ep}
-          </text>
-        ))}
-        {/* Current epoch progress line */}
-        {points.length < totalEpochs && (
-          <line x1={xScale(points.length - 1)} x2={xScale(points.length - 1)}
-            y1={PAD.top} y2={PAD.top + plotH}
-            stroke="#52525b" strokeWidth="0.75" strokeDasharray="2,2" />
-        )}
-        {/* Series lines */}
-        {LOSS_SERIES.map(s => polyline(s.key, s.color))}
-      </svg>
+    <div className="flex flex-col gap-3">
 
-      {/* Legend + latest values */}
-      <div className="flex flex-wrap gap-x-4 gap-y-1 mt-1">
-        {LOSS_SERIES.map(s => {
-          const last = points[points.length - 1][s.key as keyof EpochPoint] as number;
-          const first = points[0][s.key as keyof EpochPoint] as number;
-          const delta = ((last - first) / first) * 100;
-          const down = delta < 0;
+      {/* ── Stacked area: generator components + total envelope ─────────── */}
+      <div>
+        <div className="text-[10px] font-mono text-zinc-500 mb-1 flex items-center gap-2">
+          <span className="text-cyan-400">▲</span> Generator loss
+          <span className="text-zinc-600 ml-1">(stacked — outer edge = total)</span>
+        </div>
+        <ResponsiveContainer width="100%" height={160}>
+          <AreaChart data={data} margin={{ top: 4, right: 8, bottom: 0, left: 32 }}>
+            <defs>
+              {GEN_STACK.map(g => (
+                <linearGradient key={g.key} id={`grad_${g.key}`} x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor={g.color} stopOpacity={0.35} />
+                  <stop offset="95%" stopColor={g.color} stopOpacity={0.05} />
+                </linearGradient>
+              ))}
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
+            <XAxis
+              dataKey="epoch"
+              type="number"
+              domain={[1, totalEpochs]}
+              tickCount={3}
+              tick={axisStyle}
+              tickLine={false}
+              axisLine={{ stroke: '#3f3f46' }}
+            />
+            <YAxis
+              tick={axisStyle}
+              tickLine={false}
+              axisLine={false}
+              tickFormatter={(v: number) => v.toFixed(1)}
+              width={30}
+            />
+            <Tooltip content={<ChartTooltip />} />
+            {/* Progress marker: where training currently is */}
+            {currentEpoch < totalEpochs && (
+              <ReferenceLine
+                x={currentEpoch}
+                stroke="#52525b"
+                strokeDasharray="3 3"
+                strokeWidth={1}
+              />
+            )}
+            {/* Stack order: spk → kl → fm → gen → mel (mel on top, most visible) */}
+            {GEN_STACK.map(g => (
+              <Area
+                key={g.key}
+                type="monotone"
+                dataKey={g.key}
+                stackId="gen"
+                stroke={hidden.has(g.key) ? 'transparent' : g.color}
+                strokeWidth={hidden.has(g.key) ? 0 : 1.5}
+                fill={hidden.has(g.key) ? 'transparent' : `url(#grad_${g.key})`}
+                isAnimationActive={false}
+              />
+            ))}
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* ── Discriminator line ───────────────────────────────────────────── */}
+      <div>
+        <div className="text-[10px] font-mono text-zinc-500 mb-1 flex items-center gap-2">
+          <span className="text-amber-400">─</span> Discriminator loss
+          <span className="text-zinc-600 ml-1">(separate scale)</span>
+        </div>
+        <ResponsiveContainer width="100%" height={60}>
+          <LineChart data={data} margin={{ top: 2, right: 8, bottom: 0, left: 32 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
+            <XAxis
+              dataKey="epoch"
+              type="number"
+              domain={[1, totalEpochs]}
+              tickCount={3}
+              tick={axisStyle}
+              tickLine={false}
+              axisLine={{ stroke: '#3f3f46' }}
+            />
+            <YAxis
+              tick={axisStyle}
+              tickLine={false}
+              axisLine={false}
+              tickFormatter={(v: number) => v.toFixed(1)}
+              width={30}
+            />
+            <Tooltip content={<ChartTooltip />} />
+            {currentEpoch < totalEpochs && (
+              <ReferenceLine x={currentEpoch} stroke="#52525b" strokeDasharray="3 3" strokeWidth={1} />
+            )}
+            <Line
+              type="monotone"
+              dataKey="loss_disc"
+              stroke="#f59e0b"
+              strokeWidth={1.5}
+              dot={false}
+              isAnimationActive={false}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* ── Clickable legend + last-value status row ─────────────────────── */}
+      <div className="flex flex-wrap gap-x-3 gap-y-1.5">
+        {/* Total gen loss summary (always shown) */}
+        <span className="flex items-center gap-1.5 font-mono text-[10px] mr-2">
+          <span className="inline-block w-3 h-px border-t-2 border-dashed border-zinc-400" />
+          <span className="text-zinc-300 font-semibold">Total</span>
+          <span className="text-zinc-200 font-semibold">{totalLast.toFixed(3)}</span>
+          {(() => {
+            const delta = ((totalLast - totalFirst) / Math.max(totalFirst, 1e-9)) * 100;
+            return (
+              <span className={delta < 0 ? 'text-emerald-400' : 'text-red-400'}>
+                {delta < 0 ? '↓' : '↑'}{Math.abs(delta).toFixed(0)}%
+              </span>
+            );
+          })()}
+        </span>
+
+        {/* Per-component toggle buttons */}
+        {GEN_STACK.slice().reverse().map(g => {
+          const lv  = last[g.key as keyof EpochPoint]  as number ?? 0;
+          const fv  = first[g.key as keyof EpochPoint] as number ?? 0;
+          const pct = fv > 0 ? ((lv - fv) / fv) * 100 : 0;
+          const off = hidden.has(g.key);
           return (
-            <span key={s.key} className="flex items-center gap-1.5 font-mono text-[10px]">
-              <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: s.color }} />
-              <span style={{ color: s.color }}>{s.label}</span>
-              <span className="text-zinc-300">{last.toFixed(2)}</span>
-              <span className={down ? 'text-emerald-400' : 'text-red-400'}>
-                {down ? '↓' : '↑'}{Math.abs(delta).toFixed(0)}%
+            <button
+              key={g.key}
+              onClick={() => toggle(g.key)}
+              className="flex items-center gap-1.5 font-mono text-[10px] rounded px-1.5 py-0.5
+                         hover:bg-zinc-800 transition-colors cursor-pointer"
+              title={off ? `Show ${g.label}` : `Hide ${g.label}`}
+            >
+              <span
+                className="inline-block w-3 h-1.5 rounded-sm transition-opacity"
+                style={{ backgroundColor: g.color, opacity: off ? 0.25 : 1 }}
+              />
+              <span style={{ color: off ? '#52525b' : g.color }}>{g.label}</span>
+              {!off && (
+                <>
+                  <span className="text-zinc-400">{lv.toFixed(3)}</span>
+                  <span className={pct < 0 ? 'text-emerald-400' : 'text-red-400'}>
+                    {pct < 0 ? '↓' : '↑'}{Math.abs(pct).toFixed(0)}%
+                  </span>
+                </>
+              )}
+            </button>
+          );
+        })}
+
+        {/* Discriminator (not toggleable — separate chart) */}
+        {(() => {
+          const lv  = last.loss_disc  ?? 0;
+          const fv  = first.loss_disc ?? 0;
+          const pct = fv > 0 ? ((lv - fv) / fv) * 100 : 0;
+          return (
+            <span className="flex items-center gap-1.5 font-mono text-[10px]">
+              <span className="inline-block w-3 h-0.5 rounded-full bg-amber-400" />
+              <span className="text-amber-400">Disc</span>
+              <span className="text-zinc-400">{lv.toFixed(3)}</span>
+              <span className={pct < 0 ? 'text-emerald-400' : 'text-red-400'}>
+                {pct < 0 ? '↓' : '↑'}{Math.abs(pct).toFixed(0)}%
               </span>
             </span>
           );
-        })}
+        })()}
       </div>
     </div>
   );
@@ -274,7 +448,8 @@ function BatchSizeSelector({
         {hw && (
           <span className="text-[10px] font-mono text-zinc-500">
             {hw.total_ram_gb} GB RAM · {hw.available_ram_gb} GB free
-            {hw.mps_available && ' · MPS ✓'}
+            {hw.cuda_available && ` · CUDA ✓${hw.gpu_name ? ` (${hw.gpu_name}` : ''}${hw.gpu_vram_gb ? `, ${hw.gpu_vram_gb} GB VRAM` : ''}${hw.gpu_name || hw.gpu_vram_gb ? ')' : ''}`}
+            {!hw.cuda_available && hw.mps_available && ' · MPS ✓'}
           </span>
         )}
       </div>
@@ -383,6 +558,7 @@ export default function TrainingPage() {
   const [epochs, setEpochs] = useState(50);
   const [batchSize, setBatchSize] = useState(8);
   const [overtrainThreshold, setOvertrainThreshold] = useState(0);
+  const [speakerLossWeight, setSpeakerLossWeight] = useState(2);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
 
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -417,6 +593,7 @@ export default function TrainingPage() {
           loss_disc: r.loss_disc ?? 0,
           loss_fm:   r.loss_fm   ?? 0,
           loss_kl:   r.loss_kl   ?? 0,
+          loss_spk:  r.loss_spk  ?? 0,
         })));
       })
       .catch(() => { if (!cancelled) setEpochPoints([]); });
@@ -452,6 +629,7 @@ export default function TrainingPage() {
               loss_disc: l.loss_disc ?? 0,
               loss_fm:   l.loss_fm   ?? 0,
               loss_kl:   l.loss_kl   ?? 0,
+              loss_spk:  l.loss_spk  ?? 0,
             }]);
           }
         } else if (msg.type === 'done') {
@@ -583,7 +761,7 @@ export default function TrainingPage() {
       const res = await fetch(`${API}/api/training/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainThreshold }),
+        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainThreshold, c_spk: speakerLossWeight }),
       });
 
       if (res.status === 409) {
@@ -750,30 +928,58 @@ export default function TrainingPage() {
               />
             </div>
 
-            {/* Overtraining threshold */}
+            {/* Overtraining Stop + Speaker Loss Weight — same row */}
             <div className="border-t border-zinc-800/60 pt-4">
-              <div className="flex flex-col gap-2 max-w-xs">
-                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
-                  <span className="text-amber-400">⚠</span> Overtraining Stop
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="number" value={overtrainThreshold} min={0} max={200}
-                    disabled={isRunning}
-                    onChange={(e) => setOvertrainThreshold(Math.max(0, Math.min(200, Number(e.target.value))))}
-                    className="w-24 bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
-                               font-mono text-zinc-200 focus:outline-none focus:border-amber-600
-                               disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
-                  />
-                  <span className="text-[11px] font-mono text-zinc-500">
-                    {overtrainThreshold === 0
-                      ? 'disabled'
-                      : `stop after ${overtrainThreshold} epoch${overtrainThreshold !== 1 ? 's' : ''} without improvement`}
+              <div className="flex flex-wrap gap-x-8 gap-y-4">
+
+                {/* Overtraining Stop */}
+                <div className="flex flex-col gap-2">
+                  <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
+                    <span className="text-amber-400">⚠</span> Overtraining Stop
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number" value={overtrainThreshold} min={0} max={200}
+                      disabled={isRunning}
+                      onChange={(e) => setOvertrainThreshold(Math.max(0, Math.min(200, Number(e.target.value))))}
+                      className="w-24 bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
+                                 font-mono text-zinc-200 focus:outline-none focus:border-amber-600
+                                 disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
+                    />
+                    <span className="text-[11px] font-mono text-zinc-500">
+                      {overtrainThreshold === 0
+                        ? 'disabled'
+                        : `stop after ${overtrainThreshold} epoch${overtrainThreshold !== 1 ? 's' : ''} without improvement`}
+                    </span>
+                  </div>
+                  <span className="text-[10px] font-mono text-zinc-600">
+                    0 = run all epochs · recommended: 10–20 for fine-tuning
                   </span>
                 </div>
-                <span className="text-[10px] font-mono text-zinc-600">
-                  0 = run all epochs · recommended: 10–20 for fine-tuning
-                </span>
+
+                {/* Speaker Loss Weight */}
+                <div className="flex flex-col gap-2 min-w-[180px]">
+                  <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
+                    <span className="text-pink-400">🎤</span> Speaker Loss Weight (c_spk)
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range" value={speakerLossWeight} min={0} max={3} step={0.5}
+                      disabled={isRunning}
+                      onChange={(e) => setSpeakerLossWeight(Number(e.target.value))}
+                      className="flex-1 accent-pink-600"
+                    />
+                    <span className="text-[13px] font-mono text-pink-300 w-8 text-right">
+                      {speakerLossWeight === 0 ? 'off' : speakerLossWeight.toFixed(1)}
+                    </span>
+                  </div>
+                  <span className="text-[10px] font-mono text-zinc-600">
+                    {speakerLossWeight === 0
+                      ? 'disabled — no speaker identity loss'
+                      : `ECAPA-TDNN cosine loss · recommended: 2.0–3.0 for voice cloning`}
+                  </span>
+                </div>
+
               </div>
             </div>
 
@@ -905,6 +1111,11 @@ export default function TrainingPage() {
             title: 'RefineGAN vs HiFi-GAN',
             body: 'RefineGAN produces crisper, more detailed speech at the cost of slightly longer training time. For quick experiments, HiFi-GAN converges faster and is more forgiving.',
           },
+          {
+            icon: '🎤',
+            title: 'Speaker Loss (ECAPA-TDNN) for better voice cloning',
+            body: 'The training pipeline now includes an optional speaker identity loss using ECAPA-TDNN. Set c_spk > 0 in the training config to activate it. This loss directly optimises for speaker similarity, making the cloned voice sound more like the target speaker. Recommended weight: 1.0–3.0.',
+          },
         ]} />
 
         {/* Loss reference */}
@@ -948,6 +1159,14 @@ export default function TrainingPage() {
             what: 'The Kullback–Leibler divergence between the posterior (encoder\'s estimate of the latent from real audio) and the prior (the model\'s prior over the latent space). This regularises the latent space so it stays smooth and continuous, which prevents the decoder from memorising training examples instead of learning to generalise.',
             healthy: 'Decreases quickly and stays low (< 2.0) throughout training. Once it has settled it should barely move.',
             warning: 'A climbing KL loss late in training can indicate the model is over-regularising and losing expressiveness. In practice this is rare — KL loss is usually the most stable of the five signals.',
+          },
+          {
+            key: 'loss_spk',
+            color: '#ec4899',
+            name: 'Speaker Loss',
+            what: 'Cosine distance between ECAPA-TDNN speaker embeddings of generated vs. real audio. This loss directly optimises for speaker identity preservation — forcing the cloned voice to sound like the target speaker, not just phonetically correct. Uses the converted ecapa_tdnn.pt model (assets/ecapa/). Only active when c_spk > 0 in the training config.',
+            healthy: 'Should decrease steadily toward 0. Values below 0.3 indicate strong speaker identity match. The ECAPA-TDNN encoder is frozen and only provides reference embeddings — it does not add trainable parameters.',
+            warning: 'If speaker loss stays high while other losses are good, the model is learning content but not speaker identity — consider increasing c_spk weight. If speaker loss drops but audio quality degrades, the weight may be too high and conflicting with mel loss.',
           },
         ]} />
 

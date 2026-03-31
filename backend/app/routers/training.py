@@ -34,15 +34,14 @@ ws_router = APIRouter(tags=["training"])
 # Request / Response models
 # ---------------------------------------------------------------------------
 
+
 class StartTrainingRequest(BaseModel):
     profile_id: str
     epochs: int = 200
     save_every: int = 10
     batch_size: int = 8
-    # Overtraining detection: stop when gen loss doesn't improve for N consecutive
-    # epochs. 0 = disabled. Stored on the profile for display but the threshold
-    # itself is passed per-run so the user can adjust without retraining.
     overtrain_threshold: int = 0
+    c_spk: float = 2.0
 
 
 class CancelTrainingRequest(BaseModel):
@@ -67,6 +66,7 @@ class EpochLossPoint(BaseModel):
     loss_disc: Optional[float] = None
     loss_fm: Optional[float] = None
     loss_kl: Optional[float] = None
+    loss_spk: Optional[float] = None
     trained_at: str
 
 
@@ -77,6 +77,9 @@ class HardwareInfo(BaseModel):
     cpu_cores: int
     mps_available: bool
     mps_allocated_mb: float
+    cuda_available: bool = False
+    gpu_name: Optional[str] = None
+    gpu_vram_gb: Optional[float] = None
     sweet_spot_batch_size: int
     max_safe_batch_size: int
 
@@ -85,28 +88,41 @@ class HardwareInfo(BaseModel):
 # GET /api/training/hardware
 # ---------------------------------------------------------------------------
 
+
 @router.get("/hardware", response_model=HardwareInfo)
 async def get_hardware() -> HardwareInfo:
     """Return live hardware metrics and recommended batch size sweet spot.
 
-    Sweet spot heuristic for Apple Silicon MPS:
-      - RVC v2 training with 48k keeps roughly 1.5 GB per batch in unified mem
-        (model params ~500 MB + feature cache + gradients + activations)
-      - Reserve 40% of total RAM for OS + frontend + backend processes
-      - sweet_spot = floor((total_ram * 0.60) / 1.5)  clamped to [1, 32]
+    Batch size heuristics (all must be powers of two):
+      - CUDA:  VRAM is the bottleneck.  ~1.0 GB per batch at 32k v2.
+               sweet_spot = floor(vram_gb * 0.70 / 1.0)
+      - MPS:   unified memory — RAM is the pool. ~1.5 GB per batch.
+               sweet_spot = floor(total_ram * 0.60 / 1.5)
+      - CPU:   conservative — no GPU acceleration, fixed at 1.
     """
     import psutil  # noqa: PLC0415
-    import torch   # noqa: PLC0415
+    import torch  # noqa: PLC0415
 
     mem = psutil.virtual_memory()
-    total_gb = mem.total / 1024 ** 3
-    avail_gb = mem.available / 1024 ** 3
+    total_gb = mem.total / 1024**3
+    avail_gb = mem.available / 1024**3
 
     mps_available = torch.backends.mps.is_available()
     mps_alloc_mb = 0.0
     if mps_available:
         try:
-            mps_alloc_mb = torch.mps.current_allocated_memory() / 1024 ** 2
+            mps_alloc_mb = torch.mps.current_allocated_memory() / 1024**2
+        except Exception:
+            pass
+
+    cuda_available = torch.cuda.is_available()
+    gpu_name: Optional[str] = None
+    gpu_vram_gb: Optional[float] = None
+    if cuda_available:
+        try:
+            props = torch.cuda.get_device_properties(0)
+            gpu_name = props.name
+            gpu_vram_gb = round(props.total_memory / 1024**3, 1)
         except Exception:
             pass
 
@@ -122,11 +138,19 @@ async def get_hardware() -> HardwareInfo:
                 best = p
         return best
 
-    # Sweet spot: 60% of total RAM, ~1.5 GB per batch (model + grads + cache)
-    sweet_spot = nearest_pow2(total_gb * 0.60 / 1.5)
-
-    # Max safe: 80% of *currently available* RAM — must be ≥ sweet_spot
-    max_safe = max(sweet_spot, nearest_pow2(avail_gb * 0.80 / 1.5))
+    if cuda_available and gpu_vram_gb:
+        # CUDA: VRAM is the hard limit (~1.0 GB/batch for 32k v2 at fp16)
+        sweet_spot = nearest_pow2(gpu_vram_gb * 0.70 / 1.0)
+        max_safe   = nearest_pow2(gpu_vram_gb * 0.85 / 1.0)
+        max_safe   = max(sweet_spot, max_safe)
+    elif mps_available:
+        # MPS unified memory: RAM is the pool (~1.5 GB/batch at fp32)
+        sweet_spot = nearest_pow2(total_gb * 0.60 / 1.5)
+        max_safe   = max(sweet_spot, nearest_pow2(avail_gb * 0.80 / 1.5))
+    else:
+        # CPU-only: single batch to avoid RAM exhaustion
+        sweet_spot = 1
+        max_safe   = 1
 
     return HardwareInfo(
         total_ram_gb=round(total_gb, 1),
@@ -135,6 +159,9 @@ async def get_hardware() -> HardwareInfo:
         cpu_cores=psutil.cpu_count(logical=False) or 1,
         mps_available=mps_available,
         mps_allocated_mb=round(mps_alloc_mb, 1),
+        cuda_available=cuda_available,
+        gpu_name=gpu_name,
+        gpu_vram_gb=gpu_vram_gb,
         sweet_spot_batch_size=sweet_spot,
         max_safe_batch_size=max_safe,
     )
@@ -143,6 +170,7 @@ async def get_hardware() -> HardwareInfo:
 # ---------------------------------------------------------------------------
 # POST /api/training/start
 # ---------------------------------------------------------------------------
+
 
 @router.post("/start", response_model=StartTrainingResponse)
 async def start_training(request: StartTrainingRequest) -> StartTrainingResponse:
@@ -168,7 +196,9 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
         row = await cursor.fetchone()
 
     if row is None:
-        raise HTTPException(status_code=404, detail=f"Profile not found: {request.profile_id}")
+        raise HTTPException(
+            status_code=404, detail=f"Profile not found: {request.profile_id}"
+        )
 
     project_root = os.environ.get("PROJECT_ROOT", "")
     if not project_root:
@@ -202,14 +232,17 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     except OSError:
         wav_files = []
     if not wav_files:
-        raise HTTPException(status_code=400, detail="No audio files found in profile — add audio before training")
+        raise HTTPException(
+            status_code=400,
+            detail="No audio files found in profile — add audio before training",
+        )
 
     # Request batch_size always wins over the profile's stored default.
     # Persist it back so the DB stays in sync with what was actually used.
     batch_size = request.batch_size
     # Read embedder and vocoder from profile (both locked after first training run).
     profile_embedder = str(row["embedder"]) if row["embedder"] else "spin-v2"
-    profile_vocoder  = str(row["vocoder"])  if row["vocoder"]  else "HiFi-GAN"
+    profile_vocoder = str(row["vocoder"]) if row["vocoder"] else "HiFi-GAN"
     async with get_db() as db:
         await db.execute(
             "UPDATE profiles SET batch_size = ?, overtrain_threshold = ? WHERE id = ?",
@@ -231,16 +264,19 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
             embedder=profile_embedder,
             overtrain_threshold=int(request.overtrain_threshold or 0),
             vocoder=profile_vocoder,
+            c_spk=request.c_spk,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     logger.info(
-        json.dumps({
-            "event": "training_start",
-            "profile_id": request.profile_id,
-            "job_id": job.job_id,
-        })
+        json.dumps(
+            {
+                "event": "training_start",
+                "profile_id": request.profile_id,
+                "job_id": job.job_id,
+            }
+        )
     )
 
     return StartTrainingResponse(job_id=job.job_id)
@@ -249,6 +285,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
 # ---------------------------------------------------------------------------
 # POST /api/training/cancel
 # ---------------------------------------------------------------------------
+
 
 @router.post("/cancel")
 async def cancel_training(request: CancelTrainingRequest) -> dict:
@@ -277,6 +314,7 @@ async def cancel_training(request: CancelTrainingRequest) -> dict:
 # ---------------------------------------------------------------------------
 # GET /api/training/status/{profile_id}
 # ---------------------------------------------------------------------------
+
 
 @router.get("/status/{profile_id}", response_model=StatusResponse)
 async def get_status(profile_id: str) -> StatusResponse:
@@ -307,6 +345,7 @@ async def get_status(profile_id: str) -> StatusResponse:
 # GET /api/training/losses/{profile_id}
 # ---------------------------------------------------------------------------
 
+
 @router.get("/losses/{profile_id}", response_model=list[EpochLossPoint])
 async def get_losses(profile_id: str) -> list[EpochLossPoint]:
     """Return all persisted epoch losses for a profile, ordered by epoch.
@@ -316,7 +355,7 @@ async def get_losses(profile_id: str) -> list[EpochLossPoint]:
     """
     async with get_db() as db:
         cursor = await db.execute(
-            """SELECT epoch, loss_mel, loss_gen, loss_disc, loss_fm, loss_kl, trained_at
+            """SELECT epoch, loss_mel, loss_gen, loss_disc, loss_fm, loss_kl, loss_spk, trained_at
                FROM epoch_losses
                WHERE profile_id = ?
                ORDER BY epoch ASC""",
@@ -331,6 +370,7 @@ async def get_losses(profile_id: str) -> list[EpochLossPoint]:
             loss_disc=r["loss_disc"],
             loss_fm=r["loss_fm"],
             loss_kl=r["loss_kl"],
+            loss_spk=r["loss_spk"],
             trained_at=r["trained_at"],
         )
         for r in rows
@@ -339,6 +379,7 @@ async def get_losses(profile_id: str) -> list[EpochLossPoint]:
 
 # WS /ws/training/{profile_id}  (registered on ws_router, no prefix)
 # ---------------------------------------------------------------------------
+
 
 @ws_router.websocket("/ws/training/{profile_id}")
 async def training_websocket(websocket: WebSocket, profile_id: str) -> None:
@@ -364,11 +405,13 @@ async def training_websocket(websocket: WebSocket, profile_id: str) -> None:
         await asyncio.sleep(0.1)
 
     if job is None:
-        await websocket.send_json({
-            "type": "error",
-            "message": "job not found",
-            "phase": "idle",
-        })
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "job not found",
+                "phase": "idle",
+            }
+        )
         await websocket.close()
         return
 
@@ -385,21 +428,25 @@ async def training_websocket(websocket: WebSocket, profile_id: str) -> None:
                 if job.status in ("trained", "failed") and job.queue.empty():
                     # Job is done; send appropriate terminal message and stop
                     if job.status == "failed":
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": job.error or "Training failed",
-                            "phase": job.phase,
-                        })
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "message": job.error or "Training failed",
+                                "phase": job.phase,
+                            }
+                        )
                     else:
                         await websocket.send_json({"type": "done", "phase": job.phase})
                     break
                 # Still running — send a silent keepalive so the browser WS
                 # doesn't time out. No message: frontend skips it.
-                await websocket.send_json({
-                    "type": "keepalive",
-                    "phase": job.phase,
-                    "elapsed_s": int(time.monotonic() - ws_start),
-                })
+                await websocket.send_json(
+                    {
+                        "type": "keepalive",
+                        "phase": job.phase,
+                        "elapsed_s": int(time.monotonic() - ws_start),
+                    }
+                )
                 continue
 
             await websocket.send_json(msg)
@@ -408,9 +455,10 @@ async def training_websocket(websocket: WebSocket, profile_id: str) -> None:
                 break
     except WebSocketDisconnect:
         logger.info(
-            json.dumps({
-                "event": "ws_disconnect",
-                "profile_id": profile_id,
-            })
+            json.dumps(
+                {
+                    "event": "ws_disconnect",
+                    "profile_id": profile_id,
+                }
+            )
         )
-

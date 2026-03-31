@@ -1,72 +1,187 @@
 #!/usr/bin/env bash
+# start.sh — cross-platform startup for rvc-web
+# Supports: macOS (MPS), Linux (CUDA or CPU), Windows (Git Bash / MSYS2)
 set -euo pipefail
 
 # Anchor to rvc-web/ regardless of where the script is called from
 cd "$(dirname "$0")"
 
-# Kill any process on the given port
+# ---------------------------------------------------------------------------
+# 1. Detect OS
+# ---------------------------------------------------------------------------
+OS_TYPE="$(uname -s 2>/dev/null || echo "Windows")"
+case "$OS_TYPE" in
+  Darwin)  PLATFORM="mac"     ;;
+  Linux)   PLATFORM="linux"   ;;
+  MINGW*|MSYS*|CYGWIN*) PLATFORM="windows" ;;
+  *)       PLATFORM="linux"   ;;  # WSL, BSD — treat as linux
+esac
+echo "[start] Platform: $PLATFORM ($OS_TYPE)"
+
+# ---------------------------------------------------------------------------
+# 2. Detect available compute device
+#    Priority: CUDA > MPS > CPU
+#    Exports RVC_DEVICE so Python subprocesses can read it.
+# ---------------------------------------------------------------------------
+if python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+  export RVC_DEVICE="cuda"
+elif python -c "import torch; exit(0 if torch.backends.mps.is_available() else 1)" 2>/dev/null; then
+  export RVC_DEVICE="mps"
+else
+  export RVC_DEVICE="cpu"
+fi
+echo "[start] Compute device: $RVC_DEVICE"
+
+# ---------------------------------------------------------------------------
+# 3. Universal threading env vars (all platforms)
+#    Prevents faiss + fairseq OpenMP collision.
+# ---------------------------------------------------------------------------
+export KMP_DUPLICATE_LIB_OK=TRUE
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+# ---------------------------------------------------------------------------
+# 4. Platform-specific PyTorch tuning
+# ---------------------------------------------------------------------------
+if [ "$RVC_DEVICE" = "mps" ]; then
+  # MPS: disable memory cap so unified memory is fully usable;
+  # prefer shared memory for cheaper host-device transfers
+  export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
+  export PYTORCH_MPS_PREFER_SHARED_MEMORY=1
+  export PYTORCH_ENABLE_MPS_FALLBACK=1
+  echo "[start] MPS tuning applied"
+elif [ "$RVC_DEVICE" = "cuda" ]; then
+  # CUDA: set visible devices if not already set by caller
+  if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    export CUDA_VISIBLE_DEVICES=0
+    echo "[start] CUDA_VISIBLE_DEVICES defaulted to 0 (set externally to override)"
+  else
+    echo "[start] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (from environment)"
+  fi
+  export PYTORCH_ENABLE_MPS_FALLBACK=0
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Kill stale processes — cross-platform
+# ---------------------------------------------------------------------------
 kill_port() {
   local port=$1
-  local pids
-  pids=$(lsof -ti:"$port" 2>/dev/null) || true
-  if [ -n "$pids" ]; then
-    echo "[start] Killing stale process(es) on port $port..."
-    echo "$pids" | xargs kill -9 2>/dev/null || true
-    sleep 1
+  if command -v lsof >/dev/null 2>&1; then
+    local pids
+    pids=$(lsof -ti:"$port" 2>/dev/null) || true
+    if [ -n "$pids" ]; then
+      echo "[start] Killing stale process(es) on port $port..."
+      echo "$pids" | xargs kill -9 2>/dev/null || true
+      sleep 1
+    fi
+  else
+    # Fallback: Python-based port kill (works on Windows Git Bash)
+    python - "$port" <<'PYEOF' 2>/dev/null || true
+import sys, subprocess
+port = sys.argv[1]
+try:
+    out = subprocess.check_output(
+        ["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL
+    )
+    for line in out.splitlines():
+        if f":{port}" in line and "LISTENING" in line:
+            parts = line.split()
+            pid = parts[-1]
+            if pid.isdigit():
+                subprocess.run(["taskkill", "/F", "/PID", pid],
+                               capture_output=True)
+except Exception:
+    pass
+PYEOF
   fi
 }
 
-# Kill any running next dev process (handles .next/dev/lock conflicts)
 kill_next_dev() {
-  local pids
-  pids=$(pgrep -f "next dev" 2>/dev/null) || true
-  if [ -n "$pids" ]; then
-    echo "[start] Killing stale next dev process(es)..."
-    echo "$pids" | xargs kill -9 2>/dev/null || true
-    sleep 1
+  if command -v pgrep >/dev/null 2>&1; then
+    local pids
+    pids=$(pgrep -f "next dev" 2>/dev/null) || true
+    if [ -n "$pids" ]; then
+      echo "[start] Killing stale next dev process(es)..."
+      echo "$pids" | xargs kill -9 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+}
+
+kill_dangling() {
+  if command -v pgrep >/dev/null 2>&1; then
+    local pids
+    pids=$(pgrep -f "train\.py\|spawn_main\|_realtime_worker\|extract_f0_print\|extract_feature_print\|preprocess\.py" 2>/dev/null) || true
+    if [ -n "$pids" ]; then
+      echo "[start] Killing dangling training/inference processes..."
+      echo "$pids" | xargs kill -9 2>/dev/null || true
+      sleep 1
+    fi
   fi
 }
 
 kill_port 8000
 kill_port 3000
 kill_next_dev
-
-# Kill any dangling training or inference processes
-kill_dangling() {
-  local pids
-  pids=$(pgrep -f "train\.py\|spawn_main\|_realtime_worker\|extract_f0_print\|extract_feature_print\|preprocess\.py" 2>/dev/null) || true
-  if [ -n "$pids" ]; then
-    echo "[start] Killing dangling training/inference processes..."
-    echo "$pids" | xargs kill -9 2>/dev/null || true
-    sleep 1
-  fi
-}
 kill_dangling
 
-mkdir -p .pids
-mkdir -p logs
-mkdir -p data/profiles
+mkdir -p .pids logs data/profiles
 
-# PROJECT_ROOT is rvc-web/ — the single source of truth for all path resolution.
-# Replaces the old RVC_ROOT which pointed at the Retrieval-based-Voice-Conversion-WebUI submodule.
+# ---------------------------------------------------------------------------
+# 6. PROJECT_ROOT — single source of truth for all path resolution
+# ---------------------------------------------------------------------------
 export PROJECT_ROOT="$(pwd)"
-
-# Fix libomp duplicate-init crash when PyTorch and system OpenMP both load
-export KMP_DUPLICATE_LIB_OK=TRUE
-# Restrict OMP/MKL/BLAS to single thread — prevents faiss+fairseq OpenMP collision
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-
 echo "[start] PROJECT_ROOT=$PROJECT_ROOT"
-echo "[start] Starting backend (conda rvc env)..."
-KMP_DUPLICATE_LIB_OK=TRUE conda run --no-capture-output -n rvc \
-  uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 &
+
+# ---------------------------------------------------------------------------
+# 7. Print device summary banner
+# ---------------------------------------------------------------------------
+echo "[start] -----------------------------------------------"
+echo "[start] Device summary"
+echo "[start]   OS:      $PLATFORM"
+echo "[start]   Device:  $RVC_DEVICE"
+python - <<'PYEOF' 2>/dev/null || true
+import torch, sys
+d = ""
+if torch.cuda.is_available():
+    props = torch.cuda.get_device_properties(0)
+    vram  = props.total_memory / 1024**3
+    d = f"  GPU:     {props.name}  ({vram:.1f} GB VRAM)"
+elif torch.backends.mps.is_available():
+    import psutil
+    ram = psutil.virtual_memory().total / 1024**3
+    d = f"  MPS:     Apple Silicon  ({ram:.1f} GB unified memory)"
+else:
+    import psutil
+    ram = psutil.virtual_memory().total / 1024**3
+    d = f"  CPU:     {torch.get_num_threads()} threads  ({ram:.1f} GB RAM)"
+print(f"[start] {d}")
+PYEOF
+echo "[start] -----------------------------------------------"
+
+# ---------------------------------------------------------------------------
+# 8. Start backend
+#    Respects RVC_CONDA_ENV (default: rvc) or falls back to plain python
+#    if conda is not in use.
+# ---------------------------------------------------------------------------
+RVC_CONDA_ENV="${RVC_CONDA_ENV:-rvc}"
+
+echo "[start] Starting backend..."
+if command -v conda >/dev/null 2>&1; then
+  KMP_DUPLICATE_LIB_OK=TRUE conda run --no-capture-output -n "$RVC_CONDA_ENV" \
+    uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 &
+else
+  # Plain venv / system python — assumes dependencies are already installed
+  python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 &
+fi
 BACKEND_PID=$!
 echo "$BACKEND_PID" > .pids/backend.pid
 echo "[start] Backend PID $BACKEND_PID"
 
-# Wait for backend to be ready (up to 30s)
+# ---------------------------------------------------------------------------
+# 9. Wait for backend to be ready (up to 30s)
+# ---------------------------------------------------------------------------
 echo "[start] Waiting for backend to be ready..."
 for i in $(seq 1 30); do
   if curl -s http://localhost:8000/health >/dev/null 2>&1; then
@@ -76,6 +191,9 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
+# ---------------------------------------------------------------------------
+# 10. Start frontend
+# ---------------------------------------------------------------------------
 echo "[start] Starting frontend..."
 if [ ! -d "frontend/node_modules" ]; then
   echo "[start] Installing frontend dependencies..."
@@ -86,7 +204,9 @@ FRONTEND_PID=$!
 echo "$FRONTEND_PID" > .pids/frontend.pid
 echo "[start] Frontend PID $FRONTEND_PID"
 
-# Wait for frontend to be ready (up to 60s)
+# ---------------------------------------------------------------------------
+# 11. Wait for frontend (up to 60s)
+# ---------------------------------------------------------------------------
 echo "[start] Waiting for frontend to compile..."
 FRONTEND_URL=""
 for i in $(seq 1 60); do
