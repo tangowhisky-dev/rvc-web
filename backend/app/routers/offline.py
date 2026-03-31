@@ -606,9 +606,9 @@ class AnalysisResponse(BaseModel):
     quality_input: str
     quality_output: str
     summary: str
-    profile_emb_top10: list[float]
-    input_emb_top10: list[float]
-    output_emb_top10: list[float]
+    profile_emb: list[float]
+    input_emb: list[float]
+    output_emb: list[float]
 
 
 @router.post("/analyze", response_model=AnalysisResponse)

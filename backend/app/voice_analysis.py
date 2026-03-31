@@ -158,12 +158,18 @@ def analyze_conversion(
         if isinstance(profile_emb, torch.Tensor):
             profile_emb = profile_emb.cpu().numpy()
     else:
-        # Compute from audio directory
+        # Compute from audio directory — check both root and audio/ subdirectory
         import glob as _glob
 
         wav_files = sorted(_glob.glob(os.path.join(profile_emb_path, "*.wav")))
         if not wav_files:
-            raise FileNotFoundError(f"No WAV files in {profile_emb_path}")
+            # Try audio/ subdirectory
+            audio_subdir = os.path.join(profile_emb_path, "audio")
+            wav_files = sorted(_glob.glob(os.path.join(audio_subdir, "*.wav")))
+        if not wav_files:
+            raise FileNotFoundError(
+                f"No WAV files in {profile_emb_path} or audio/ subdirectory"
+            )
 
         embs = []
         for wav_path in wav_files:
@@ -236,8 +242,8 @@ def analyze_conversion(
         "quality_input": quality_input,
         "quality_output": quality_output,
         "summary": verdict,
-        # Embedding vectors for radar chart (first 10 dimensions)
-        "profile_emb_top10": profile_emb[:10].tolist(),
-        "input_emb_top10": input_emb[:10].tolist(),
-        "output_emb_top10": output_emb[:10].tolist(),
+        # Full embedding vectors for radar chart (all 192 dimensions)
+        "profile_emb": profile_emb.tolist(),
+        "input_emb": input_emb.tolist(),
+        "output_emb": output_emb.tolist(),
     }

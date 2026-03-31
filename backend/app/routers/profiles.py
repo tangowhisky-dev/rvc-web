@@ -60,12 +60,13 @@ router = APIRouter(prefix="/api/profiles", tags=["profiles"])
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 
 # Audio duration constraints (seconds)
-MAX_DURATION_SEC = 30 * 60   # 30 minutes
+MAX_DURATION_SEC = 30 * 60  # 30 minutes
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
+
 
 class AudioFileOut(BaseModel):
     id: str
@@ -86,12 +87,12 @@ class ProfileOut(BaseModel):
     sample_path: str
     batch_size: int = 8
     profile_dir: Optional[str] = None
-    model_path: Optional[str] = None        # inference-ready (~54 MB)
+    model_path: Optional[str] = None  # inference-ready (~54 MB)
     checkpoint_path: Optional[str] = None  # resume checkpoint (~431 MB)
     index_path: Optional[str] = None
     total_epochs_trained: int = 0
     needs_retraining: bool = False
-    profile_rms: Optional[float] = None     # speech-weighted RMS of training data
+    profile_rms: Optional[float] = None  # speech-weighted RMS of training data
     # Embedder model used for feature extraction.  Locked after first training.
     embedder: str = "spin-v2"
     # Vocoder decoder architecture.  Locked after first training.
@@ -107,12 +108,13 @@ class PreprocessResponse(BaseModel):
 
 class HealthStatus(BaseModel):
     """Per-profile file-existence health check result."""
+
     profile_id: str
-    audio_ok: bool            # at least one audio file exists
-    model_ok: bool            # model_infer.pth exists
-    index_ok: bool            # model.index exists
-    can_train: bool           # audio_ok
-    can_infer: bool           # model_ok AND index_ok
+    audio_ok: bool  # at least one audio file exists
+    model_ok: bool  # model_infer.pth exists
+    index_ok: bool  # model.index exists
+    can_train: bool  # audio_ok
+    can_infer: bool  # model_ok AND index_ok
     errors: list[str]
 
 
@@ -120,10 +122,11 @@ class HealthStatus(BaseModel):
 # Directory helpers
 # ---------------------------------------------------------------------------
 
+
 def _project_root() -> str:
     return os.environ.get(
         "PROJECT_ROOT",
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")),
     )
 
 
@@ -165,6 +168,7 @@ def _dedup_filename(audio_dir: str, stem: str, ext: str = ".wav") -> str:
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
+
 
 def _audio_file_row_to_out(row) -> AudioFileOut:
     return AudioFileOut(
@@ -248,11 +252,21 @@ async def _row_to_out(row, db) -> ProfileOut:
         model_path=_resolve_model_path(row),
         checkpoint_path=_resolve_checkpoint_path(row),
         index_path=_resolve_index_path(row),
-        total_epochs_trained=int(row["total_epochs_trained"] or 0) if "total_epochs_trained" in keys else 0,
-        needs_retraining=bool(row["needs_retraining"]) if "needs_retraining" in keys else False,
-        profile_rms=float(row["profile_rms"]) if "profile_rms" in keys and row["profile_rms"] is not None else None,
-        embedder=str(row["embedder"]) if "embedder" in keys and row["embedder"] else "spin-v2",
-        vocoder=str(row["vocoder"]) if "vocoder" in keys and row["vocoder"] else "HiFi-GAN",
+        total_epochs_trained=int(row["total_epochs_trained"] or 0)
+        if "total_epochs_trained" in keys
+        else 0,
+        needs_retraining=bool(row["needs_retraining"])
+        if "needs_retraining" in keys
+        else False,
+        profile_rms=float(row["profile_rms"])
+        if "profile_rms" in keys and row["profile_rms"] is not None
+        else None,
+        embedder=str(row["embedder"])
+        if "embedder" in keys and row["embedder"]
+        else "spin-v2",
+        vocoder=str(row["vocoder"])
+        if "vocoder" in keys and row["vocoder"]
+        else "HiFi-GAN",
         audio_files=audio_files,
     )
 
@@ -260,6 +274,7 @@ async def _row_to_out(row, db) -> ProfileOut:
 # ---------------------------------------------------------------------------
 # Shared upload + clip helper
 # ---------------------------------------------------------------------------
+
 
 async def _upload_and_clip(
     file: UploadFile,
@@ -276,7 +291,9 @@ async def _upload_and_clip(
     """
     import soundfile as sf  # noqa: PLC0415
 
-    raw_path = os.path.join(audio_dir, f"_upload_{uuid.uuid4().hex}_{original_filename}")
+    raw_path = os.path.join(
+        audio_dir, f"_upload_{uuid.uuid4().hex}_{original_filename}"
+    )
 
     bytes_written = 0
     try:
@@ -287,7 +304,9 @@ async def _upload_and_clip(
                     break
                 bytes_written += len(chunk)
                 if bytes_written > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="File exceeds 200 MiB limit")
+                    raise HTTPException(
+                        status_code=413, detail="File exceeds 200 MiB limit"
+                    )
                 await out_f.write(chunk)
     except HTTPException:
         try:
@@ -312,7 +331,7 @@ async def _upload_and_clip(
             pass
         raise HTTPException(
             status_code=422,
-            detail=f"Audio is {duration/60:.1f} min — max allowed is 30 min",
+            detail=f"Audio is {duration / 60:.1f} min — max allowed is 30 min",
         )
 
     # Derive a clean stem from the original filename
@@ -331,7 +350,9 @@ async def _upload_and_clip(
     try:
         raw, sr = sf.read(raw_path, always_2d=True, dtype="float32")
         s_frame = int(round((seg_start or 0.0) * sr))
-        e_frame = int(round(end_for_clip * sr)) if end_for_clip is not None else raw.shape[0]
+        e_frame = (
+            int(round(end_for_clip * sr)) if end_for_clip is not None else raw.shape[0]
+        )
         s_frame = max(0, min(s_frame, raw.shape[0]))
         e_frame = max(s_frame, min(e_frame, raw.shape[0]))
         clipped = raw[s_frame:e_frame, :]
@@ -353,6 +374,7 @@ async def _upload_and_clip(
 # ---------------------------------------------------------------------------
 # POST /api/profiles  — create profile + first audio file
 # ---------------------------------------------------------------------------
+
 
 @router.post("", status_code=200, response_model=ProfileOut)
 async def create_profile(
@@ -396,9 +418,15 @@ async def create_profile(
     try:
         pp = await loop.run_in_executor(None, preprocess_audio_inplace, file_path)
         clip_dur = pp["duration_after_s"] or clip_dur
-        logger.info("preprocessed first file: trimmed=%.0fms  dur=%.1fs", pp["trimmed_ms"], clip_dur)
+        logger.info(
+            "preprocessed first file: trimmed=%.0fms  dur=%.1fs",
+            pp["trimmed_ms"],
+            clip_dur,
+        )
     except Exception as exc:
-        logger.warning("audio preprocessing failed for %s: %s — continuing without", file_path, exc)
+        logger.warning(
+            "audio preprocessing failed for %s: %s — continuing without", file_path, exc
+        )
 
     # Measure the speech-weighted RMS of this first (preprocessed) file.
     # All subsequent files added to the profile will be normalized to match it.
@@ -417,7 +445,17 @@ async def create_profile(
                (id, name, status, sample_path, batch_size, audio_duration,
                 preprocessed_path, profile_dir, profile_rms, embedder, vocoder, created_at)
                VALUES (?, ?, 'untrained', ?, 8, ?, NULL, ?, ?, ?, ?, ?)""",
-            (profile_id, name, file_path, clip_dur, pdir, profile_rms, embedder, vocoder, created_at),
+            (
+                profile_id,
+                name,
+                file_path,
+                clip_dur,
+                pdir,
+                profile_rms,
+                embedder,
+                vocoder,
+                created_at,
+            ),
         )
         await db.execute(
             """INSERT INTO audio_files (id, profile_id, filename, file_path, duration, is_cleaned, created_at)
@@ -437,14 +475,20 @@ async def create_profile(
         row = await cursor.fetchone()
         result = await _row_to_out(row, db)
 
-    logger.info("profile created id=%s name=%s dir=%s dur=%.1fs",
-                profile_id, name, pdir, clip_dur)
+    logger.info(
+        "profile created id=%s name=%s dir=%s dur=%.1fs",
+        profile_id,
+        name,
+        pdir,
+        clip_dur,
+    )
     return result
 
 
 # ---------------------------------------------------------------------------
 # POST /api/profiles/{id}/audio  — add audio file to existing profile
 # ---------------------------------------------------------------------------
+
 
 @router.post("/{profile_id}/audio", status_code=200, response_model=AudioFileOut)
 async def add_audio_file(
@@ -466,7 +510,9 @@ async def add_audio_file(
 
     pdir = row["profile_dir"]
     if not pdir:
-        raise HTTPException(status_code=400, detail="Profile has no directory — recreate it")
+        raise HTTPException(
+            status_code=400, detail="Profile has no directory — recreate it"
+        )
 
     audio_dir = _audio_dir(pdir)
     os.makedirs(audio_dir, exist_ok=True)
@@ -482,7 +528,9 @@ async def add_audio_file(
         pp = await loop.run_in_executor(None, preprocess_audio_inplace, file_path)
         clip_dur = pp["duration_after_s"] or clip_dur
     except Exception as exc:
-        logger.warning("audio preprocessing failed for %s: %s — continuing without", file_path, exc)
+        logger.warning(
+            "audio preprocessing failed for %s: %s — continuing without", file_path, exc
+        )
 
     # Normalize to the profile's RMS reference so all training files are
     # level-consistent.  If the profile has no stored RMS yet (legacy profile),
@@ -497,7 +545,11 @@ async def add_audio_file(
                 "normalized new file %s to profile_rms=%.5f", filename, stored_rms
             )
         except Exception as exc:
-            logger.warning("RMS normalization failed for %s: %s — keeping original level", filename, exc)
+            logger.warning(
+                "RMS normalization failed for %s: %s — keeping original level",
+                filename,
+                exc,
+            )
 
     file_id = uuid.uuid4().hex
     created_at = datetime.now(timezone.utc).isoformat()
@@ -516,7 +568,9 @@ async def add_audio_file(
             )
         await db.commit()
 
-    logger.info("audio file added profile=%s file=%s dur=%.1fs", profile_id, filename, clip_dur)
+    logger.info(
+        "audio file added profile=%s file=%s dur=%.1fs", profile_id, filename, clip_dur
+    )
     return AudioFileOut(
         id=file_id,
         profile_id=profile_id,
@@ -531,6 +585,7 @@ async def add_audio_file(
 # ---------------------------------------------------------------------------
 # GET /api/profiles
 # ---------------------------------------------------------------------------
+
 
 @router.get("", response_model=list[ProfileOut])
 async def list_profiles() -> list[ProfileOut]:
@@ -553,6 +608,7 @@ async def list_profiles() -> list[ProfileOut]:
 # GET /api/profiles/{id}
 # ---------------------------------------------------------------------------
 
+
 @router.get("/{profile_id}", response_model=ProfileOut)
 async def get_profile(profile_id: str) -> ProfileOut:
     async with get_db() as db:
@@ -566,13 +622,16 @@ async def get_profile(profile_id: str) -> ProfileOut:
         )
         row = await cursor.fetchone()
         if row is None:
-            raise HTTPException(status_code=404, detail=f"Profile not found: {profile_id}")
+            raise HTTPException(
+                status_code=404, detail=f"Profile not found: {profile_id}"
+            )
         return await _row_to_out(row, db)
 
 
 # ---------------------------------------------------------------------------
 # GET /api/profiles/{id}/audio/{file_id}  — stream individual audio file
 # ---------------------------------------------------------------------------
+
 
 @router.get("/{profile_id}/audio/{file_id}")
 async def stream_audio_file(profile_id: str, file_id: str):
@@ -596,6 +655,7 @@ async def stream_audio_file(profile_id: str, file_id: str):
 # DELETE /api/profiles/{id}/audio/{file_id}  — delete one audio file
 # ---------------------------------------------------------------------------
 
+
 @router.delete("/{profile_id}/audio/{file_id}", status_code=204)
 async def delete_audio_file(profile_id: str, file_id: str) -> Response:
     """Delete an audio file from the profile. Sets needs_retraining if trained."""
@@ -613,7 +673,9 @@ async def delete_audio_file(profile_id: str, file_id: str) -> Response:
             (profile_id,),
         )
         profile_row = await cursor2.fetchone()
-        prior_epochs = int(profile_row["total_epochs_trained"] or 0) if profile_row else 0
+        prior_epochs = (
+            int(profile_row["total_epochs_trained"] or 0) if profile_row else 0
+        )
 
         await db.execute(
             "DELETE FROM audio_files WHERE id = ?",
@@ -640,6 +702,7 @@ async def delete_audio_file(profile_id: str, file_id: str) -> Response:
 # ---------------------------------------------------------------------------
 # POST /api/profiles/{id}/audio/{file_id}/clean  — noise removal in-place
 # ---------------------------------------------------------------------------
+
 
 @router.post("/{profile_id}/audio/{file_id}/clean", response_model=PreprocessResponse)
 async def clean_audio_file(profile_id: str, file_id: str) -> PreprocessResponse:
@@ -706,7 +769,9 @@ async def clean_audio_file(profile_id: str, file_id: str) -> PreprocessResponse:
                 None, normalize_rms_inplace, file_path, float(stored_rms)
             )
         except Exception as exc:
-            logger.warning("post-clean RMS normalization failed for %s: %s", file_path, exc)
+            logger.warning(
+                "post-clean RMS normalization failed for %s: %s", file_path, exc
+            )
 
     cleaned_dur = await loop.run_in_executor(None, get_duration, file_path)
 
@@ -728,6 +793,7 @@ async def clean_audio_file(profile_id: str, file_id: str) -> PreprocessResponse:
 # GET /api/profiles/{id}/health
 # ---------------------------------------------------------------------------
 
+
 @router.get("/{profile_id}/health", response_model=HealthStatus)
 async def profile_health(profile_id: str) -> HealthStatus:
     """File-existence health check for a profile."""
@@ -739,14 +805,20 @@ async def profile_health(profile_id: str) -> HealthStatus:
         )
         row = await cursor.fetchone()
         if row is None:
-            raise HTTPException(status_code=404, detail=f"Profile not found: {profile_id}")
+            raise HTTPException(
+                status_code=404, detail=f"Profile not found: {profile_id}"
+            )
 
         audio_files = await _fetch_audio_files(db, profile_id)
 
     errors: list[str] = []
 
     # Audio check — at least one file must exist on disk
-    audio_ok = any(os.path.exists(af.file_path) for af in audio_files) if audio_files else False
+    audio_ok = (
+        any(os.path.exists(af.file_path) for af in audio_files)
+        if audio_files
+        else False
+    )
     if not audio_ok:
         errors.append("no audio files found — add at least one audio file to train")
 
@@ -754,13 +826,17 @@ async def profile_health(profile_id: str) -> HealthStatus:
     model = _resolve_model_path(row)
     model_ok = bool(model and os.path.exists(model))
     if row["status"] == "trained" and not model_ok:
-        errors.append("model_infer.pth missing — profile is marked trained but inference model not found")
+        errors.append(
+            "model_infer.pth missing — profile is marked trained but inference model not found"
+        )
 
     # Index check
     index = _resolve_index_path(row)
     index_ok = bool(index and os.path.exists(index))
     if row["status"] == "trained" and not index_ok:
-        errors.append("model.index missing — profile is marked trained but index file not found")
+        errors.append(
+            "model.index missing — profile is marked trained but index file not found"
+        )
 
     can_train = audio_ok
     can_infer = model_ok and index_ok
@@ -777,8 +853,67 @@ async def profile_health(profile_id: str) -> HealthStatus:
 
 
 # ---------------------------------------------------------------------------
+# PATCH /api/profiles/{id} — update embedder/vocoder (only if not locked)
+# ---------------------------------------------------------------------------
+
+
+class PatchProfileRequest(BaseModel):
+    embedder: Optional[str] = None
+    vocoder: Optional[str] = None
+
+
+@router.patch("/{profile_id}")
+async def patch_profile(profile_id: str, body: PatchProfileRequest):
+    """Update embedder or vocoder for a profile. Only allowed before first training."""
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT id, embedder, vocoder, total_epochs_trained FROM profiles WHERE id = ?",
+            (profile_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail=f"Profile not found: {profile_id}"
+            )
+
+        if row["total_epochs_trained"] > 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot change embedder/vocoder after first training run",
+            )
+
+        updates = {}
+        if body.embedder is not None:
+            if body.embedder not in ("spin-v2", "spin", "contentvec", "hubert"):
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid embedder: {body.embedder}"
+                )
+            updates["embedder"] = body.embedder
+
+        if body.vocoder is not None:
+            if body.vocoder not in ("HiFi-GAN", "RefineGAN"):
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid vocoder: {body.vocoder}"
+                )
+            updates["vocoder"] = body.vocoder
+
+        if not updates:
+            raise HTTPException(status_code=400, detail="No valid fields to update")
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        await db.execute(
+            f"UPDATE profiles SET {set_clause} WHERE id = ?",
+            (*updates.values(), profile_id),
+        )
+        await db.commit()
+
+    return {"ok": True, **updates}
+
+
+# ---------------------------------------------------------------------------
 # DELETE /api/profiles/{id}
 # ---------------------------------------------------------------------------
+
 
 @router.delete("/{profile_id}", status_code=204)
 async def delete_profile(profile_id: str) -> Response:
@@ -789,7 +924,9 @@ async def delete_profile(profile_id: str) -> Response:
         )
         row = await cursor.fetchone()
         if row is None:
-            raise HTTPException(status_code=404, detail=f"Profile not found: {profile_id}")
+            raise HTTPException(
+                status_code=404, detail=f"Profile not found: {profile_id}"
+            )
 
         # audio_files and epoch_losses have ON DELETE CASCADE but aiosqlite
         # doesn't enforce FK constraints by default — delete explicitly.
@@ -812,7 +949,9 @@ async def delete_profile(profile_id: str) -> Response:
     # doesn't inherit stale checkpoints from this one.
     project_root = os.environ.get("PROJECT_ROOT", "")
     if project_root:
-        exp_dir = os.path.join(os.path.abspath(project_root), "logs", "rvc_finetune_active")
+        exp_dir = os.path.join(
+            os.path.abspath(project_root), "logs", "rvc_finetune_active"
+        )
         if os.path.isdir(exp_dir):
             shutil.rmtree(exp_dir, ignore_errors=True)
 
@@ -823,6 +962,7 @@ async def delete_profile(profile_id: str) -> Response:
 # Legacy compat endpoints — kept so old frontend code doesn't 404
 # These are superseded by the per-file endpoints above.
 # ---------------------------------------------------------------------------
+
 
 @router.get("/{profile_id}/audio")
 async def stream_audio_legacy(profile_id: str):
@@ -853,8 +993,12 @@ async def stream_clean_audio_legacy(profile_id: str):
         )
         row = await cursor.fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="No cleaned audio files for this profile")
+        raise HTTPException(
+            status_code=404, detail="No cleaned audio files for this profile"
+        )
     path = row["file_path"]
     if not path or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Cleaned audio file not found on disk")
+        raise HTTPException(
+            status_code=404, detail="Cleaned audio file not found on disk"
+        )
     return FileResponse(path, media_type="audio/wav", filename=row["filename"])

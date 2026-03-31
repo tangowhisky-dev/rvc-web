@@ -662,10 +662,16 @@ async def _run_pipeline(
     # ------------------------------------------------------------------
     gt_wavs_dir_check = os.path.join(exp_dir, "0_gt_wavs")
     _gt_wavs_exist = (
-        os.path.isdir(gt_wavs_dir_check)
-        and any(f.endswith(".wav") for f in os.listdir(gt_wavs_dir_check))
-    ) if os.path.isdir(gt_wavs_dir_check) else False
-    _skip_preprocess = (not different_profile) and (not files_changed) and _gt_wavs_exist
+        (
+            os.path.isdir(gt_wavs_dir_check)
+            and any(f.endswith(".wav") for f in os.listdir(gt_wavs_dir_check))
+        )
+        if os.path.isdir(gt_wavs_dir_check)
+        else False
+    )
+    _skip_preprocess = (
+        (not different_profile) and (not files_changed) and _gt_wavs_exist
+    )
 
     if _skip_preprocess:
         await job.queue.put(
@@ -790,48 +796,73 @@ async def _run_pipeline(
 
     # ------------------------------------------------------------------
     # Pre-phase 3: Extract profile-level speaker embedding (if c_spk > 0)
+    # Single source of truth: profile_dir/profile_embedding.pt
     # ------------------------------------------------------------------
-    profile_emb_path = os.path.join(exp_dir, "profile_embedding.pt")
+    profile_emb_path = (
+        os.path.join(profile_dir, "profile_embedding.pt") if profile_dir else None
+    )
+    exp_emb_path = os.path.join(exp_dir, "profile_embedding.pt")  # copy for training
+
     if c_spk > 0:
         _emit_phase("extract_profile_emb", "Extracting profile speaker embedding")
         gt_wavs_dir = os.path.join(exp_dir, "0_gt_wavs")
-        # Use MPS if available (same logic as in train.py)
-        emb_device = _rvc_device
-        emb_extract_args = [
-            python,
-            "infer/modules/train/extract_profile_embedding.py",
-            gt_wavs_dir,
-            profile_emb_path,
-            emb_device,
-        ]
-        await job.queue.put(
-            {
-                "type": "log",
-                "message": f"Extracting profile embedding: {gt_wavs_dir} → {profile_emb_path} (device={emb_device})",
-                "phase": "extract_profile_emb",
-            }
+
+        needs_extraction = (
+            not profile_emb_path
+            or not os.path.isfile(profile_emb_path)
+            or files_changed
+            or different_profile
         )
-        ok = await _run_subprocess(
-            job, emb_extract_args, base_env, rvc_pkg_dir, "extract_profile_emb"
-        )
-        if not ok:
-            # Non-fatal — speaker embedding extraction failed, disable speaker loss
+
+        if needs_extraction:
+            # Extract fresh embedding from training audio
+            emb_device = _rvc_device
+            emb_extract_args = [
+                python,
+                "infer/modules/train/extract_profile_embedding.py",
+                gt_wavs_dir,
+                profile_emb_path,  # Save directly to profile_dir
+                emb_device,
+            ]
             await job.queue.put(
                 {
                     "type": "log",
-                    "message": "WARNING: Profile embedding extraction failed — speaker loss disabled",
+                    "message": f"Extracting profile embedding: {gt_wavs_dir} → {profile_emb_path} (device={emb_device})",
                     "phase": "extract_profile_emb",
                 }
             )
-            c_spk = 0.0
+            ok = await _run_subprocess(
+                job, emb_extract_args, base_env, rvc_pkg_dir, "extract_profile_emb"
+            )
+            if not ok:
+                await job.queue.put(
+                    {
+                        "type": "log",
+                        "message": "WARNING: Profile embedding extraction failed — speaker loss disabled",
+                        "phase": "extract_profile_emb",
+                    }
+                )
+                c_spk = 0.0
+            else:
+                await job.queue.put(
+                    {
+                        "type": "log",
+                        "message": f"Profile speaker embedding saved to {profile_emb_path}",
+                        "phase": "extract_profile_emb",
+                    }
+                )
         else:
             await job.queue.put(
                 {
                     "type": "log",
-                    "message": f"Profile speaker embedding saved to {profile_emb_path}",
+                    "message": f"Using existing speaker embedding from {profile_emb_path}",
                     "phase": "extract_profile_emb",
                 }
             )
+
+        # Copy to exp_dir for training subprocess
+        if profile_emb_path and os.path.isfile(profile_emb_path):
+            shutil.copy2(profile_emb_path, exp_emb_path)
     else:
         await job.queue.put(
             {
@@ -864,8 +895,14 @@ async def _run_pipeline(
     # Pre-phase 3 setup: config.json and filelist.txt
     # ------------------------------------------------------------------
     try:
-        _write_config(project_root, exp_dir, batch_size=batch_size, c_spk=c_spk,
-                      vocoder=vocoder, pretrain_g=pretrain_g)
+        _write_config(
+            project_root,
+            exp_dir,
+            batch_size=batch_size,
+            c_spk=c_spk,
+            vocoder=vocoder,
+            pretrain_g=pretrain_g,
+        )
         _build_filelist(project_root, exp_dir)
     except Exception as exc:
         await _fail("setup", f"Pre-train setup failed: {exc}")

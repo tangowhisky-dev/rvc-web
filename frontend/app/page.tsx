@@ -858,6 +858,9 @@ interface ProfileCardProps {
 function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
   const [deleting, setDeleting]           = useState(false);
   const [showAddAudio, setShowAddAudio]   = useState(false);
+  const [editField, setEditField]         = useState<'embedder' | 'vocoder' | null>(null);
+  const [updating, setUpdating]           = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
 
   // Health check state — loaded async on mount and when status changes
   const [health, setHealth]             = useState<HealthStatus | null>(null);
@@ -872,6 +875,46 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
       .catch(() => { if (!cancelled) setHealthLoading(false); });
     return () => { cancelled = true; };
   }, [profile.id, profile.status, profile.audio_files.length]);
+
+  // Close edit menu on outside click
+  useEffect(() => {
+    if (!editField) return;
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setEditField(null);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [editField]);
+
+  // Keyboard: Escape closes menu
+  useEffect(() => {
+    if (!editField) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setEditField(null);
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [editField]);
+
+  async function handleUpdateField(field: 'embedder' | 'vocoder', value: string) {
+    setUpdating(true);
+    try {
+      const res = await fetch(`${API}/api/profiles/${profile.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [field]: value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      onRefresh();
+    } catch (err) {
+      alert(err instanceof Error ? err.message : String(err));
+    } finally {
+      setUpdating(false);
+      setEditField(null);
+    }
+  }
 
   async function handleDelete() {
     if (!window.confirm(`Delete profile "${profile.name}" and all its files? This cannot be undone.`)) return;
@@ -943,34 +986,76 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
           </div>
 
           {/* Meta row */}
-          <div className="flex items-center gap-3 text-[11px] font-mono text-zinc-500 flex-wrap">
-            <span title={profile.id}>{profile.id.slice(0, 12)}…</span>
-            {profile.audio_files.length > 0 && (
-              <span>{profile.audio_files.length} file{profile.audio_files.length !== 1 ? 's' : ''} · ⏱ {fmtDuration(totalDuration)}</span>
-            )}
-            {profile.total_epochs_trained > 0 && (
-              <span className="text-cyan-600">{profile.total_epochs_trained} epochs</span>
-            )}
-            {/* Embedder badge */}
-            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono
-                             bg-indigo-950/40 border border-indigo-800/40 text-indigo-400">
-              ◈ {profile.embedder || 'spin-v2'}
-              {profile.total_epochs_trained > 0 && (
-                <span className="text-indigo-600" title="Embedder locked after first training run">🔒</span>
-              )}
+          <div className="flex flex-col gap-2">
+            {/* Full profile ID */}
+            <span className="text-[10px] font-mono text-zinc-600 truncate" title={profile.id}>
+              {profile.id}
             </span>
-            {/* Vocoder badge */}
-            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono
-                             bg-violet-950/40 border border-violet-800/40 text-violet-400">
-              ◈ {profile.vocoder || 'HiFi-GAN'}
-              {profile.total_epochs_trained > 0 && (
-                <span className="text-violet-600" title="Vocoder locked after first training run">🔒</span>
+            {/* Stats + badges row */}
+            <div className="flex items-center gap-2 flex-wrap">
+              {profile.audio_files.length > 0 && (
+                <span className="text-[11px] font-mono text-zinc-400">
+                  {profile.audio_files.length} file{profile.audio_files.length !== 1 ? 's' : ''} · ⏱ {fmtDuration(totalDuration)}
+                </span>
               )}
-            </span>
-            {profile.profile_dir && (
-              <span title={profile.profile_dir} className="text-zinc-700 max-w-[220px] truncate">
-                📁 {profile.profile_dir.split('/').slice(-2).join('/')}
+              {profile.total_epochs_trained > 0 && (
+                <span className="text-[11px] font-mono text-cyan-600">{profile.total_epochs_trained} epochs</span>
+              )}
+              {/* Embedder badge — clickable if not locked */}
+              <span
+                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono
+                           bg-indigo-950/40 border border-indigo-800/40 text-indigo-400
+                           ${profile.total_epochs_trained === 0 ? 'cursor-pointer hover:border-indigo-600/60 hover:bg-indigo-950/60' : 'cursor-not-allowed opacity-60'}`}
+                title={profile.total_epochs_trained > 0 ? 'Locked after training' : 'Click to change embedder'}
+                onClick={() => profile.total_epochs_trained === 0 && setEditField(editField === 'embedder' ? null : 'embedder')}
+              >
+                ◈ {profile.embedder || 'spin-v2'}
+                {profile.total_epochs_trained > 0 && (
+                  <span className="text-indigo-600" title="Locked after first training run">🔒</span>
+                )}
               </span>
+              {/* Vocoder badge — clickable if not locked */}
+              <span
+                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono
+                           bg-violet-950/40 border border-violet-800/40 text-violet-400
+                           ${profile.total_epochs_trained === 0 ? 'cursor-pointer hover:border-violet-600/60 hover:bg-violet-950/60' : 'cursor-not-allowed opacity-60'}`}
+                title={profile.total_epochs_trained > 0 ? 'Locked after training' : 'Click to change vocoder'}
+                onClick={() => profile.total_epochs_trained === 0 && setEditField(editField === 'vocoder' ? null : 'vocoder')}
+              >
+                ◈ {profile.vocoder || 'HiFi-GAN'}
+                {profile.total_epochs_trained > 0 && (
+                  <span className="text-violet-600" title="Locked after first training run">🔒</span>
+                )}
+              </span>
+            </div>
+            {/* Edit dropdown */}
+            {editField && (
+              <div
+                ref={menuRef}
+                className="relative z-50 w-48 rounded-lg border border-zinc-700 bg-zinc-800 shadow-xl overflow-hidden"
+              >
+                <div className="px-2 py-1.5 text-[9px] font-mono uppercase tracking-widest text-zinc-500 border-b border-zinc-700/60">
+                  {editField}
+                </div>
+                {(editField === 'embedder' ? EMBEDDER_OPTIONS : VOCODER_OPTIONS).map(opt => (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    disabled={updating}
+                    onClick={() => handleUpdateField(editField, opt.value)}
+                    className={`w-full text-left px-3 py-1.5 text-[11px] font-mono transition-colors
+                                ${opt.value === (editField === 'embedder' ? profile.embedder : profile.vocoder)
+                                  ? 'text-cyan-300 bg-zinc-700/60'
+                                  : 'text-zinc-300 hover:bg-zinc-700/40'}
+                                disabled:opacity-40`}
+                  >
+                    {opt.label}
+                    {opt.value === (editField === 'embedder' ? profile.embedder : profile.vocoder) && (
+                      <span className="ml-2 text-cyan-400">✓</span>
+                    )}
+                  </button>
+                ))}
+              </div>
             )}
           </div>
         </div>
