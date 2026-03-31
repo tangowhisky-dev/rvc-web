@@ -1,6 +1,9 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { TipsPanel } from '../TipsPanel';
+import { LossGuide } from '../SettingsGuide';
+import { ProfilePicker } from '../ProfilePicker';
 
 const API = 'http://localhost:8000';
 const WS_BASE = 'ws://localhost:8000';
@@ -15,6 +18,8 @@ interface Profile {
   status: string;
   total_epochs_trained: number;
   needs_retraining: boolean;
+  embedder: string;
+  vocoder: string;
   audio_files: { id: string; duration: number | null }[];
 }
 
@@ -375,8 +380,9 @@ export default function TrainingPage() {
   const [selectedId, setSelectedId] = useState('');
   const [profilesError, setProfilesError] = useState<string | null>(null);
 
-  const [epochs, setEpochs] = useState(20);
+  const [epochs, setEpochs] = useState(50);
   const [batchSize, setBatchSize] = useState(8);
+  const [overtrainThreshold, setOvertrainThreshold] = useState(0);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
 
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -577,7 +583,7 @@ export default function TrainingPage() {
       const res = await fetch(`${API}/api/training/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize }),
+        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainThreshold }),
       });
 
       if (res.status === 409) {
@@ -678,37 +684,29 @@ export default function TrainingPage() {
           <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 flex flex-col gap-5">
 
             {/* Profile + Epochs row */}
-            <div className="grid grid-cols-2 gap-4">
-              <div className="flex flex-col gap-2">
+            {/* Profile + Epochs — profile list takes most of the width */}
+            <div className="flex gap-4 items-start">
+              {/* Profile list — flex-1 so it takes remaining space */}
+              <div className="flex flex-col gap-2 flex-1 min-w-0">
                 <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
                   <span className="text-cyan-400">◈</span> Voice Profile
                 </label>
                 {profiles.length === 0 ? (
-                  <div className="bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px] font-mono text-zinc-500">
+                  <div className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-[12px] font-mono text-zinc-500">
                     {profilesError ? 'Backend unreachable' : 'No profiles — upload one in Library'}
                   </div>
                 ) : (
-                  <select
-                    value={selectedId}
+                  <ProfilePicker
+                    profiles={profiles}
+                    selectedId={selectedId}
+                    onChange={setSelectedId}
                     disabled={isRunning}
-                    onChange={(e) => setSelectedId(e.target.value)}
-                    className="bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
-                               font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
-                               disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
-                  >
-                    {profiles.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                        {p.total_epochs_trained > 0 ? ` (${p.total_epochs_trained} ep)` : ''}
-                        {p.needs_retraining ? ' ⚠' : ''}
-                        {p.status === 'trained' ? ' ✓' : p.status === 'training' ? ' ⟳' : p.status === 'failed' ? ' ✗' : ''}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 )}
               </div>
 
-              <div className="flex flex-col gap-2">
+              {/* Epochs — narrow fixed width */}
+              <div className="flex flex-col gap-2 w-48 shrink-0">
                 <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
                   <span className="text-cyan-400">⟳</span> Epochs
                 </label>
@@ -716,24 +714,24 @@ export default function TrainingPage() {
                   type="number" value={epochs} min={1} max={200}
                   disabled={isRunning}
                   onChange={(e) => setEpochs(Math.max(1, Math.min(200, Number(e.target.value))))}
-                  className="bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
+                  className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
                              font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
                              disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
                 />
-                {/* Resume indicator / re-training warning */}
+                {/* Resume / retrain hint */}
                 {(() => {
                   const sel = profiles.find(p => p.id === selectedId);
                   if (!sel) return null;
                   return (
                     <div className="flex flex-col gap-1">
                       {sel.total_epochs_trained > 0 && (
-                        <span className="text-[10px] font-mono text-amber-500/80">
-                          ↳ resume from epoch {sel.total_epochs_trained} → {sel.total_epochs_trained + epochs} total
+                        <span className="text-[10px] font-mono text-amber-500/80 leading-tight">
+                          ↳ resume {sel.total_epochs_trained} → {sel.total_epochs_trained + epochs}
                         </span>
                       )}
                       {sel.needs_retraining && (
-                        <span className="text-[10px] font-mono text-amber-400">
-                          ⚠ audio files changed — re-training recommended
+                        <span className="text-[10px] font-mono text-amber-400 leading-tight">
+                          ⚠ retrain recommended
                         </span>
                       )}
                     </div>
@@ -750,6 +748,33 @@ export default function TrainingPage() {
                 disabled={isRunning}
                 hw={hw}
               />
+            </div>
+
+            {/* Overtraining threshold */}
+            <div className="border-t border-zinc-800/60 pt-4">
+              <div className="flex flex-col gap-2 max-w-xs">
+                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
+                  <span className="text-amber-400">⚠</span> Overtraining Stop
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number" value={overtrainThreshold} min={0} max={200}
+                    disabled={isRunning}
+                    onChange={(e) => setOvertrainThreshold(Math.max(0, Math.min(200, Number(e.target.value))))}
+                    className="w-24 bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
+                               font-mono text-zinc-200 focus:outline-none focus:border-amber-600
+                               disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
+                  />
+                  <span className="text-[11px] font-mono text-zinc-500">
+                    {overtrainThreshold === 0
+                      ? 'disabled'
+                      : `stop after ${overtrainThreshold} epoch${overtrainThreshold !== 1 ? 's' : ''} without improvement`}
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono text-zinc-600">
+                  0 = run all epochs · recommended: 10–20 for fine-tuning
+                </span>
+              </div>
             </div>
 
             {/* Actions */}
@@ -847,6 +872,85 @@ export default function TrainingPage() {
         <footer className="text-[11px] font-mono text-zinc-600 pb-4">
           Training data must be uploaded as voice sample(s) in the Library tab first.
         </footer>
+
+        {/* Tips */}
+        <TipsPanel tips={[
+          {
+            icon: '📊',
+            title: 'Epoch count: 200–500 for speech, 500–1000 for singing',
+            body: 'Results at 25 epochs are audible but rough. Speech cloning typically becomes convincing at 200+ epochs. More training data means fewer epochs needed for the same quality.',
+          },
+          {
+            icon: '🛑',
+            title: 'Overtraining detection is active',
+            body: 'When the generator loss stops improving and starts climbing, training halts automatically. This is a sign to stop — more epochs past this point hurt quality.',
+          },
+          {
+            icon: '🎙️',
+            title: 'Audio quality matters more than quantity',
+            body: 'One hour of clean, single-speaker, dry (no reverb) audio beats 10 hours of noisy or multi-speaker recordings. Remove silence, music beds, and cross-talk before uploading.',
+          },
+          {
+            icon: '🔁',
+            title: 'Batch size and save frequency',
+            body: 'Larger batches train faster but need more GPU memory. Save every 10–25 epochs so you can roll back to an earlier checkpoint if overtraining is detected.',
+          },
+          {
+            icon: '🗂️',
+            title: 'SPIN-v2 embedder gives the best speaker identity preservation',
+            body: 'ContentVec is a good fallback if SPIN-v2 produces artefacts. HuBERT is the most forgiving with noisy or reverberant data.',
+          },
+          {
+            icon: '🔊',
+            title: 'RefineGAN vs HiFi-GAN',
+            body: 'RefineGAN produces crisper, more detailed speech at the cost of slightly longer training time. For quick experiments, HiFi-GAN converges faster and is more forgiving.',
+          },
+        ]} />
+
+        {/* Loss reference */}
+        <LossGuide losses={[
+          {
+            key: 'loss_mel',
+            color: '#06b6d4',
+            name: 'Mel Loss',
+            what: 'Measures the difference between the spectrogram of the generated audio and the real audio on a mel-frequency scale — the same scale human hearing uses. This is the single most important signal for perceptual audio quality. A low mel loss means the generated audio sounds tonally similar to the training data: correct pitch, correct timbre, correct vowel shapes.',
+            healthy: 'Steadily decreasing over epochs, eventually plateauing. Typical good values are below 1.0; excellent fine-tunes reach 0.3–0.6. This should be the primary metric you watch.',
+            warning: 'Rising mel loss after it has plateaued is a strong overtraining signal — the model is fitting noise rather than speech structure. Training halts automatically when this is detected.',
+          },
+          {
+            key: 'loss_gen',
+            color: '#a78bfa',
+            name: 'Generator Loss',
+            what: 'The adversarial loss from the discriminator\'s verdict on generated audio. The generator (voice synthesis network) is trying to fool the discriminator into believing its output is real. A lower generator loss means the discriminator is having a harder time telling generated from real — which generally means the audio sounds more natural.',
+            healthy: 'Should decrease early and then oscillate in a moderate range as the generator and discriminator reach a dynamic equilibrium. Some oscillation is normal and expected in GAN training.',
+            warning: 'If generator loss collapses to near zero, the discriminator has stopped providing useful gradient — mode collapse. If it climbs sharply, the discriminator has become too strong and the generator is struggling.',
+          },
+          {
+            key: 'loss_disc',
+            color: '#f59e0b',
+            name: 'Discriminator Loss',
+            what: 'How well the discriminator can distinguish real training audio from generated audio. This should stay in a moderate range throughout training — not too high (discriminator is failing) and not too low (discriminator is too dominant, starving the generator of useful gradient).',
+            healthy: 'Stays roughly stable in a moderate range after initial settling. A healthy training run has generator and discriminator locked in a productive adversarial tension.',
+            warning: 'Near-zero discriminator loss means it has become too strong — the generator gets no useful gradient and output quality stagnates. Very high discriminator loss means the generator is winning easily — the discriminator needs to catch up.',
+          },
+          {
+            key: 'loss_fm',
+            color: '#34d399',
+            name: 'Feature Matching Loss',
+            what: 'Compares the internal feature activations of the discriminator between real and generated audio, at multiple layers. Rather than just asking "real or fake?", it asks "do the intermediate representations match?". This stabilises GAN training and improves fine-grained detail in the output — voice texture, breathiness, and consonant crispness.',
+            healthy: 'Decreases steadily alongside mel loss, usually converging a bit faster. Values below 5.0 are typical for a well-trained model.',
+            warning: 'Feature matching loss plateauing high while mel loss is still falling suggests the discriminator architecture may be a bottleneck — less actionable, but worth noting if output sounds blurry at high epoch counts.',
+          },
+          {
+            key: 'loss_kl',
+            color: '#f87171',
+            name: 'KL Divergence Loss',
+            what: 'The Kullback–Leibler divergence between the posterior (encoder\'s estimate of the latent from real audio) and the prior (the model\'s prior over the latent space). This regularises the latent space so it stays smooth and continuous, which prevents the decoder from memorising training examples instead of learning to generalise.',
+            healthy: 'Decreases quickly and stays low (< 2.0) throughout training. Once it has settled it should barely move.',
+            warning: 'A climbing KL loss late in training can indicate the model is over-regularising and losing expressiveness. In practice this is rare — KL loss is usually the most stable of the five signals.',
+          },
+        ]} />
+
       </div>
     </main>
   );

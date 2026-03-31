@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from backend.app.db import init_db
-from backend.app.routers import profiles, realtime, training
+from backend.app.routers import profiles, realtime, training, offline
 from backend.app.routers.realtime import ws_router as realtime_ws_router
 from backend.app.routers.training import ws_router as training_ws_router
 
@@ -88,3 +88,4 @@ app.include_router(training.router)
 app.include_router(training_ws_router)
 app.include_router(realtime.router)
 app.include_router(realtime_ws_router)
+app.include_router(offline.router)

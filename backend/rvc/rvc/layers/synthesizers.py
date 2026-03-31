@@ -7,6 +7,7 @@ from torch import nn
 from .encoders import TextEncoder, PosteriorEncoder
 from .generators import Generator
 from .nsf import NSFGenerator
+from .refinegan import RefineGANGenerator
 from .residuals import ResidualCouplingBlock
 from .utils import (
     slice_on_last_dim,
@@ -37,6 +38,7 @@ class SynthesizerTrnMsNSFsid(nn.Module):
         sr: Optional[Union[str, int]],
         encoder_dim: int,
         use_f0: bool,
+        vocoder: str = "HiFi-GAN",
     ):
         super().__init__()
         if isinstance(sr, str):
@@ -75,17 +77,26 @@ class SynthesizerTrnMsNSFsid(nn.Module):
             f0=use_f0,
         )
         if use_f0:
-            self.dec = NSFGenerator(
-                inter_channels,
-                resblock,
-                resblock_kernel_sizes,
-                resblock_dilation_sizes,
-                upsample_rates,
-                upsample_initial_channel,
-                upsample_kernel_sizes,
-                gin_channels=gin_channels,
-                sr=sr,
-            )
+            if vocoder == "RefineGAN":
+                self.dec = RefineGANGenerator(
+                    sample_rate=sr,
+                    num_mels=inter_channels,
+                    upsample_rates=upsample_rates,
+                    upsample_initial_channel=upsample_initial_channel,
+                    gin_channels=gin_channels,
+                )
+            else:
+                self.dec = NSFGenerator(
+                    inter_channels,
+                    resblock,
+                    resblock_kernel_sizes,
+                    resblock_dilation_sizes,
+                    upsample_rates,
+                    upsample_initial_channel,
+                    upsample_kernel_sizes,
+                    gin_channels=gin_channels,
+                    sr=sr,
+                )
         else:
             self.dec = Generator(
                 inter_channels,
@@ -235,6 +246,8 @@ class SynthesizerTrnMs256NSFsid(SynthesizerTrnMsNSFsid):
         spk_embed_dim: int,
         gin_channels: int,
         sr: Union[str, int],
+        vocoder: str = "HiFi-GAN",
+        **kwargs,
     ):
         super().__init__(
             spec_channels,
@@ -257,6 +270,7 @@ class SynthesizerTrnMs256NSFsid(SynthesizerTrnMsNSFsid):
             sr,
             256,
             True,
+            vocoder=vocoder,
         )
 
 
@@ -281,6 +295,8 @@ class SynthesizerTrnMs768NSFsid(SynthesizerTrnMsNSFsid):
         spk_embed_dim: int,
         gin_channels: int,
         sr: Union[str, int],
+        vocoder: str = "HiFi-GAN",
+        **kwargs,
     ):
         super().__init__(
             spec_channels,
@@ -303,6 +319,7 @@ class SynthesizerTrnMs768NSFsid(SynthesizerTrnMsNSFsid):
             sr,
             768,
             True,
+            vocoder=vocoder,
         )
 
 
@@ -327,6 +344,8 @@ class SynthesizerTrnMs256NSFsid_nono(SynthesizerTrnMsNSFsid):
         spk_embed_dim: int,
         gin_channels: int,
         sr=None,
+        vocoder: str = "HiFi-GAN",
+        **kwargs,
     ):
         super().__init__(
             spec_channels,
@@ -346,8 +365,10 @@ class SynthesizerTrnMs256NSFsid_nono(SynthesizerTrnMsNSFsid):
             upsample_kernel_sizes,
             spk_embed_dim,
             gin_channels,
+            None,   # sr — unused for _nono (no F0 conditioning)
             256,
             False,
+            vocoder=vocoder,
         )
 
 
@@ -372,6 +393,8 @@ class SynthesizerTrnMs768NSFsid_nono(SynthesizerTrnMsNSFsid):
         spk_embed_dim: int,
         gin_channels: int,
         sr=None,
+        vocoder: str = "HiFi-GAN",
+        **kwargs,
     ):
         super().__init__(
             spec_channels,
@@ -391,6 +414,8 @@ class SynthesizerTrnMs768NSFsid_nono(SynthesizerTrnMsNSFsid):
             upsample_kernel_sizes,
             spk_embed_dim,
             gin_channels,
+            None,   # sr — unused for _nono (no F0 conditioning)
             768,
             False,
+            vocoder=vocoder,
         )

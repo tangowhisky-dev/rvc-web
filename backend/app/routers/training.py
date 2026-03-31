@@ -39,6 +39,10 @@ class StartTrainingRequest(BaseModel):
     epochs: int = 200
     save_every: int = 10
     batch_size: int = 8
+    # Overtraining detection: stop when gen loss doesn't improve for N consecutive
+    # epochs. 0 = disabled. Stored on the profile for display but the threshold
+    # itself is passed per-run so the user can adjust without retraining.
+    overtrain_threshold: int = 0
 
 
 class CancelTrainingRequest(BaseModel):
@@ -158,7 +162,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     # Look up profile
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT id, name, status, sample_path, batch_size, profile_dir, total_epochs_trained, needs_retraining FROM profiles WHERE id = ?",
+            "SELECT id, name, status, sample_path, batch_size, profile_dir, total_epochs_trained, needs_retraining, embedder, vocoder FROM profiles WHERE id = ?",
             (request.profile_id,),
         )
         row = await cursor.fetchone()
@@ -203,10 +207,13 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     # Request batch_size always wins over the profile's stored default.
     # Persist it back so the DB stays in sync with what was actually used.
     batch_size = request.batch_size
+    # Read embedder and vocoder from profile (both locked after first training run).
+    profile_embedder = str(row["embedder"]) if row["embedder"] else "spin-v2"
+    profile_vocoder  = str(row["vocoder"])  if row["vocoder"]  else "HiFi-GAN"
     async with get_db() as db:
         await db.execute(
-            "UPDATE profiles SET batch_size = ? WHERE id = ?",
-            (batch_size, request.profile_id),
+            "UPDATE profiles SET batch_size = ?, overtrain_threshold = ? WHERE id = ?",
+            (batch_size, request.overtrain_threshold, request.profile_id),
         )
         await db.commit()
 
@@ -221,6 +228,9 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
             profile_dir=profile_dir,
             prior_epochs=int(row["total_epochs_trained"] or 0),
             files_changed=bool(row["needs_retraining"]),
+            embedder=profile_embedder,
+            overtrain_threshold=int(request.overtrain_threshold or 0),
+            vocoder=profile_vocoder,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -272,20 +282,16 @@ async def cancel_training(request: CancelTrainingRequest) -> dict:
 async def get_status(profile_id: str) -> StatusResponse:
     """Return current training job status for a profile.
 
-    Args:
-        profile_id: The profile to query.
-
-    Returns:
-        StatusResponse with phase, progress_pct, status, error.
-
-    Raises:
-        HTTPException(404): No active job for this profile.
+    Returns status='idle' (200) when no active job exists — callers use this
+    to distinguish "not running" from an actual error without noisy 404 logs.
     """
     job = manager.get_job(profile_id)
     if job is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No active training job for profile: {profile_id}",
+        return StatusResponse(
+            phase="idle",
+            progress_pct=0.0,
+            status="idle",
+            error=None,
         )
 
     return StatusResponse(

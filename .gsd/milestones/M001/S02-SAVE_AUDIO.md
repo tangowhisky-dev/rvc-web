@@ -66,7 +66,7 @@ The Save Audio feature has been fully implemented and tested. All components wor
 
 ### User Experience
 1. Check "Save Audio" checkbox below the Output waveform
-2. Set filepath (defaults to ~/Downloads/rvc_output.mp3)
+2. Set filepath (defaults to ~/Documents/audio/rvc_output.mp3)
 3. Start session - audio is accumulated in background
 4. When session stops, MP3 file is encoded and saved
 5. Status message appears: "✓ Saved: /path/file.mp3 (XXs)" or "✗ Save failed: error"

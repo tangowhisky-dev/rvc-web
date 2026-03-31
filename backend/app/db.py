@@ -89,6 +89,19 @@ _MIGRATIONS: list[tuple[str, str]] = [
     # level to the training distribution.  NULL on profiles created before this
     # migration — the worker falls back gracefully (no pre-gain applied).
     ("profile_rms",          "REAL"),
+    # Feature embedder model name (e.g. "spin-v2", "contentvec", "hubert").
+    # Locked after the first training run: switching embedder mid-training would
+    # corrupt the stored feature vectors in 3_feature768/. NULL = "spin-v2"
+    # (default for profiles created before this migration).
+    ("embedder",             "TEXT NOT NULL DEFAULT 'spin-v2'"),
+    # Overtraining detection threshold — number of consecutive epochs where
+    # generator loss does not improve before training is stopped early.
+    # 0 = disabled.  NULL treated as 0.
+    ("overtrain_threshold",  "INTEGER NOT NULL DEFAULT 0"),
+    # Vocoder used to train this profile: "HiFi-GAN" or "RefineGAN".
+    # Locked after the first training run — the decoder architecture is baked
+    # into the G_latest.pth checkpoint and cannot be swapped mid-training.
+    ("vocoder",              "TEXT NOT NULL DEFAULT 'HiFi-GAN'"),
 ]
 
 

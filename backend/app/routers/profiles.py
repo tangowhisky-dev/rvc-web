@@ -92,6 +92,10 @@ class ProfileOut(BaseModel):
     total_epochs_trained: int = 0
     needs_retraining: bool = False
     profile_rms: Optional[float] = None     # speech-weighted RMS of training data
+    # Embedder model used for feature extraction.  Locked after first training.
+    embedder: str = "spin-v2"
+    # Vocoder decoder architecture.  Locked after first training.
+    vocoder: str = "HiFi-GAN"
     audio_files: list[AudioFileOut] = []
 
 
@@ -247,6 +251,8 @@ async def _row_to_out(row, db) -> ProfileOut:
         total_epochs_trained=int(row["total_epochs_trained"] or 0) if "total_epochs_trained" in keys else 0,
         needs_retraining=bool(row["needs_retraining"]) if "needs_retraining" in keys else False,
         profile_rms=float(row["profile_rms"]) if "profile_rms" in keys and row["profile_rms"] is not None else None,
+        embedder=str(row["embedder"]) if "embedder" in keys and row["embedder"] else "spin-v2",
+        vocoder=str(row["vocoder"]) if "vocoder" in keys and row["vocoder"] else "HiFi-GAN",
         audio_files=audio_files,
     )
 
@@ -354,8 +360,22 @@ async def create_profile(
     file: UploadFile = ...,
     seg_start: float = Form(0.0),
     seg_end: Optional[float] = Form(None),
+    embedder: str = Form("spin-v2"),
+    vocoder: str = Form("HiFi-GAN"),
 ) -> ProfileOut:
-    """Upload an audio file, clip to the selected segment, and create a profile."""
+    """Upload an audio file, clip to the selected segment, and create a profile.
+
+    embedder: feature embedder to use during training (locked after first run).
+    vocoder: decoder architecture — "HiFi-GAN" or "RefineGAN" (locked after first run).
+    """
+    # Validate embedder name
+    _VALID_EMBEDDERS = {"spin-v2", "spin", "contentvec", "hubert"}
+    if embedder not in _VALID_EMBEDDERS:
+        raise HTTPException(status_code=400, detail=f"Invalid embedder: {embedder!r}")
+    _VALID_VOCODERS = {"HiFi-GAN", "RefineGAN"}
+    if vocoder not in _VALID_VOCODERS:
+        raise HTTPException(status_code=400, detail=f"Invalid vocoder: {vocoder!r}")
+
     profile_id = uuid.uuid4().hex
     pdir = os.path.join(_profiles_root(), profile_id)
     audio_dir = _audio_dir(pdir)
@@ -395,9 +415,9 @@ async def create_profile(
         await db.execute(
             """INSERT INTO profiles
                (id, name, status, sample_path, batch_size, audio_duration,
-                preprocessed_path, profile_dir, profile_rms, created_at)
-               VALUES (?, ?, 'untrained', ?, 8, ?, NULL, ?, ?, ?)""",
-            (profile_id, name, file_path, clip_dur, pdir, profile_rms, created_at),
+                preprocessed_path, profile_dir, profile_rms, embedder, vocoder, created_at)
+               VALUES (?, ?, 'untrained', ?, 8, ?, NULL, ?, ?, ?, ?, ?)""",
+            (profile_id, name, file_path, clip_dur, pdir, profile_rms, embedder, vocoder, created_at),
         )
         await db.execute(
             """INSERT INTO audio_files (id, profile_id, filename, file_path, duration, is_cleaned, created_at)
@@ -410,7 +430,7 @@ async def create_profile(
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder
                FROM profiles WHERE id = ?""",
             (profile_id,),
         )
@@ -519,7 +539,7 @@ async def list_profiles() -> list[ProfileOut]:
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder
                FROM profiles ORDER BY created_at DESC"""
         )
         rows = await cursor.fetchall()
@@ -540,7 +560,7 @@ async def get_profile(profile_id: str) -> ProfileOut:
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder
                FROM profiles WHERE id = ?""",
             (profile_id,),
         )

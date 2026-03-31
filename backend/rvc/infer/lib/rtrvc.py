@@ -74,33 +74,7 @@ class RVC:
             ), is_half, 0, device, self.window, self.sr
         )
 
-        project_root = os.environ.get("PROJECT_ROOT")
-        hubert_path = (
-            os.path.join(project_root, "assets", "hubert", "hubert_base.pt")
-            if project_root
-            else os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "assets", "hubert", "hubert_base.pt")
-        )
-
-        try:
-            from fairseq.data.dictionary import Dictionary
-            torch.serialization.add_safe_globals([Dictionary])
-        except (ImportError, AttributeError):
-            pass
-
-        models, _, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task(
-            [hubert_path],
-            suffix="",
-        )
-
-        hubert_model = models[0]
-        hubert_model = hubert_model.to(self.device)
-        if self.is_half:
-            hubert_model = hubert_model.half()
-        else:
-            hubert_model = hubert_model.float()
-        hubert_model.eval()
-        self.hubert = hubert_model
-
+        # ── Load synthesizer first so we know the embedder stored in the ckpt ──
         self.net_g: Optional[nn.Module] = None
 
         def set_default_model():
@@ -109,6 +83,7 @@ class RVC:
             cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
             self.if_f0 = cpt.get("f0", 1)
             self.version = cpt.get("version", "v1")
+            self._embedder_name = cpt.get("embedder", "hubert")
             if self.is_half:
                 self.net_g = self.net_g.half()
             else:
@@ -123,6 +98,7 @@ class RVC:
             self.tgt_sr = cpt["config"][-1]
             self.if_f0 = cpt.get("f0", 1)
             self.version = cpt.get("version", "v1")
+            self._embedder_name = cpt.get("embedder", "hubert")
             self.net_g = torch.jit.load(BytesIO(cpt["model"]), map_location=self.device)
             self.net_g.infer = self.net_g.forward
             self.net_g.eval().to(self.device)
@@ -135,6 +111,72 @@ class RVC:
             set_jit_model()
         else:
             set_default_model()
+
+        # ── Load the feature embedder matched to the checkpoint ──────────────
+        project_root = os.environ.get("PROJECT_ROOT")
+        assets_root = (
+            os.path.join(project_root, "assets")
+            if project_root
+            else os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "assets")
+        )
+
+        embedder_name = self._embedder_name
+        self._embedder_is_hf = (embedder_name != "hubert")
+
+        if self._embedder_is_hf:
+            # HuggingFace transformers path — spin-v2, spin, contentvec
+            # These checkpoints have no preprocessor_config.json; inputs are
+            # raw waveform tensors — same as extract_feature_print.py.
+            import warnings as _warnings
+            import logging as _logging
+            _warnings.filterwarnings("ignore", category=UserWarning)
+            _logging.getLogger("transformers").setLevel(_logging.ERROR)
+
+            from transformers import HubertModel
+            import torch.nn as _nn
+
+            class _HubertWithProj(HubertModel):
+                def __init__(self, config):
+                    super().__init__(config)
+                    self.final_proj = _nn.Linear(
+                        config.hidden_size, config.classifier_proj_size
+                    )
+
+            embedder_path = os.path.join(assets_root, embedder_name)
+            hf_model = _HubertWithProj.from_pretrained(embedder_path)
+            hf_model = hf_model.to(self.device)
+            if self.is_half:
+                hf_model = hf_model.half()
+            else:
+                hf_model = hf_model.float()
+            hf_model.eval()
+            self.embedder = hf_model
+            import logging as _log2
+            _log2.getLogger("rvc_web.rtrvc").info(
+                "Loaded HuggingFace embedder: %s", embedder_name
+            )
+        else:
+            # fairseq path — hubert_base.pt
+            hubert_path = os.path.join(assets_root, "hubert", "hubert_base.pt")
+            try:
+                from fairseq.data.dictionary import Dictionary
+                torch.serialization.add_safe_globals([Dictionary])
+            except (ImportError, AttributeError):
+                pass
+            models, _, _ = fairseq.checkpoint_utils.load_model_ensemble_and_task(
+                [hubert_path],
+                suffix="",
+            )
+            fs_model = models[0]
+            fs_model = fs_model.to(self.device)
+            if self.is_half:
+                fs_model = fs_model.half()
+            else:
+                fs_model = fs_model.float()
+            fs_model.eval()
+            self.embedder = fs_model
+            import logging as _logging
+            _logging.getLogger("rvc_web.rtrvc").info("Loaded fairseq HuBERT embedder")
 
     def set_key(self, new_key):
         self.f0_up_key = new_key
@@ -166,17 +208,25 @@ class RVC:
             if feats.dim() == 2:  # double channels
                 feats = feats.mean(-1)
             feats = feats.view(1, -1)
-            padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
 
-            inputs = {
-                "source": feats,
-                "padding_mask": padding_mask,
-                "output_layer": 9 if self.version == "v1" else 12,
-            }
-            logits = self.hubert.extract_features(**inputs)
-            feats = (
-                self.hubert.final_proj(logits[0]) if self.version == "v1" else logits[0]
-            )
+            if self._embedder_is_hf:
+                # HuggingFace transformers extraction (spin-v2, spin, contentvec)
+                # Raw waveform tensor — model handles normalisation internally.
+                out = self.embedder(feats)
+                feats = out["last_hidden_state"]  # (1, T, D)
+            else:
+                # fairseq HuBERT extraction
+                padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
+                inputs = {
+                    "source": feats,
+                    "padding_mask": padding_mask,
+                    "output_layer": 9 if self.version == "v1" else 12,
+                }
+                logits = self.embedder.extract_features(**inputs)
+                feats = (
+                    self.embedder.final_proj(logits[0]) if self.version == "v1" else logits[0]
+                )
+
             feats = torch.cat((feats, feats[:, -1:, :]), 1)
             if protect < 0.5 and self.if_f0 == 1:
                 feats0 = feats.clone()
