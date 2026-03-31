@@ -14,7 +14,7 @@ import nemo.collections.asr as nemo_asr
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
+ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets", "ecapa")
 NEMO_PATH = os.path.join(ASSETS_DIR, "ecapa_tdnn.nemo")
 OUTPUT_PT_PATH = os.path.join(ASSETS_DIR, "ecapa_tdnn.pt")
 OUTPUT_CONFIG_PATH = os.path.join(ASSETS_DIR, "ecapa_tdnn_config.yaml")

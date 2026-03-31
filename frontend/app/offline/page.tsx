@@ -3,6 +3,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { TipsPanel } from '../TipsPanel';
 import { ProfilePicker } from '../ProfilePicker';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip as RechartsTooltip,
+  ResponsiveContainer,
+  RadarChart,
+  PolarGrid,
+  PolarAngleAxis,
+  PolarRadiusAxis,
+  Radar,
+  Legend,
+} from 'recharts';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
@@ -18,6 +33,20 @@ interface Profile {
   total_epochs_trained: number;
   embedder: string;
   vocoder: string;
+}
+
+interface VoiceAnalysis {
+  profile_input_similarity: number;
+  profile_output_similarity: number;
+  input_output_similarity: number;
+  improvement: number;
+  improvement_pct: number;
+  quality_input: string;
+  quality_output: string;
+  summary: string;
+  profile_emb_top10: number[];
+  input_emb_top10: number[];
+  output_emb_top10: number[];
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +367,159 @@ function ParamSlider({
 }
 
 // ---------------------------------------------------------------------------
+// VoiceAnalysisPanel — speaker embedding comparison with charts
+// ---------------------------------------------------------------------------
+
+function qualityColor(quality: string): string {
+  switch (quality) {
+    case 'Excellent': return '#10b981';
+    case 'Good':      return '#22c55e';
+    case 'Normal':    return '#f59e0b';
+    case 'Bad':       return '#ef4444';
+    case 'Very Poor': return '#dc2626';
+    default:          return '#6b7280';
+  }
+}
+
+function VoiceAnalysisPanel({
+  analysis,
+  loading,
+  profileName,
+}: {
+  analysis: VoiceAnalysis | null;
+  loading: boolean;
+  profileName: string;
+}) {
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-6 text-[12px] font-mono text-zinc-400">
+        <div className="flex items-center gap-2">
+          <div className="w-4 h-4 border-2 border-cyan-500 border-t-transparent rounded-full animate-spin" />
+          Analyzing speaker embeddings…
+        </div>
+      </div>
+    );
+  }
+
+  if (!analysis) {
+    return (
+      <div className="text-[11px] font-mono text-zinc-500 py-2 text-center">
+        Enable this option before conversion to see analysis results.
+      </div>
+    );
+  }
+
+  // Bar chart data
+  const barData = [
+    { name: 'Profile ↔ Input', value: Math.round(analysis.profile_input_similarity * 100), fill: '#f59e0b' },
+    { name: 'Profile ↔ Output', value: Math.round(analysis.profile_output_similarity * 100), fill: '#22c55e' },
+    { name: 'Input ↔ Output', value: Math.round(analysis.input_output_similarity * 100), fill: '#8b5cf6' },
+  ];
+
+  // Radar chart data
+  const radarData = analysis.profile_emb_top10.map((_, i) => ({
+    dim: `D${i + 1}`,
+    Profile: Math.abs(analysis.profile_emb_top10[i]),
+    Input: Math.abs(analysis.input_emb_top10[i]),
+    Output: Math.abs(analysis.output_emb_top10[i]),
+  }));
+
+  const outputQualityColor = qualityColor(analysis.quality_output);
+
+  return (
+    <div className="flex flex-col gap-5 pt-2">
+      {/* Quality badge + summary */}
+      <div className="flex items-start gap-4">
+        <div
+          className="px-3 py-1.5 rounded-lg text-[11px] font-mono font-bold uppercase tracking-wider"
+          style={{
+            backgroundColor: `${outputQualityColor}20`,
+            color: outputQualityColor,
+            border: `1px solid ${outputQualityColor}40`,
+          }}
+        >
+          {analysis.quality_output}
+        </div>
+        <p className="text-[11px] font-mono text-zinc-300 leading-relaxed flex-1">
+          {analysis.summary}
+        </p>
+      </div>
+
+      {/* Similarity bars */}
+      <div>
+        <h3 className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-3">
+          Speaker Similarity
+        </h3>
+        <ResponsiveContainer width="100%" height={140}>
+          <BarChart data={barData} layout="vertical" margin={{ left: 120, right: 40 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+            <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 10, fill: '#71717a' }} />
+            <YAxis
+              type="category"
+              dataKey="name"
+              tick={{ fontSize: 10, fill: '#a1a1aa' }}
+              width={120}
+            />
+            <RechartsTooltip
+              formatter={(value) => `${value}%`}
+              contentStyle={{
+                backgroundColor: '#18181b',
+                border: '1px solid #3f3f46',
+                borderRadius: '6px',
+                fontSize: '11px',
+                fontFamily: 'monospace',
+              }}
+            />
+            <Bar dataKey="value" radius={[0, 4, 4, 0]} barSize={20} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Radar chart */}
+      <div>
+        <h3 className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-3">
+          Embedding Comparison (Top 10 Dimensions)
+        </h3>
+        <ResponsiveContainer width="100%" height={220}>
+          <RadarChart data={radarData}>
+            <PolarGrid stroke="#3f3f46" />
+            <PolarAngleAxis dataKey="dim" tick={{ fontSize: 9, fill: '#71717a' }} />
+            <PolarRadiusAxis tick={false} axisLine={false} />
+            <Radar
+              name="Profile"
+              dataKey="Profile"
+              stroke="#f59e0b"
+              fill="#f59e0b"
+              fillOpacity={0.15}
+              strokeWidth={1.5}
+            />
+            <Radar
+              name="Input"
+              dataKey="Input"
+              stroke="#22d3ee"
+              fill="#22d3ee"
+              fillOpacity={0.15}
+              strokeWidth={1.5}
+            />
+            <Radar
+              name="Output"
+              dataKey="Output"
+              stroke="#a78bfa"
+              fill="#a78bfa"
+              fillOpacity={0.15}
+              strokeWidth={1.5}
+            />
+            <Legend
+              wrapperStyle={{ fontSize: '10px', fontFamily: 'monospace', color: '#a1a1aa' }}
+            />
+          </RadarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
 
@@ -365,6 +547,12 @@ export default function OfflinePage() {
   const [outputDuration, setOutputDuration] = useState(0);
   const [outputFilename, setOutputFilename] = useState('');
   const abortRef = useRef<AbortController | null>(null);
+
+  // Post-conversion analysis
+  const [analyzeEnabled, setAnalyzeEnabled] = useState(false);
+  const [analysis, setAnalysis]           = useState<VoiceAnalysis | null>(null);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const outputFilePathRef = useRef<string | null>(null);
 
   // Load profiles
   useEffect(() => {
@@ -397,6 +585,12 @@ export default function OfflinePage() {
     a.onloadedmetadata = () => setOutputDuration(a.duration);
   }, [outputUrl]);
 
+  // Run analysis when output is ready and enabled
+  useEffect(() => {
+    if (!outputUrl || !profileId || !analyzeEnabled || !outputFilePathRef.current) return;
+    runAnalysis();
+  }, [outputUrl]);
+
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -406,6 +600,8 @@ export default function OfflinePage() {
     setJobError(null);
     setProgress(0);
     setJobId(null);
+    setAnalysis(null);
+    outputFilePathRef.current = null;
   }
 
   async function handleConvert() {
@@ -456,7 +652,7 @@ export default function OfflinePage() {
             const msg = JSON.parse(line.slice(6));
             if (msg.type === 'progress') {
               setProgress(Math.round(msg.fraction * 100));
-            } else if (msg.type === 'done') {
+            } else             if (msg.type === 'done') {
               setJobId(msg.job_id);
               setJobStatus('done');
               setProgress(100);
@@ -478,6 +674,8 @@ export default function OfflinePage() {
                 } else {
                   setOutputFilename('output_rvc.wav');
                 }
+                // Store the server path for analysis
+                outputFilePathRef.current = msg.result_path || null;
               }
             } else if (msg.type === 'error') {
               setJobStatus('error');
@@ -506,6 +704,43 @@ export default function OfflinePage() {
     a.href = outputUrl;
     a.download = outputFilename;
     a.click();
+  }
+
+  async function runAnalysis() {
+    if (!profileId || !outputFilePathRef.current) return;
+    setAnalysisLoading(true);
+    try {
+      // We need to send the input file to the server for analysis
+      // First upload input file, then call analysis
+      const inputForm = new FormData();
+      if (inputFile) {
+        inputForm.append('file', inputFile);
+        const uploadRes = await fetch(`${API}/api/offline/upload-temp`, {
+          method: 'POST',
+          body: inputForm,
+        });
+        if (!uploadRes.ok) throw new Error('Failed to upload input');
+        const uploadData = await uploadRes.json();
+        const inputPath = uploadData.path;
+
+        const res = await fetch(`${API}/api/offline/analyze`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            profile_id: profileId,
+            input_audio_path: inputPath,
+            output_audio_path: outputFilePathRef.current,
+          }),
+        });
+        if (!res.ok) throw new Error('Analysis failed');
+        const data = await res.json();
+        setAnalysis(data);
+      }
+    } catch (err: any) {
+      console.error('Analysis error:', err);
+    } finally {
+      setAnalysisLoading(false);
+    }
   }
 
   const selectedProfile = profiles.find(p => p.id === profileId);
@@ -679,6 +914,35 @@ export default function OfflinePage() {
               color="#a78bfa"
               label="OUTPUT"
             />
+          </section>
+        )}
+
+        {/* Post-conversion analysis */}
+        {jobStatus === 'done' && (
+          <section className="flex flex-col gap-3 p-4 rounded-xl border border-zinc-800 bg-zinc-900/50">
+            <div className="flex items-center gap-3">
+              <input
+                type="checkbox"
+                id="analyze"
+                checked={analyzeEnabled}
+                onChange={e => setAnalyzeEnabled(e.target.checked)}
+                className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-cyan-500 focus:ring-cyan-500/30"
+              />
+              <label htmlFor="analyze" className="text-[12px] font-mono text-zinc-300 cursor-pointer">
+                Post-Conversion Analysis
+              </label>
+              <span className="text-[10px] font-mono text-zinc-500">
+                Compare speaker embeddings to verify voice conversion quality
+              </span>
+            </div>
+
+            {analyzeEnabled && (
+              <VoiceAnalysisPanel
+                analysis={analysis}
+                loading={analysisLoading}
+                profileName={selectedProfile?.name ?? 'Profile'}
+              />
+            )}
           </section>
         )}
 

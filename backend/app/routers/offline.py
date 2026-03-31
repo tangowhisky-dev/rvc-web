@@ -30,14 +30,14 @@ from backend.app.db import get_db
 
 # MIME types for common audio formats
 _AUDIO_MIME = {
-    ".wav":  "audio/wav",
-    ".mp3":  "audio/mpeg",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
     ".flac": "audio/flac",
-    ".ogg":  "audio/ogg",
-    ".m4a":  "audio/mp4",
-    ".aac":  "audio/aac",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
     ".aiff": "audio/aiff",
-    ".aif":  "audio/aiff",
+    ".aif": "audio/aiff",
 }
 
 # Formats soundfile can write natively (no ffmpeg needed)
@@ -52,13 +52,19 @@ def _write_audio(path: str, audio: np.ndarray, sr: int, ext: str) -> None:
     """
     ext = ext.lower()
     if ext in _SF_WRITE_EXTS:
-        fmt_map = {".wav": "WAV", ".flac": "FLAC", ".ogg": "OGG",
-                   ".aiff": "AIFF", ".aif": "AIFF"}
+        fmt_map = {
+            ".wav": "WAV",
+            ".flac": "FLAC",
+            ".ogg": "OGG",
+            ".aiff": "AIFF",
+            ".aif": "AIFF",
+        }
         sf.write(path, audio, sr, format=fmt_map.get(ext, "WAV"))
     else:
         # Write to a temporary WAV first, then convert with pydub
         from pydub import AudioSegment
         import tempfile as _tmp
+
         with _tmp.NamedTemporaryFile(suffix=".wav", delete=False) as t:
             wav_path = t.name
         try:
@@ -72,6 +78,7 @@ def _write_audio(path: str, audio: np.ndarray, sr: int, ext: str) -> None:
                 os.unlink(wav_path)
             except OSError:
                 pass
+
 
 logger = logging.getLogger("rvc_web.offline")
 
@@ -87,6 +94,7 @@ _jobs: dict[str, dict] = {}  # job_id → {status, result_path, error, sample_ra
 # ---------------------------------------------------------------------------
 # Profile list — re-uses same DB query as training page
 # ---------------------------------------------------------------------------
+
 
 class ProfileOut(BaseModel):
     id: str
@@ -121,18 +129,21 @@ async def list_profiles():
                 model_path = mp
             # find index
             import glob
+
             matches = glob.glob(os.path.join(pdir, "*.index"))
             if matches:
                 index_path = matches[0]
-        out.append(ProfileOut(
-            id=row["id"],
-            name=row["name"],
-            model_path=model_path,
-            index_path=index_path,
-            total_epochs_trained=int(row["total_epochs_trained"] or 0),
-            embedder=row["embedder"] or "spin-v2",
-            vocoder=row["vocoder"] or "HiFi-GAN",
-        ))
+        out.append(
+            ProfileOut(
+                id=row["id"],
+                name=row["name"],
+                model_path=model_path,
+                index_path=index_path,
+                total_epochs_trained=int(row["total_epochs_trained"] or 0),
+                embedder=row["embedder"] or "spin-v2",
+                vocoder=row["vocoder"] or "HiFi-GAN",
+            )
+        )
     return out
 
 
@@ -143,11 +154,11 @@ async def list_profiles():
 _SR_16K = 16000
 _SR_48K = 48000
 _WINDOW = 160
-_ZC     = _SR_48K // 100       # 480
-_BLOCK_48K   = 9600             # 200ms blocks — same as realtime
-_SOLA_BUF_48K   = 2 * _ZC      # 960
-_SOLA_SEARCH_48K = _ZC          # 480
-_EXTRA_TIME = 2.0               # 2s context window
+_ZC = _SR_48K // 100  # 480
+_BLOCK_48K = 9600  # 200ms blocks — same as realtime
+_SOLA_BUF_48K = 2 * _ZC  # 960
+_SOLA_SEARCH_48K = _ZC  # 480
+_EXTRA_TIME = 2.0  # 2s context window
 
 
 def _compute_block_params(block_48k: int = _BLOCK_48K) -> dict:
@@ -161,27 +172,27 @@ def _compute_block_params(block_48k: int = _BLOCK_48K) -> dict:
     return_length_frames = total_out_48k // _ZC
     skip_head_frames = p_len - return_length_frames
     return {
-        "block_48k":            block_48k,
-        "block_16k":            block_16k,
-        "f0_extractor_frame":   f0_extractor_frame,
-        "total_16k_samples":    total_16k_samples,
-        "p_len":                p_len,
+        "block_48k": block_48k,
+        "block_16k": block_16k,
+        "f0_extractor_frame": f0_extractor_frame,
+        "total_16k_samples": total_16k_samples,
+        "p_len": p_len,
         "return_length_frames": return_length_frames,
-        "skip_head_frames":     skip_head_frames,
-        "sola_buf_48k":         _SOLA_BUF_48K,
-        "sola_search_48k":      _SOLA_SEARCH_48K,
+        "skip_head_frames": skip_head_frames,
+        "sola_buf_48k": _SOLA_BUF_48K,
+        "sola_search_48k": _SOLA_SEARCH_48K,
     }
 
 
 def _run_offline_inference(
-    audio_16k: np.ndarray,     # float32, mono, 16 kHz
-    audio_tgt: np.ndarray,     # float32, mono, tgt_sr  (for SOLA output alignment)
+    audio_16k: np.ndarray,  # float32, mono, 16 kHz
+    audio_tgt: np.ndarray,  # float32, mono, tgt_sr  (for SOLA output alignment)
     model_path: str,
     index_path: str,
     pitch: float,
     index_rate: float,
     protect: float,
-    progress_cb,               # callable(fraction: float)
+    progress_cb,  # callable(fraction: float)
     output_gain: float = 1.0,  # post-inference volume multiplier (1.0 = no change)
 ) -> np.ndarray:
     """Run chunked RVC inference on a full audio array.
@@ -198,6 +209,7 @@ def _run_offline_inference(
 
     try:
         from configs.config import Config
+
         Config.use_insecure_load()
     except Exception:
         pass
@@ -205,8 +217,11 @@ def _run_offline_inference(
     from infer.lib.rtrvc import RVC
     from torchaudio.transforms import Resample
 
-    device = "mps" if torch.backends.mps.is_available() else \
-             ("cuda" if torch.cuda.is_available() else "cpu")
+    device = (
+        "mps"
+        if torch.backends.mps.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    )
     # fp16 on CUDA only — MPS and CPU require fp32
     is_half = device.startswith("cuda")
 
@@ -222,21 +237,23 @@ def _run_offline_inference(
     tgt_sr = rvc.tgt_sr
 
     # Resamplers
-    resample_16_tgt = Resample(orig_freq=_SR_16K, new_freq=tgt_sr,
-                               dtype=torch.float32).to(device)
-    resample_tgt_16 = Resample(orig_freq=tgt_sr, new_freq=_SR_16K,
-                               dtype=torch.float32).to(device)
+    resample_16_tgt = Resample(
+        orig_freq=_SR_16K, new_freq=tgt_sr, dtype=torch.float32
+    ).to(device)
+    resample_tgt_16 = Resample(
+        orig_freq=tgt_sr, new_freq=_SR_16K, dtype=torch.float32
+    ).to(device)
 
     bp = _compute_block_params()
-    block_16k          = bp["block_16k"]
-    total_16k_samples  = bp["total_16k_samples"]
-    skip_head          = bp["skip_head_frames"]
-    return_length      = bp["return_length_frames"]
-    sola_buf_48k       = bp["sola_buf_48k"]
-    sola_search_48k    = bp["sola_search_48k"]
-    block_tgt          = int(bp["block_48k"] * tgt_sr / _SR_48K)
-    sola_buf_tgt       = int(sola_buf_48k   * tgt_sr / _SR_48K)
-    sola_search_tgt    = int(sola_search_48k * tgt_sr / _SR_48K)
+    block_16k = bp["block_16k"]
+    total_16k_samples = bp["total_16k_samples"]
+    skip_head = bp["skip_head_frames"]
+    return_length = bp["return_length_frames"]
+    sola_buf_48k = bp["sola_buf_48k"]
+    sola_search_48k = bp["sola_search_48k"]
+    block_tgt = int(bp["block_48k"] * tgt_sr / _SR_48K)
+    sola_buf_tgt = int(sola_buf_48k * tgt_sr / _SR_48K)
+    sola_search_tgt = int(sola_search_48k * tgt_sr / _SR_48K)
 
     # Patch _get_f0 for head-padding (same as realtime worker)
     _orig_get_f0 = rvc._get_f0
@@ -249,14 +266,18 @@ def _run_offline_inference(
             c = torch.cat([torch.zeros(pad, dtype=c.dtype, device=c.device), c])
             f = torch.cat([torch.zeros(pad, dtype=f.dtype, device=f.device), f])
         return c, f
+
     rvc._get_f0 = _patched_get_f0
 
     # FAISS fix
     if hasattr(rvc, "index"):
         import faiss  # noqa: F401
+
         _orig_search = rvc.index.search
+
         def _safe_search(npy, k):
             return _orig_search(np.ascontiguousarray(npy, dtype=np.float32), k=k)
+
         rvc.index.search = _safe_search
 
     # Warmup
@@ -267,9 +288,12 @@ def _run_offline_inference(
     rolling_buf = torch.zeros(total_16k_samples, device=device)
 
     # SOLA state — sin² fade windows, same as realtime worker
-    fade_in_win  = torch.sin(0.5 * np.pi * torch.linspace(0.0, 1.0, sola_buf_tgt, device=device)) ** 2
+    fade_in_win = (
+        torch.sin(0.5 * np.pi * torch.linspace(0.0, 1.0, sola_buf_tgt, device=device))
+        ** 2
+    )
     fade_out_win = 1.0 - fade_in_win
-    sola_buf     = torch.zeros(sola_buf_tgt, device=device)
+    sola_buf = torch.zeros(sola_buf_tgt, device=device)
     output_parts: list[np.ndarray] = []
 
     # Pad input at end so last block is full
@@ -279,19 +303,21 @@ def _run_offline_inference(
 
     for block_idx in range(n_blocks):
         off = block_idx * block_16k
-        chunk_np = audio_padded[off: off + block_16k]
-        chunk_t  = torch.from_numpy(chunk_np).to(device)
+        chunk_np = audio_padded[off : off + block_16k]
+        chunk_t = torch.from_numpy(chunk_np).to(device)
 
         # Shift rolling buffer left, append new block
         rolling_buf[:-block_16k] = rolling_buf[block_16k:].clone()
         rolling_buf[-block_16k:] = chunk_t
 
-        infer_out = rvc.infer(rolling_buf, block_16k, skip_head, return_length, "rmvpe", protect)
+        infer_out = rvc.infer(
+            rolling_buf, block_16k, skip_head, return_length, "rmvpe", protect
+        )
         infer_tgt = infer_out
 
         # SOLA: find best alignment in search window
         if infer_tgt.shape[0] >= sola_buf_tgt + sola_search_tgt:
-            search_region = infer_tgt[:sola_buf_tgt + sola_search_tgt]
+            search_region = infer_tgt[: sola_buf_tgt + sola_search_tgt]
             # cross-correlate sola_buf against search_region
             if sola_buf_tgt > 0 and search_region.shape[0] > sola_buf_tgt:
                 try:
@@ -305,7 +331,8 @@ def _run_offline_inference(
                             search_region[None, None, :] ** 2,
                             torch.ones(1, 1, sola_buf_tgt, device=device),
                             padding=0,
-                        ).squeeze() + 1e-8
+                        ).squeeze()
+                        + 1e-8
                     )
                     sola_offset = int(torch.argmax(cor_nom / cor_den).item())
                 except Exception:
@@ -315,7 +342,7 @@ def _run_offline_inference(
 
             # Extract the aligned output block
             out_start = sola_offset
-            out_block = infer_tgt[out_start: out_start + block_tgt + sola_buf_tgt]
+            out_block = infer_tgt[out_start : out_start + block_tgt + sola_buf_tgt]
             if out_block.shape[0] < block_tgt + sola_buf_tgt:
                 out_block = torch.nn.functional.pad(
                     out_block, (0, block_tgt + sola_buf_tgt - out_block.shape[0])
@@ -325,7 +352,7 @@ def _run_offline_inference(
             out_block[:sola_buf_tgt] = (
                 sola_buf * fade_out_win + out_block[:sola_buf_tgt] * fade_in_win
             )
-            sola_buf = out_block[block_tgt: block_tgt + sola_buf_tgt].clone()
+            sola_buf = out_block[block_tgt : block_tgt + sola_buf_tgt].clone()
             block_out = out_block[:block_tgt]
             output_parts.append(block_out.cpu().numpy())
         else:
@@ -353,8 +380,8 @@ def _run_offline_inference(
     # naturally outputs at a different RMS than the input (measured ~3.8× higher).
     # Without this the output is significantly louder than the source file.
     if len(result) > 0 and len(audio_16k) > 0:
-        in_rms  = float(np.sqrt(np.mean(audio_16k ** 2)) + 1e-8)
-        out_rms = float(np.sqrt(np.mean(result ** 2)) + 1e-8)
+        in_rms = float(np.sqrt(np.mean(audio_16k**2)) + 1e-8)
+        out_rms = float(np.sqrt(np.mean(result**2)) + 1e-8)
         rms_scale = in_rms / out_rms
         rms_scale = float(np.clip(rms_scale, 0.1, 10.0))
         result = result * rms_scale
@@ -368,6 +395,7 @@ def _run_offline_inference(
 # ---------------------------------------------------------------------------
 # SSE convert endpoint
 # ---------------------------------------------------------------------------
+
 
 @router.post("/convert")
 async def convert_audio(
@@ -387,8 +415,7 @@ async def convert_audio(
     # Load profile
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT id, name, profile_dir FROM profiles WHERE id = ?",
-            (profile_id,)
+            "SELECT id, name, profile_dir FROM profiles WHERE id = ?", (profile_id,)
         )
         row = await cursor.fetchone()
     if not row:
@@ -402,6 +429,7 @@ async def convert_audio(
         if os.path.exists(mp):
             model_path = mp
         import glob
+
         matches = glob.glob(os.path.join(pdir, "*.index"))
         if matches:
             index_path = matches[0]
@@ -431,6 +459,7 @@ async def convert_audio(
     if orig_sr != _SR_16K:
         resamp = torch.from_numpy(audio_mono).unsqueeze(0)
         from torchaudio.transforms import Resample as _R
+
         resamp = _R(orig_freq=orig_sr, new_freq=_SR_16K)(resamp).squeeze(0)
         audio_16k = resamp.numpy()
     else:
@@ -485,14 +514,14 @@ async def convert_audio(
             try:
                 item = await asyncio.wait_for(progress_queue.get(), timeout=120.0)
             except asyncio.TimeoutError:
-                yield "data: {\"type\":\"error\",\"message\":\"timeout\"}\n\n"
+                yield 'data: {"type":"error","message":"timeout"}\n\n'
                 return
 
             if isinstance(item, float):
                 yield f"data: {_json.dumps({'type': 'progress', 'fraction': round(item, 3)})}\n\n"
             elif item == "done":
                 job = _jobs[job_id]
-                yield f"data: {_json.dumps({'type': 'done', 'job_id': job_id})}\n\n"
+                yield f"data: {_json.dumps({'type': 'done', 'job_id': job_id, 'result_path': job.get('result_path', '')})}\n\n"
                 return
             elif isinstance(item, str) and item.startswith("error:"):
                 msg = item[6:]
@@ -513,6 +542,7 @@ async def convert_audio(
 # Result download
 # ---------------------------------------------------------------------------
 
+
 @router.get("/result/{job_id}")
 async def download_result(job_id: str):
     job = _jobs.get(job_id)
@@ -527,7 +557,7 @@ async def download_result(job_id: str):
 
     orig = job.get("orig_filename", "output.wav")
     stem = os.path.splitext(orig)[0]
-    ext  = os.path.splitext(result_path)[1].lower() or ".wav"
+    ext = os.path.splitext(result_path)[1].lower() or ".wav"
     download_name = f"{stem}_rvc{ext}"
     mime = _AUDIO_MIME.get(ext, "application/octet-stream")
 
@@ -537,3 +567,94 @@ async def download_result(job_id: str):
         filename=download_name,
         headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# Temp audio upload (for analysis)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/upload-temp")
+async def upload_temp_audio(file: UploadFile = File(...)):
+    """Upload audio to a temp file and return its path (for analysis)."""
+    ext = os.path.splitext(file.filename or "")[1].lower() or ".wav"
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False, prefix="rvc_analysis_")
+    tmp.close()
+    content = await file.read()
+    with open(tmp.name, "wb") as f:
+        f.write(content)
+    return {"path": tmp.name}
+
+
+# ---------------------------------------------------------------------------
+# Voice conversion analysis
+# ---------------------------------------------------------------------------
+
+
+class AnalysisRequest(BaseModel):
+    profile_id: str
+    input_audio_path: str
+    output_audio_path: str
+
+
+class AnalysisResponse(BaseModel):
+    profile_input_similarity: float
+    profile_output_similarity: float
+    input_output_similarity: float
+    improvement: float
+    improvement_pct: float
+    quality_input: str
+    quality_output: str
+    summary: str
+    profile_emb_top10: list[float]
+    input_emb_top10: list[float]
+    output_emb_top10: list[float]
+
+
+@router.post("/analyze", response_model=AnalysisResponse)
+async def analyze_conversion(req: AnalysisRequest):
+    """Compare speaker embeddings of profile, input, and output audio."""
+    from backend.app.voice_analysis import analyze_conversion
+
+    # Resolve profile embedding path
+    profile_emb_path = None
+    pdir = None
+
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT profile_dir FROM profiles WHERE id = ?",
+            (req.profile_id,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            pdir = row["profile_dir"]
+
+    if not pdir or not os.path.isdir(pdir):
+        raise HTTPException(status_code=404, detail="Profile directory not found")
+
+    # Use existing profile_embedding.pt if available
+    profile_emb_path = os.path.join(pdir, "profile_embedding.pt")
+    if not os.path.exists(profile_emb_path):
+        # Fall back to using the audio directory
+        profile_emb_path = pdir
+
+    # Determine device
+    import torch
+
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+
+    try:
+        result = analyze_conversion(
+            profile_emb_path=profile_emb_path,
+            input_audio_path=req.input_audio_path,
+            output_audio_path=req.output_audio_path,
+            device=device,
+        )
+        return AnalysisResponse(**result)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Analysis failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")

@@ -463,6 +463,22 @@ async def _run_pipeline(
                     }
                 )
 
+    # Guard: prior_epochs > 0 but checkpoint missing — treat as fresh run rather
+    # than starting from random init with no pretrain weights, which would silently
+    # produce garbage output.  Reset prior_epochs so pretrain weights are loaded.
+    if prior_epochs > 0 and not seeded_checkpoint:
+        await job.queue.put(
+            {
+                "type": "log",
+                "message": (
+                    f"WARNING: DB records {prior_epochs} prior epochs but no checkpoint "
+                    "found in profile checkpoints/ — treating as fresh run with pretrain weights."
+                ),
+                "phase": "setup",
+            }
+        )
+        prior_epochs = 0
+
     # ------------------------------------------------------------------
     # Clean stale training artifacts before each run so we always start
     # fresh (no accumulated checkpoints, tfevents, or stale logs).
@@ -640,26 +656,45 @@ async def _run_pipeline(
 
     # ------------------------------------------------------------------
     # Phase 1: Preprocess
+    # Skip if same profile, no audio changes, and 0_gt_wavs already populated.
+    # Preprocess is expensive and idempotent — safe to skip when inputs unchanged.
+    # Always runs when: different_profile, files_changed, or 0_gt_wavs empty/missing.
     # ------------------------------------------------------------------
-    _emit_phase("preprocess", "Preprocessing audio samples")
+    gt_wavs_dir_check = os.path.join(exp_dir, "0_gt_wavs")
+    _gt_wavs_exist = (
+        os.path.isdir(gt_wavs_dir_check)
+        and any(f.endswith(".wav") for f in os.listdir(gt_wavs_dir_check))
+    ) if os.path.isdir(gt_wavs_dir_check) else False
+    _skip_preprocess = (not different_profile) and (not files_changed) and _gt_wavs_exist
 
-    preprocess_args = [
-        python,
-        "infer/modules/train/preprocess.py",
-        sample_dir,  # inp_root (directory, not the wav file itself)
-        "32000",  # sr
-        str(n_cpu),  # n_p
-        exp_dir,  # exp_dir (absolute path)
-        "False",  # noparallel
-        "3.0",  # per (segment duration)
-    ]
+    if _skip_preprocess:
+        await job.queue.put(
+            {
+                "type": "log",
+                "message": "Skipping preprocess — same profile, audio unchanged, 0_gt_wavs present",
+                "phase": "preprocess",
+            }
+        )
+    else:
+        _emit_phase("preprocess", "Preprocessing audio samples")
 
-    ok = await _run_subprocess(
-        job, preprocess_args, base_env, rvc_pkg_dir, "preprocess"
-    )
-    if not ok:
-        await _fail("preprocess", "Preprocess phase failed (non-zero exit code)")
-        return
+        preprocess_args = [
+            python,
+            "infer/modules/train/preprocess.py",
+            sample_dir,  # inp_root (directory, not the wav file itself)
+            "32000",  # sr
+            str(n_cpu),  # n_p
+            exp_dir,  # exp_dir (absolute path)
+            "False",  # noparallel
+            "3.0",  # per (segment duration)
+        ]
+
+        ok = await _run_subprocess(
+            job, preprocess_args, base_env, rvc_pkg_dir, "preprocess"
+        )
+        if not ok:
+            await _fail("preprocess", "Preprocess phase failed (non-zero exit code)")
+            return
 
     # ------------------------------------------------------------------
     # Resolve compute device for all subprocess phases.
@@ -807,6 +842,25 @@ async def _run_pipeline(
         )
 
     # ------------------------------------------------------------------
+    # Pretrain weights — must be resolved before _write_config so that
+    # spk_embed_dim can be read from the checkpoint (RefineGAN fix).
+    # ------------------------------------------------------------------
+    if prior_epochs == 0:
+        if vocoder == "RefineGAN":
+            pretrain_g = os.path.join(project_root, "assets", "refinegan", "f0G32k.pth")
+            pretrain_d = os.path.join(project_root, "assets", "refinegan", "f0D32k.pth")
+        else:
+            pretrain_g = os.path.join(
+                project_root, "assets", "pretrained_v2", "f0G32k.pth"
+            )
+            pretrain_d = os.path.join(
+                project_root, "assets", "pretrained_v2", "f0D32k.pth"
+            )
+    else:
+        pretrain_g = ""
+        pretrain_d = ""
+
+    # ------------------------------------------------------------------
     # Pre-phase 3 setup: config.json and filelist.txt
     # ------------------------------------------------------------------
     try:
@@ -843,23 +897,6 @@ async def _run_pipeline(
     # Cumulative epoch target: train.py resumes from prior_epochs (loaded
     # from G_latest.pth) and runs until it hits this number.
     cumulative_epochs = prior_epochs + total_epoch
-
-    # Pretrain weights — absolute paths into project_root/assets/
-    # RefineGAN ships its own pretrained G/D under assets/refinegan/
-    if prior_epochs == 0:
-        if vocoder == "RefineGAN":
-            pretrain_g = os.path.join(project_root, "assets", "refinegan", "f0G32k.pth")
-            pretrain_d = os.path.join(project_root, "assets", "refinegan", "f0D32k.pth")
-        else:
-            pretrain_g = os.path.join(
-                project_root, "assets", "pretrained_v2", "f0G32k.pth"
-            )
-            pretrain_d = os.path.join(
-                project_root, "assets", "pretrained_v2", "f0D32k.pth"
-            )
-    else:
-        pretrain_g = ""
-        pretrain_d = ""
 
     await job.queue.put(
         {
@@ -931,6 +968,10 @@ async def _run_pipeline(
     )
     job._proc = train_proc
 
+    # Tracks the last epoch_done seen in stdout — used for accurate DB epoch count
+    # on early-stop (overtraining) so we don't credit epochs that didn't run.
+    _last_completed_epoch: int = prior_epochs
+
     log_path = os.path.join(exp_dir, "train.log")
 
     # Tail train.log concurrently while train.py runs (belt + suspenders —
@@ -950,6 +991,8 @@ async def _run_pipeline(
         # Buffer the latest loss line and attach it to epoch_done.
         # All mid-epoch log noise is suppressed.
         last_loss_line: str = ""
+        # Track last completed epoch for accurate DB update (early-stop safe).
+        nonlocal _last_completed_epoch
 
         # Overtraining detection state
         # Mirrors the logic in ultimate-rvc's train.py but runs here so we can
@@ -1047,6 +1090,8 @@ async def _run_pipeline(
                     if overtrain_threshold > 0:
                         msg["overtrain_consecutive"] = _ot_consecutive
                     await job.queue.put(msg)
+                    # Track last completed epoch for accurate DB update
+                    _last_completed_epoch = epoch_num
                     # Persist losses to DB so the chart survives restarts
                     if losses:
                         try:
@@ -1253,7 +1298,9 @@ async def _run_pipeline(
     job.progress_pct = 100
     job.status = "done"
 
-    new_total_epochs = prior_epochs + total_epoch
+    # Use _last_completed_epoch (updated per epoch_done event) rather than
+    # prior_epochs + total_epoch — the two diverge on overtraining early-stop.
+    new_total_epochs = _last_completed_epoch
 
     async with get_db() as db:
         await db.execute(
