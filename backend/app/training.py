@@ -270,7 +270,12 @@ def _build_filelist(project_root: str, exp_dir: str) -> None:
 
 
 def _write_config(
-    project_root: str, exp_dir: str, batch_size: int = 8, c_spk: float = 2.0
+    project_root: str,
+    exp_dir: str,
+    batch_size: int = 8,
+    c_spk: float = 2.0,
+    vocoder: str = "HiFi-GAN",
+    pretrain_g: str = "",
 ) -> None:
     """Copy backend/rvc/configs/inuse/v2/32k.json into exp_dir/config.json, patching
     training hyperparameters for MPS performance.
@@ -284,8 +289,18 @@ def _write_config(
     - The last batch's loss line is still the one attached to epoch_done
       because _drain_stdout buffers and replaces it on each loss line seen.
       Loss accuracy is unaffected; only spectrogram images are sparser.
+
+    spk_embed_dim alignment for RefineGAN:
+    - The pretrained RefineGAN f0G32k.pth was trained with spk_embed_dim=129
+      but 32k.json has spk_embed_dim=109 (the HiFi-GAN pretrain value).
+    - Passing spk_embed_dim=109 to the model then loading pretrain weights
+      with shape [129, 256] causes a hard RuntimeError in load_state_dict.
+    - Fix: when pretrain_g is provided, read emb_g.weight.shape[0] from the
+      checkpoint and use that as spk_embed_dim in config.json. This is safe
+      for HiFi-GAN too (its pretrain also has 109, matching the config).
     """
     import json as _json
+    import torch as _torch
 
     config_save_path = os.path.join(exp_dir, "config.json")
     src = os.path.join(
@@ -294,12 +309,29 @@ def _write_config(
 
     with open(src) as _f:
         cfg = _json.load(_f)
+
     # log_interval=10: log every 10 batches instead of every batch.
     # Eliminates ~90% of the matplotlib MPS→CPU syncs that account for ~15s/epoch.
     # Loss values attached to epoch_done still come from the final batch since
     # _drain_stdout buffers and overwrites last_loss_line on each emitted loss line.
     cfg["train"]["log_interval"] = 10
     cfg["train"]["c_spk"] = c_spk
+
+    # Align spk_embed_dim with the pretrained weights.
+    # The embedding table shape is [spk_embed_dim, gin_channels]. If the
+    # checkpoint was trained with a different spk_embed_dim than 32k.json
+    # declares (RefineGAN: 129 vs HiFi-GAN: 109), load_state_dict crashes.
+    # Reading the value from the checkpoint itself makes this self-correcting
+    # for any future pretrain weight changes.
+    if pretrain_g and os.path.isfile(pretrain_g):
+        try:
+            ckpt = _torch.load(pretrain_g, map_location="cpu", weights_only=True)
+            emb_shape = ckpt.get("model", {}).get("emb_g.weight")
+            if emb_shape is not None:
+                cfg["model"]["spk_embed_dim"] = emb_shape.shape[0]
+        except Exception:
+            pass  # leave config value as-is; load_state_dict will surface the real error
+
     with open(config_save_path, "w") as _f:
         _json.dump(cfg, _f, indent=2)
 
@@ -778,7 +810,8 @@ async def _run_pipeline(
     # Pre-phase 3 setup: config.json and filelist.txt
     # ------------------------------------------------------------------
     try:
-        _write_config(project_root, exp_dir, batch_size=batch_size, c_spk=c_spk)
+        _write_config(project_root, exp_dir, batch_size=batch_size, c_spk=c_spk,
+                      vocoder=vocoder, pretrain_g=pretrain_g)
         _build_filelist(project_root, exp_dir)
     except Exception as exc:
         await _fail("setup", f"Pre-train setup failed: {exc}")
