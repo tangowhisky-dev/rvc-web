@@ -5,7 +5,8 @@ import torch
 from torch import nn
 from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn import functional as F
-from torch.nn.utils import remove_weight_norm, weight_norm
+from torch.nn.utils import remove_weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 from .generators import SineGenerator
 from .residuals import ResBlock1, ResBlock2, LRELU_SLOPE
@@ -202,14 +203,14 @@ class NSFGenerator(torch.nn.Module):
                 # because of shadowing, so we check the module name directly.
                 # https://github.com/pytorch/pytorch/blob/be0ca00c5ce260eb5bcec3237357f7a30cc08983/torch/nn/utils/__init__.py#L3
                 if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
+                    hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                     and hook.__class__.__name__ == "WeightNorm"
                 ):
                     torch.nn.utils.remove_weight_norm(l)
         for l in self.resblocks:
             for hook in self.resblocks._forward_pre_hooks.values():
                 if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
+                    hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                     and hook.__class__.__name__ == "WeightNorm"
                 ):
                     torch.nn.utils.remove_weight_norm(l)

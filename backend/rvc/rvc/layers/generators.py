@@ -4,7 +4,8 @@ import torch
 from torch import nn
 from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn import functional as F
-from torch.nn.utils import remove_weight_norm, weight_norm
+from torch.nn.utils import remove_weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 from .residuals import ResBlock1, ResBlock2, LRELU_SLOPE
 from .utils import call_weight_data_normal_if_Conv
@@ -102,24 +103,11 @@ class Generator(torch.nn.Module):
                 # normally we would do `if isinstance(...)` but this class is not accessible
                 # because of shadowing, so we check the module name directly.
                 # https://github.com/pytorch/pytorch/blob/be0ca00c5ce260eb5bcec3237357f7a30cc08983/torch/nn/utils/__init__.py#L3
-                if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
-                    and hook.__class__.__name__ == "WeightNorm"
-                ):
-                    torch.nn.utils.remove_weight_norm(l)
-
-        for l in self.resblocks:
-            for hook in l._forward_pre_hooks.values():
-                if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
-                    and hook.__class__.__name__ == "WeightNorm"
-                ):
-                    torch.nn.utils.remove_weight_norm(l)
-        return self
-
-    def remove_weight_norm(self):
-        for l in self.ups:
-            remove_weight_norm(l)
+            if (
+                hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
+                and hook.__class__.__name__ == "WeightNorm"
+            ):
+                remove_weight_norm(l)
         for l in self.resblocks:
             l.remove_weight_norm()
 

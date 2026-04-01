@@ -3,6 +3,8 @@ from typing import Optional
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.utils import remove_weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 from .utils import activate_add_tanh_sigmoid_multiply
 
@@ -49,7 +51,7 @@ class WN(torch.nn.Module):
             cond_layer = torch.nn.Conv1d(
                 gin_channels, 2 * hidden_channels * n_layers, 1
             )
-            self.cond_layer = torch.nn.utils.weight_norm(cond_layer, name="weight")
+            self.cond_layer = weight_norm(cond_layer, name="weight")
 
         for i in range(n_layers):
             dilation = dilation_rate**i
@@ -61,7 +63,7 @@ class WN(torch.nn.Module):
                 dilation=dilation,
                 padding=padding,
             )
-            in_layer = torch.nn.utils.weight_norm(in_layer, name="weight")
+            in_layer = weight_norm(in_layer, name="weight")
             self.in_layers.append(in_layer)
 
             # last one is not necessary
@@ -71,7 +73,7 @@ class WN(torch.nn.Module):
                 res_skip_channels = hidden_channels
 
             res_skip_layer = torch.nn.Conv1d(hidden_channels, res_skip_channels, 1)
-            res_skip_layer = torch.nn.utils.weight_norm(res_skip_layer, name="weight")
+            res_skip_layer = weight_norm(res_skip_layer, name="weight")
             self.res_skip_layers.append(res_skip_layer)
 
     def __call__(
@@ -117,32 +119,32 @@ class WN(torch.nn.Module):
 
     def remove_weight_norm(self):
         if self.gin_channels != 0:
-            torch.nn.utils.remove_weight_norm(self.cond_layer)
+            remove_weight_norm(self.cond_layer)
         for l in self.in_layers:
-            torch.nn.utils.remove_weight_norm(l)
+            remove_weight_norm(l)
         for l in self.res_skip_layers:
-            torch.nn.utils.remove_weight_norm(l)
+            remove_weight_norm(l)
 
     def __prepare_scriptable__(self):
         if self.gin_channels != 0:
             for hook in self.cond_layer._forward_pre_hooks.values():
                 if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
+                    hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                     and hook.__class__.__name__ == "WeightNorm"
                 ):
-                    torch.nn.utils.remove_weight_norm(self.cond_layer)
+                    remove_weight_norm(self.cond_layer)
         for l in self.in_layers:
             for hook in l._forward_pre_hooks.values():
                 if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
+                    hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                     and hook.__class__.__name__ == "WeightNorm"
                 ):
-                    torch.nn.utils.remove_weight_norm(l)
+                    remove_weight_norm(l)
         for l in self.res_skip_layers:
             for hook in l._forward_pre_hooks.values():
                 if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
+                    hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                     and hook.__class__.__name__ == "WeightNorm"
                 ):
-                    torch.nn.utils.remove_weight_norm(l)
+                    remove_weight_norm(l)
         return self

@@ -4,7 +4,8 @@ import torch
 from torch import nn
 from torch.nn import Conv1d
 from torch.nn import functional as F
-from torch.nn.utils import remove_weight_norm, weight_norm
+from torch.nn.utils import remove_weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 from .norms import WN
 from .utils import (
@@ -93,14 +94,14 @@ class ResBlock1(torch.nn.Module):
         for l in self.convs1:
             for hook in l._forward_pre_hooks.values():
                 if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
+                    hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                     and hook.__class__.__name__ == "WeightNorm"
                 ):
                     torch.nn.utils.remove_weight_norm(l)
         for l in self.convs2:
             for hook in l._forward_pre_hooks.values():
                 if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
+                    hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                     and hook.__class__.__name__ == "WeightNorm"
                 ):
                     torch.nn.utils.remove_weight_norm(l)
@@ -167,7 +168,7 @@ class ResBlock2(torch.nn.Module):
         for l in self.convs:
             for hook in l._forward_pre_hooks.values():
                 if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
+                    hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                     and hook.__class__.__name__ == "WeightNorm"
                 ):
                     torch.nn.utils.remove_weight_norm(l)
@@ -251,7 +252,7 @@ class ResidualCouplingLayer(nn.Module):
     def __prepare_scriptable__(self):
         for hook in self.enc._forward_pre_hooks.values():
             if (
-                hook.__module__ == "torch.nn.utils.weight_norm"
+                hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                 and hook.__class__.__name__ == "WeightNorm"
             ):
                 torch.nn.utils.remove_weight_norm(self.enc)
@@ -346,7 +347,7 @@ class ResidualCouplingBlock(nn.Module):
         for i in range(self.n_flows):
             for hook in self.flows[i * 2]._forward_pre_hooks.values():
                 if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
+                    hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                     and hook.__class__.__name__ == "WeightNorm"
                 ):
                     torch.nn.utils.remove_weight_norm(self.flows[i * 2])
