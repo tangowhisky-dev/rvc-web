@@ -46,15 +46,21 @@ def _get_statistics_with_mask(x, m, dim=2, eps=1e-10):
 
 def _normalize_batch(x, seq_len, normalize_type="per_feature"):
     if normalize_type == "per_feature":
-        x_mean = torch.zeros((x.shape[0], x.shape[1]), device=x.device, dtype=x.dtype)
-        x_var = torch.zeros((x.shape[0], x.shape[1]), device=x.device, dtype=x.dtype)
-        for i in range(x.shape[0]):
-            feat = x[i]
-            seq_end = seq_len[i].item() if seq_len is not None else feat.shape[-1]
-            if seq_end > 0:
-                feat_slice = feat[:, :seq_end]
-                x_mean[i] = feat_slice.mean(dim=-1)
-                x_var[i] = feat_slice.var(dim=-1, unbiased=True)
+        if seq_len is not None:
+            # Fully vectorised — no Python loop, no .item() GPU→CPU sync stalls.
+            # Works correctly on CUDA, MPS, and CPU.
+            max_t  = x.shape[-1]
+            # mask: [B, T]  —  True for valid time steps
+            mask   = torch.arange(max_t, device=x.device).unsqueeze(0) < seq_len.unsqueeze(1)
+            mask_f = mask.unsqueeze(1).float()              # [B, 1, T]
+            counts = mask_f.sum(dim=-1).clamp(min=1)        # [B, 1]
+            x_mean = (x * mask_f).sum(dim=-1) / counts      # [B, C]
+            diff   = (x - x_mean.unsqueeze(-1)) * mask_f
+            # unbiased variance (divide by N-1) — matches original behaviour
+            x_var  = (diff ** 2).sum(dim=-1) / (counts - 1).clamp(min=1)  # [B, C]
+        else:
+            x_mean = x.mean(dim=-1)                         # [B, C]
+            x_var  = x.var(dim=-1, unbiased=True)           # [B, C]
         x_norm = (x - x_mean.unsqueeze(-1)) / (x_var.unsqueeze(-1).sqrt() + 1e-5)
         return x_norm, x_mean, x_var
     return x, None, None
@@ -503,7 +509,8 @@ class SpeakerEncoder:
     def get_embedding(self, audio: torch.Tensor) -> torch.Tensor:
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
-        _, embs = self.model(audio.to(self.device))
+        # audio is already on the training device — avoid redundant .to() transfer
+        _, embs = self.model(audio)
         return embs
 
 

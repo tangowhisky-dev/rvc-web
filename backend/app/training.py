@@ -1020,6 +1020,26 @@ async def _run_pipeline(
 
     log_path = os.path.join(exp_dir, "train.log")
 
+    # Persistent training log — written to profile_dir so it survives exp_dir
+    # wipes and is scoped per profile.  train.py's own FileHandler is broken
+    # (the file descriptor doesn't survive mp.Process pickling on macOS/Linux
+    # with the spawn start method), so we tee every stdout line here instead.
+    # Append mode so continuation runs accumulate into a single log file.
+    profile_log_path = os.path.join(profile_dir, "train.log") if profile_dir else None
+    if profile_log_path:
+        os.makedirs(profile_dir, exist_ok=True)
+        try:
+            import datetime as _dt
+            with open(profile_log_path, "a", encoding="utf-8") as _lf:
+                _lf.write(
+                    f"\n{'='*60}\n"
+                    f"Training session started: {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Profile: {job.profile_id}  Prior epochs: {prior_epochs}  Target: +{total_epoch}\n"
+                    f"{'='*60}\n"
+                )
+        except OSError:
+            pass
+
     # Tail train.log concurrently while train.py runs (belt + suspenders —
     # in case the FileHandler works in some configurations)
     tail_task = asyncio.create_task(_tail_train_log(job, log_path))
@@ -1062,6 +1082,13 @@ async def _run_pipeline(
 
         async for raw_line in train_proc.stdout:
             line = raw_line.decode(errors="replace").rstrip()
+            # Tee raw line to persistent profile-scoped log file
+            if profile_log_path and line:
+                try:
+                    with open(profile_log_path, "a", encoding="utf-8") as _lf:
+                        _lf.write(line + "\n")
+                except OSError:
+                    pass
             if not line:
                 continue
             # Filter faiss loader spam
@@ -1073,12 +1100,13 @@ async def _run_pipeline(
                 continue
 
             # Loss line — buffer for display AND accumulate for epoch average
-            if "loss_disc=" in clean or "loss_gen=" in clean:
+            # Format: "losses: disc=X, gen=Y, fm=Z, mel=A, kl=B, spk=C"
+            if "losses:" in clean:
                 last_loss_line = clean
                 # Accumulate gen and disc loss for epoch-average OT detection
                 import re as _re2
-                _gm = _re2.search(r"loss_gen=([0-9.]+)", clean)
-                _dm = _re2.search(r"loss_disc=([0-9.]+)", clean)
+                _gm = _re2.search(r"gen=([0-9.]+)", clean)
+                _dm = _re2.search(r"disc=([0-9.]+)", clean)
                 if _gm and _dm:
                     try:
                         _epoch_gen_sum += float(_gm.group(1))
@@ -1231,6 +1259,12 @@ async def _run_pipeline(
         async for raw_line in train_proc.stderr:
             line = raw_line.decode(errors="replace").rstrip()
             if line:
+                if profile_log_path:
+                    try:
+                        with open(profile_log_path, "a", encoding="utf-8") as _lf:
+                            _lf.write(f"[stderr] {line}\n")
+                    except OSError:
+                        pass
                 await job.queue.put(
                     {"type": "log", "message": f"[stderr] {line}", "phase": "train"}
                 )
@@ -1262,19 +1296,37 @@ async def _run_pipeline(
             -_signal.SIGTERM,
             _signal.SIGTERM,
         )
-        if not is_overtrain_stop:
+        # User-initiated cancel — job.status was set to "cancelled" by
+        # cancel_job() before the subprocess was killed.  Proceed to artifact
+        # phase so whatever checkpoints exist on disk are preserved.
+        is_user_cancel = job.status == "cancelled"
+
+        if not is_overtrain_stop and not is_user_cancel:
             # stderr already drained into job queue by _drain_stderr above
             err_msg = f"Train phase failed (exit code {train_proc.returncode}) — see [stderr] lines above"
             await _fail("train", err_msg)
             return
-        # Overtraining stop — log it and continue to artifact phase
-        await job.queue.put(
-            {
-                "type": "log",
-                "message": "Training stopped early by overtraining detector — proceeding to index build.",
-                "phase": "train",
-            }
-        )
+
+        if is_user_cancel:
+            await job.queue.put(
+                {
+                    "type": "log",
+                    "message": (
+                        f"Training cancelled by user at epoch {_last_completed_epoch} — "
+                        f"saving last checkpoint to profile."
+                    ),
+                    "phase": "train",
+                }
+            )
+        else:
+            # Overtraining stop — log it and continue to artifact phase
+            await job.queue.put(
+                {
+                    "type": "log",
+                    "message": "Training stopped early by overtraining detector — proceeding to index build.",
+                    "phase": "train",
+                }
+            )
     # On success: stderr was already drained by the concurrent _drain_stderr task
 
     # ------------------------------------------------------------------
@@ -1357,8 +1409,9 @@ async def _run_pipeline(
                 )
                 # G_best.pth is written directly by train.py at the exact best
                 # epoch. Copy it to the profile checkpoints dir if it exists.
-                # Fall back to G_latest only if train.py never wrote G_best.pth
-                # (e.g. very short run where loss never improved past epoch 1).
+                # If train.py never wrote it (cancel before any loss improvement,
+                # or degenerate run) leave dest_best_g absent — no fallback to
+                # G_latest, which would be misleading.
                 g_best_src = os.path.join(exp_dir, "G_best.pth")
                 if os.path.exists(g_best_src):
                     shutil.copy2(g_best_src, dest_best_g)
@@ -1370,13 +1423,10 @@ async def _run_pipeline(
                         }
                     )
                 else:
-                    # No G_best.pth — loss never improved (degenerate run).
-                    # Fall back to latest so model_best.pth still exists.
-                    shutil.copy2(g_latest, dest_best_g)
                     await job.queue.put(
                         {
                             "type": "log",
-                            "message": f"G_best.pth not written by train.py — falling back to G_latest for best checkpoint",
+                            "message": "G_best.pth not written by train.py — no best checkpoint saved",
                             "phase": "index",
                         }
                     )
@@ -1399,6 +1449,13 @@ async def _run_pipeline(
                     import sys as _sys
                     import json as _json
                     import torch as _torch_ssm
+
+                    # Ensure backend/rvc is on sys.path so `infer.*` imports resolve.
+                    # This function runs in the FastAPI process (not the train subprocess),
+                    # so rvc_pkg_dir is not on sys.path by default.
+                    if rvc_pkg_dir not in _sys.path:
+                        _sys.path.insert(0, rvc_pkg_dir)
+
                     from infer.lib.train.process_ckpt import save_small_model as _ssm
                     from infer.lib.train.utils import HParams as _HParams
 
@@ -1467,18 +1524,30 @@ async def _run_pipeline(
                 dest_infer_path = None
 
             # ── model_best.pth (best epoch, used when "Use best variant" is on) ─
-            # G_best.pth was written by train.py at the exact best epoch.
-            # Generate a stripped inference model from it so it matches the
-            # same format as model_infer.pth (small, no optimiser state).
+            # G_best.pth is written by train.py at the exact best epoch.
+            # Generate a stripped inference model from it only when it exists.
+            # If G_best.pth was never written (cancel before any improvement, or
+            # degenerate run) we leave model_best.pth absent — the UI checkbox
+            # will be disabled, which correctly signals no best model exists.
             g_best_src = os.path.join(exp_dir, "G_best.pth")
             if os.path.exists(g_best_src):
-                ok = await _make_infer_model(g_best_src, dest_best_infer_path, f"best inference model (epoch {_best_epoch_num}) from G_best.pth")
-                if not ok and dest_infer_path and os.path.exists(dest_infer_path):
-                    # Fall back to copying model_infer.pth
-                    shutil.copy2(dest_infer_path, dest_best_infer_path)
-            elif dest_infer_path and os.path.exists(dest_infer_path):
-                # No G_best.pth (loss never improved past first epoch) — best = latest
-                shutil.copy2(dest_infer_path, dest_best_infer_path)
+                ok = await _make_infer_model(
+                    g_best_src,
+                    dest_best_infer_path,
+                    f"best inference model (epoch {_best_epoch_num}, avg_gen={_best_epoch_avg_gen:.4f}) from G_best.pth",
+                )
+                if not ok:
+                    await job.queue.put({
+                        "type": "log",
+                        "message": "Warning: could not generate model_best.pth — best variant unavailable",
+                        "phase": "index",
+                    })
+            else:
+                await job.queue.put({
+                    "type": "log",
+                    "message": "G_best.pth not found — model_best.pth not written (no best variant available)",
+                    "phase": "index",
+                })
 
             shutil.copy2(added_index_path, dest_index_path)
             await job.queue.put(
@@ -1511,7 +1580,10 @@ async def _run_pipeline(
     # ------------------------------------------------------------------
     job.phase = "done"
     job.progress_pct = 100
-    job.status = "done"
+    # Preserve "cancelled" status so status endpoint reports it correctly
+    # after artifact save completes. Only overwrite if it wasn't a cancel.
+    if job.status != "cancelled":
+        job.status = "done"
 
     # Use _last_completed_epoch (updated per epoch_done event) rather than
     # prior_epochs + total_epoch — the two diverge on overtraining early-stop.
@@ -1535,7 +1607,7 @@ async def _run_pipeline(
                 dest_model_path,
                 dest_index_path,
                 new_total_epochs,
-                dest_best_infer_path if profile_dir and os.path.exists(dest_best_infer_path) else dest_infer_path,
+                dest_best_infer_path if profile_dir and os.path.exists(dest_best_infer_path) else None,
                 _best_epoch_num if _best_epoch_num > 0 else new_total_epochs,
                 round(_best_epoch_avg_gen, 4) if _best_epoch_avg_gen < float("inf") else None,
                 job.profile_id,
@@ -1544,8 +1616,9 @@ async def _run_pipeline(
         await db.commit()
 
     elapsed = time.monotonic() - start_ts
+    final_msg = "Training cancelled — checkpoint saved." if job.status == "cancelled" else "Training complete"
     await job.queue.put(
-        {"type": "done", "message": "Training complete", "phase": "done"}
+        {"type": "done", "message": final_msg, "phase": "done"}
     )
 
     print(

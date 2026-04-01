@@ -676,11 +676,14 @@ def train_and_evaluate(
                 if spk_encoder is not None and c_spk > 0 and profile_emb is not None:
                     # Resample to 16kHz for ECAPA-TDNN
                     _sr = hps.data.sampling_rate
-                    # wave and y_hat are [B, 1, T] — squeeze to [B, T]
-                    _yhat = y_hat.squeeze(1)
+                    # y_hat is [B, 1, T] — squeeze to [B, T]
+                    # Cast to fp32 explicitly: we are inside autocast(enabled=False)
+                    # but y_hat may still be fp16 from the outer autocast scope.
+                    # ECAPA's mel filterbank (fb) is fp32; mismatched dtypes cause
+                    # an implicit cast every batch, adding measurable overhead.
+                    _yhat = y_hat.squeeze(1).float()
                     if _sr != 16000:
-                        _ratio = 16000 / _sr
-                        _new_len = int(_yhat.shape[-1] * _ratio)
+                        _new_len = int(_yhat.shape[-1] * 16000 / _sr)
                         _yhat_16k = F.interpolate(
                             _yhat.unsqueeze(1),
                             size=_new_len,
@@ -693,9 +696,7 @@ def train_and_evaluate(
                     gen_emb = spk_encoder.get_embedding(_yhat_16k)  # [B, 192]
                     # Normalize embeddings for cosine similarity
                     gen_emb = F.normalize(gen_emb, p=2, dim=1)
-                    ref_emb = profile_emb.unsqueeze(
-                        0
-                    )  # [1, 192] → [B, 192] via broadcast
+                    ref_emb = profile_emb.unsqueeze(0)  # [1, 192] → broadcast [B, 192]
                     loss_spk = _spk_loss_fn(gen_emb, ref_emb) * c_spk
 
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_spk
@@ -727,7 +728,7 @@ def train_and_evaluate(
 
                 logger.info([global_step, lr])
                 logger.info(
-                    f"loss_disc={loss_disc:.3f}, loss_gen={loss_gen:.3f}, loss_fm={loss_fm:.3f},loss_mel={loss_mel:.3f}, loss_kl={loss_kl:.3f}, loss_spk={loss_spk:.3f}"
+                    f"losses: disc={loss_disc:.3f}, gen={loss_gen:.3f}, fm={loss_fm:.3f}, mel={loss_mel:.3f}, kl={loss_kl:.3f}, spk={loss_spk:.3f}"
                 )
                 scalar_dict = {
                     "loss/g/total": loss_gen_all,

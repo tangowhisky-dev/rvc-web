@@ -706,7 +706,10 @@ export default function TrainingPage() {
             const sRes = await fetch(`${API}/api/training/status/${p.id}`);
             if (sRes.ok) {
               const s = await sRes.json();
-              if (s.status === 'training' || s.phase === 'train' || s.phase === 'preprocess' || s.phase === 'extract_f0' || s.phase === 'extract_feature' || s.phase === 'index') {
+              if (
+                s.status === 'training' &&
+                (s.phase === 'train' || s.phase === 'preprocess' || s.phase === 'extract_f0' || s.phase === 'extract_feature' || s.phase === 'index')
+              ) {
                 resumedId = p.id;
                 break;
               }
