@@ -61,7 +61,7 @@ CUDA_DEVICE="cpu"
 case "$PLATFORM" in
     Darwin)
         info "Platform: macOS ($ARCH)"
-        TORCH_INDEX=""   # PyTorch ships MPS support in the default index
+        TORCH_INDEX=""   # PyTorch ships MPS support in the default PyPI index
         FAISS_PKG="faiss-cpu"
         ONNX_PKG="onnxruntime"
         ;;
@@ -74,15 +74,17 @@ case "$PLATFORM" in
                 CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
                 CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
                 info "CUDA $CUDA_VER detected"
-                # Pick torch CUDA index — prefer cu128 (12.x), fall back to cu118
-                if [ "$CUDA_MAJOR" -ge 12 ]; then
+                if [ "$CUDA_MAJOR" -ge 13 ]; then
+                    TORCH_INDEX=""      # PyPI default wheel ships with CUDA 13 support
+                    CUDA_DEVICE="cuda"
+                elif [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -ge 8 ]; then
                     TORCH_INDEX="https://download.pytorch.org/whl/cu128"
                     CUDA_DEVICE="cuda"
-                elif [ "$CUDA_MAJOR" -eq 11 ] && [ "$CUDA_MINOR" -ge 8 ]; then
-                    TORCH_INDEX="https://download.pytorch.org/whl/cu118"
+                elif [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -ge 6 ]; then
+                    TORCH_INDEX="https://download.pytorch.org/whl/cu126"
                     CUDA_DEVICE="cuda"
                 else
-                    warn "CUDA $CUDA_VER is older than 11.8 — falling back to CPU build"
+                    warn "CUDA $CUDA_VER is not supported (need 12.6+, 12.8, or 13.x) — falling back to CPU build"
                     TORCH_INDEX=""
                 fi
             else
@@ -126,15 +128,36 @@ conda activate "$ENV_NAME"
 info "Python: $(python --version)"
 
 # ---------------------------------------------------------------------------
-# 4. Install uv (fast resolver — used for everything except torch)
+# 4. Resolve uv — prefer the standalone binary over python -m uv
+#    so the conda env's Python doesn't need uv installed inside it.
 # ---------------------------------------------------------------------------
-if ! command -v uv &>/dev/null && ! python -m uv --version &>/dev/null 2>&1; then
-    info "Installing uv..."
-    pip install uv --quiet
+# Search order:
+#   1. uv already on PATH (global install, brew, cargo, etc.)
+#   2. ~/.cargo/bin/uv   (cargo install uv)
+#   3. ~/.local/bin/uv   (pip install --user uv or uv's own installer)
+#   4. conda env's pip   (install uv into the env as a last resort)
+UV_BIN=""
+for candidate in \
+    "$(command -v uv 2>/dev/null)" \
+    "$HOME/.cargo/bin/uv" \
+    "$HOME/.local/bin/uv" \
+    "/usr/local/bin/uv"
+do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        UV_BIN="$candidate"
+        break
+    fi
+done
+
+if [ -n "$UV_BIN" ]; then
+    info "uv found: $UV_BIN"
+    UV="$UV_BIN pip"
 else
-    info "uv available ✓"
+    # Fall back: install uv into the conda env, then use python -m uv
+    info "uv not found globally — installing into conda env..."
+    pip install uv --quiet
+    UV="python -m uv pip"
 fi
-UV="python -m uv pip"
 
 # ---------------------------------------------------------------------------
 # 5. Install PyTorch (must come before other packages that depend on torch)

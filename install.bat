@@ -55,22 +55,33 @@ if !errorlevel!==0 (
     for /f "tokens=9" %%v in ('nvidia-smi ^| findstr "CUDA Version"') do set CUDA_VER=%%v
     if not "!CUDA_VER!"=="" (
         echo [install] CUDA !CUDA_VER! detected
-        REM Parse major version
+        REM Parse major and minor versions
         for /f "tokens=1 delims=." %%m in ("!CUDA_VER!") do set CUDA_MAJOR=%%m
-        if !CUDA_MAJOR! GEQ 12 (
-            set TORCH_INDEX=https://download.pytorch.org/whl/cu128
+        for /f "tokens=2 delims=." %%n in ("!CUDA_VER!") do set CUDA_MINOR=%%n
+        if !CUDA_MAJOR! GEQ 13 (
+            set TORCH_INDEX=https://download.pytorch.org/whl/cu130
             set FAISS_PKG=faiss-gpu
             set ONNX_PKG=onnxruntime-gpu
             set CUDA_DEVICE=cuda
-            echo [install] Using CUDA 12.x PyTorch build
-        ) else if !CUDA_MAJOR! EQU 11 (
-            set TORCH_INDEX=https://download.pytorch.org/whl/cu118
-            set FAISS_PKG=faiss-gpu
-            set ONNX_PKG=onnxruntime-gpu
-            set CUDA_DEVICE=cuda
-            echo [install] Using CUDA 11.8 PyTorch build
+            echo [install] Using cu130 index ^(CUDA 13.x^)
+        ) else if !CUDA_MAJOR! EQU 12 (
+            if !CUDA_MINOR! GEQ 8 (
+                set TORCH_INDEX=https://download.pytorch.org/whl/cu128
+                set FAISS_PKG=faiss-gpu
+                set ONNX_PKG=onnxruntime-gpu
+                set CUDA_DEVICE=cuda
+                echo [install] Using cu128 index ^(CUDA 12.8^)
+            ) else if !CUDA_MINOR! GEQ 6 (
+                set TORCH_INDEX=https://download.pytorch.org/whl/cu126
+                set FAISS_PKG=faiss-gpu
+                set ONNX_PKG=onnxruntime-gpu
+                set CUDA_DEVICE=cuda
+                echo [install] Using cu126 index ^(CUDA 12.6^)
+            ) else (
+                echo [install] CUDA !CUDA_VER! not supported ^(need 12.6+, 12.8, or 13.x^) — using CPU build
+            )
         ) else (
-            echo [install] CUDA !CUDA_VER! too old ^(need ^>=11.8^) — using CPU build
+            echo [install] CUDA !CUDA_VER! not supported ^(need 12.6+, 12.8, or 13.x^) — using CPU build
         )
     )
 ) else (
@@ -99,35 +110,62 @@ if !errorlevel! NEQ 0 (
 )
 
 REM ---------------------------------------------------------------------------
-REM 4. Install uv
+REM 4. Resolve uv — prefer standalone binary over python -m uv
+REM    so the conda env's Python doesn't need uv installed inside it.
+REM    When using the global binary we must pass --python so uv targets
+REM    the conda env's interpreter, not the system Python.
 REM ---------------------------------------------------------------------------
-echo [install] Installing uv...
+set UV_BIN=
+where uv >nul 2>&1
+if !errorlevel!==0 (
+    for /f "delims=" %%p in ('where uv') do (
+        set UV_BIN=%%p
+        goto :uv_found
+    )
+)
+if exist "%USERPROFILE%\.cargo\bin\uv.exe"  set UV_BIN=%USERPROFILE%\.cargo\bin\uv.exe & goto :uv_found
+if exist "%USERPROFILE%\.local\bin\uv.exe"  set UV_BIN=%USERPROFILE%\.local\bin\uv.exe & goto :uv_found
+if exist "%LOCALAPPDATA%\uv\bin\uv.exe"     set UV_BIN=%LOCALAPPDATA%\uv\bin\uv.exe    & goto :uv_found
+
+REM Not found anywhere — install into conda env and use python -m uv
+echo [install] uv not found globally — installing into conda env...
 call conda run -n !ENV_NAME! pip install uv -q
+set UV=conda run -n !ENV_NAME! python -m uv pip
+goto :uv_done
+
+:uv_found
+REM Resolve the conda env's Python path so we can pass it to --python
+for /f "delims=" %%p in ('conda run -n !ENV_NAME! python -c "import sys; print(sys.executable)"') do set CONDA_PYTHON=%%p
+echo [install] uv found: !UV_BIN! ^(targeting !CONDA_PYTHON!^)
+set UV=!UV_BIN! pip --python !CONDA_PYTHON!
+
+:uv_done
 
 REM ---------------------------------------------------------------------------
 REM 5. Install PyTorch
 REM ---------------------------------------------------------------------------
 echo [install] Installing PyTorch...
 if "!TORCH_INDEX!"=="" (
-    call conda run -n !ENV_NAME! python -m uv pip install torch torchaudio -q
+    call !UV! install torch torchaudio -q
 ) else (
-    call conda run -n !ENV_NAME! python -m uv pip install torch torchaudio --index-url !TORCH_INDEX! -q
+    echo [install]   Using index: !TORCH_INDEX!
+    call !UV! install torch torchaudio --index-url !TORCH_INDEX! -q
 )
 
 REM ---------------------------------------------------------------------------
 REM 6. Install faiss
 REM ---------------------------------------------------------------------------
 echo [install] Installing !FAISS_PKG!...
-call conda run -n !ENV_NAME! python -m uv pip install !FAISS_PKG! -q
+call !UV! install !FAISS_PKG! -q
 
 REM ---------------------------------------------------------------------------
 REM 7. Install fairseq (One-sixth fork)
 REM ---------------------------------------------------------------------------
 echo [install] Installing build prerequisites for fairseq...
-call conda run -n !ENV_NAME! python -m uv pip install Cython numpy -q
+call !UV! install Cython numpy -q
 
 echo [install] Installing fairseq ^(One-sixth fork^)...
-call conda run -n !ENV_NAME! python -m uv pip install "fairseq @ git+https://github.com/One-sixth/fairseq.git" -q
+call !UV! install "fairseq @ git+https://github.com/One-sixth/fairseq.git" -q
 
 REM ---------------------------------------------------------------------------
 REM 8. Install remaining requirements
@@ -147,12 +185,12 @@ for /f "usebackq tokens=* delims=" %%L in (requirements.txt) do (
     :skip_line
 )
 
-call conda run -n !ENV_NAME! python -m uv pip install -r !TMPFILE! -q
+call !UV! install -r !TMPFILE! -q
 del !TMPFILE! 2>nul
 
 REM onnxruntime — platform-specific
 echo [install] Installing !ONNX_PKG!...
-call conda run -n !ENV_NAME! python -m uv pip install !ONNX_PKG! -q
+call !UV! install !ONNX_PKG! -q
 
 REM ---------------------------------------------------------------------------
 REM 9. Install frontend dependencies

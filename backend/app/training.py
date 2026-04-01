@@ -320,17 +320,23 @@ def _write_config(
     # Align spk_embed_dim with the pretrained weights.
     # The embedding table shape is [spk_embed_dim, gin_channels]. If the
     # checkpoint was trained with a different spk_embed_dim than 32k.json
-    # declares (RefineGAN: 129 vs HiFi-GAN: 109), load_state_dict crashes.
-    # Reading the value from the checkpoint itself makes this self-correcting
-    # for any future pretrain weight changes.
-    if pretrain_g and os.path.isfile(pretrain_g):
+    # declares (RefineGAN: 129 vs HiFi-GAN: 109), load_state_dict crashes on
+    # a fresh run (strict=True path) or silently resets emb_g to random on
+    # resume (strict=False path in load_checkpoint). Both are wrong.
+    #
+    # Strategy: read emb_g.weight.shape[0] from whichever checkpoint is about
+    # to be loaded:
+    #   - Fresh run  → pretrain_g  (assets/refinegan/f0G32k.pth etc.)
+    #   - Resume run → G_latest.pth already seeded into exp_dir at this point
+    _ckpt_to_probe = pretrain_g if pretrain_g else os.path.join(exp_dir, "G_latest.pth")
+    if os.path.isfile(_ckpt_to_probe):
         try:
-            ckpt = _torch.load(pretrain_g, map_location="cpu", weights_only=True)
+            ckpt = _torch.load(_ckpt_to_probe, map_location="cpu", weights_only=True)
             emb_shape = ckpt.get("model", {}).get("emb_g.weight")
             if emb_shape is not None:
                 cfg["model"]["spk_embed_dim"] = emb_shape.shape[0]
         except Exception:
-            pass  # leave config value as-is; load_state_dict will surface the real error
+            pass  # leave config value as-is; train.py will surface the mismatch
 
     with open(config_save_path, "w") as _f:
         _json.dump(cfg, _f, indent=2)
@@ -1293,11 +1299,93 @@ async def _run_pipeline(
                         "phase": "index",
                     }
                 )
-            else:
+            elif os.path.exists(g_latest):
+                # weights_pth is only written by save_small_model() at the
+                # natural end of training (epoch >= total_epoch). On an
+                # overtraining early-stop, train.py exits via SIGTERM before
+                # reaching that point, so weights_pth never gets created.
+                #
+                # Recover by calling save_small_model() here, in the same
+                # process, using the G_latest.pth checkpoint and the
+                # config.json that was written before training started.
+                # This produces an identical output to what train.py would
+                # have written — same structure, same fp16 weight stripping,
+                # same config array built from hps.
                 await job.queue.put(
                     {
                         "type": "log",
-                        "message": f"Warning: inference weights not found at {weights_pth}",
+                        "message": "weights_pth not found after early stop — generating inference model from G_latest.pth",
+                        "phase": "index",
+                    }
+                )
+                try:
+                    import sys as _sys
+                    import json as _json
+
+                    _rvc_pkg = os.path.join(project_root, "backend", "rvc")
+                    if _rvc_pkg not in _sys.path:
+                        _sys.path.insert(0, _rvc_pkg)
+
+                    import torch as _torch_ssm
+                    from infer.lib.train.process_ckpt import save_small_model as _ssm
+                    from infer.lib.train.utils import HParams as _HParams
+
+                    # Load config.json written before training to reconstruct hps
+                    _cfg_path = os.path.join(exp_dir, "config.json")
+                    with open(_cfg_path) as _f:
+                        _cfg_d = _json.load(_f)
+
+                    _hps = _HParams(**_cfg_d)
+                    _hps.model_dir   = exp_dir
+                    _hps.name        = exp_name
+                    _hps.sample_rate = "32k"
+                    _hps.if_f0       = 1
+                    _hps.version     = "v2"
+                    _hps.vocoder     = vocoder
+                    _hps.embedder    = embedder
+                    _hps.author      = ""
+                    _hps.save_every_weights = "0"
+
+                    _g_ckpt  = _torch_ssm.load(g_latest, map_location="cpu", weights_only=True)
+                    _state   = _g_ckpt.get("model", _g_ckpt)
+                    _epoch   = _g_ckpt.get("iteration", _last_completed_epoch)
+
+                    # save_small_model writes to assets/weights/{name}.pth
+                    # using PROJECT_ROOT env var (already set in train_env / base_env)
+                    os.environ.setdefault("PROJECT_ROOT", project_root)
+                    _result = _ssm(_state, "32k", 1, exp_name, _epoch, "v2", _hps)
+                    if os.path.exists(weights_pth):
+                        shutil.copy2(weights_pth, dest_infer_path)
+                        await job.queue.put(
+                            {
+                                "type": "log",
+                                "message": f"Generated + saved inference model → {dest_infer_path} ({_result})",
+                                "phase": "index",
+                            }
+                        )
+                    else:
+                        raise RuntimeError(f"save_small_model returned '{_result}' but {weights_pth} not found")
+                except Exception as _ssm_err:
+                    await job.queue.put(
+                        {
+                            "type": "log",
+                            "message": f"Warning: could not generate inference model: {_ssm_err}",
+                            "phase": "index",
+                        }
+                    )
+                    dest_infer_path = None
+            else:
+                # Neither weights_pth nor G_latest.pth — overtraining fired
+                # before the first checkpoint save. No inference model possible.
+                await job.queue.put(
+                    {
+                        "type": "log",
+                        "message": (
+                            f"Warning: no checkpoint or inference model found — "
+                            f"overtraining stop fired before first checkpoint save "
+                            f"(save_every={effective_save_every}). "
+                            f"Try a lower overtrain_threshold or more epochs."
+                        ),
                         "phase": "index",
                     }
                 )
