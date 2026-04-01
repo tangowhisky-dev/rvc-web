@@ -128,10 +128,10 @@ async def get_hardware() -> HardwareInfo:
 
     # All batch sizes must be powers of two — RVC's data loader and gradient
     # accumulation behave correctly only on 2^n values.
-    POW2 = [1, 2, 4, 8, 16, 32]
+    POW2 = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 
     def nearest_pow2(x: float) -> int:
-        """Largest power-of-two that does not exceed x, clamped to [1, 32]."""
+        """Largest power-of-two that does not exceed x, clamped to [1, 256]."""
         best = 1
         for p in POW2:
             if p <= x:
@@ -144,9 +144,10 @@ async def get_hardware() -> HardwareInfo:
         max_safe   = nearest_pow2(gpu_vram_gb * 0.85 / 1.0)
         max_safe   = max(sweet_spot, max_safe)
     elif mps_available:
-        # MPS unified memory: RAM is the pool (~1.5 GB/batch at fp32)
-        sweet_spot = nearest_pow2(total_gb * 0.60 / 1.5)
-        max_safe   = max(sweet_spot, nearest_pow2(avail_gb * 0.80 / 1.5))
+        # MPS unified memory: available RAM is the effective pool (~1.5 GB/batch at fp32)
+        sweet_spot = nearest_pow2(avail_gb * 0.60 / 1.5)
+        max_safe   = nearest_pow2(avail_gb * 0.80 / 1.5)
+        max_safe   = max(sweet_spot, max_safe)
     else:
         # CPU-only: single batch to avoid RAM exhaustion
         sweet_spot = 1

@@ -106,6 +106,7 @@ def _get_speaker_encoder(device: torch.device):
 
 
 global_step = 0
+lowest_loss_g = float("inf")  # best epoch-average generator loss seen so far
 
 
 class EpochRecorder:
@@ -463,6 +464,11 @@ def train_and_evaluate(
 
     train_loader.batch_sampler.set_epoch(epoch)
     global global_step
+    global lowest_loss_g
+
+    # Per-epoch loss accumulation for best-epoch detection
+    _epoch_gen_sum: float = 0.0
+    _epoch_gen_count: int = 0
 
     net_g.train()
     net_d.train()
@@ -700,6 +706,11 @@ def train_and_evaluate(
         scaler.step(optim_g)
         scaler.update()
 
+        # Accumulate generator loss for epoch-average best-epoch tracking
+        if rank == 0:
+            _epoch_gen_sum += loss_gen.item()
+            _epoch_gen_count += 1
+
         if rank == 0:
             if global_step % hps.train.log_interval == 0:
                 lr = optim_g.param_groups[0]["lr"]
@@ -823,6 +834,28 @@ def train_and_evaluate(
             )
 
     if rank == 0:
+        # Best-epoch checkpoint — save G_best.pth whenever epoch-average
+        # generator loss hits a new minimum (mirrors ultimate-rvc strategy).
+        # This runs every epoch regardless of save_every_epoch so the best
+        # checkpoint is always captured at the exact right epoch, not the
+        # nearest save_every_epoch boundary.
+        if _epoch_gen_count > 0:
+            avg_loss_g = _epoch_gen_sum / _epoch_gen_count
+            _min_delta = 0.004  # must improve by at least this to count
+            if avg_loss_g < lowest_loss_g - _min_delta:
+                lowest_loss_g = avg_loss_g
+                best_path = os.path.join(hps.model_dir, "G_best.pth")
+                utils.save_checkpoint(
+                    net_g,
+                    optim_g,
+                    hps.train.learning_rate,
+                    epoch,
+                    best_path,
+                )
+                logger.info(
+                    f"best model updated → G_best.pth  (epoch={epoch}, avg_loss_g={avg_loss_g:.4f})"
+                )
+
         logger.info("====> Epoch: {} {}".format(epoch, epoch_recorder.record()))
     if epoch >= hps.total_epoch and rank == 0:
         logger.info("Training is done. The program is closed.")

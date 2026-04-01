@@ -1355,10 +1355,13 @@ async def _run_pipeline(
                         "phase": "index",
                     }
                 )
-                # Also save as G_best.pth if this IS the best epoch, or if
-                # G_best.pth doesn't exist yet (first-ever training run).
-                if _best_epoch_num > 0 and not os.path.exists(dest_best_g):
-                    shutil.copy2(g_latest, dest_best_g)
+                # G_best.pth is written directly by train.py at the exact best
+                # epoch. Copy it to the profile checkpoints dir if it exists.
+                # Fall back to G_latest only if train.py never wrote G_best.pth
+                # (e.g. very short run where loss never improved past epoch 1).
+                g_best_src = os.path.join(exp_dir, "G_best.pth")
+                if os.path.exists(g_best_src):
+                    shutil.copy2(g_best_src, dest_best_g)
                     await job.queue.put(
                         {
                             "type": "log",
@@ -1366,13 +1369,14 @@ async def _run_pipeline(
                             "phase": "index",
                         }
                     )
-                elif _best_epoch_num > 0 and os.path.exists(dest_best_g):
-                    # On continuation runs, only overwrite if this run improved
+                else:
+                    # No G_best.pth — loss never improved (degenerate run).
+                    # Fall back to latest so model_best.pth still exists.
                     shutil.copy2(g_latest, dest_best_g)
                     await job.queue.put(
                         {
                             "type": "log",
-                            "message": f"Updated best checkpoint (epoch {_best_epoch_num}, avg_gen={_best_epoch_avg_gen:.4f}) → {dest_best_g}",
+                            "message": f"G_best.pth not written by train.py — falling back to G_latest for best checkpoint",
                             "phase": "index",
                         }
                     )
@@ -1388,54 +1392,19 @@ async def _run_pipeline(
             if os.path.exists(d_latest):
                 shutil.copy2(d_latest, dest_d)
 
-            if os.path.exists(weights_pth):
-                shutil.copy2(weights_pth, dest_infer_path)
-                # model_best.pth = same file; on an early-stop the "latest"
-                # IS the best since train.py only writes weights_pth at natural end.
-                shutil.copy2(weights_pth, dest_best_infer_path)
-                await job.queue.put(
-                    {
-                        "type": "log",
-                        "message": f"Saved inference model → {dest_infer_path}",
-                        "phase": "index",
-                    }
-                )
-            elif os.path.exists(g_latest):
-                # weights_pth is only written by save_small_model() at the
-                # natural end of training (epoch >= total_epoch). On an
-                # overtraining early-stop, train.py exits via SIGTERM before
-                # reaching that point, so weights_pth never gets created.
-                #
-                # Recover by calling save_small_model() here, in the same
-                # process, using the G_latest.pth checkpoint and the
-                # config.json that was written before training started.
-                # This produces an identical output to what train.py would
-                # have written — same structure, same fp16 weight stripping,
-                # same config array built from hps.
-                await job.queue.put(
-                    {
-                        "type": "log",
-                        "message": "weights_pth not found after early stop — generating inference model from G_latest.pth",
-                        "phase": "index",
-                    }
-                )
+            # Helper: generate a stripped inference model (~54 MB) from a full
+            # checkpoint and write it to dest_path. Returns True on success.
+            async def _make_infer_model(src_ckpt: str, dest_path: str, label: str) -> bool:
                 try:
                     import sys as _sys
                     import json as _json
-
-                    _rvc_pkg = os.path.join(project_root, "backend", "rvc")
-                    if _rvc_pkg not in _sys.path:
-                        _sys.path.insert(0, _rvc_pkg)
-
                     import torch as _torch_ssm
                     from infer.lib.train.process_ckpt import save_small_model as _ssm
                     from infer.lib.train.utils import HParams as _HParams
 
-                    # Load config.json written before training to reconstruct hps
                     _cfg_path = os.path.join(exp_dir, "config.json")
                     with open(_cfg_path) as _f:
                         _cfg_d = _json.load(_f)
-
                     _hps = _HParams(**_cfg_d)
                     _hps.model_dir   = exp_dir
                     _hps.name        = exp_name
@@ -1447,50 +1416,69 @@ async def _run_pipeline(
                     _hps.author      = ""
                     _hps.save_every_weights = "0"
 
-                    _g_ckpt  = _torch_ssm.load(g_latest, map_location="cpu", weights_only=True)
-                    _state   = _g_ckpt.get("model", _g_ckpt)
-                    _epoch   = _g_ckpt.get("iteration", _last_completed_epoch)
+                    _g_ckpt = _torch_ssm.load(src_ckpt, map_location="cpu", weights_only=True)
+                    _state  = _g_ckpt.get("model", _g_ckpt)
+                    _epoch  = _g_ckpt.get("iteration", _last_completed_epoch)
 
-                    # save_small_model writes to assets/weights/{name}.pth
-                    # using PROJECT_ROOT env var (already set in train_env / base_env)
                     os.environ.setdefault("PROJECT_ROOT", project_root)
                     _result = _ssm(_state, "32k", 1, exp_name, _epoch, "v2", _hps)
                     if os.path.exists(weights_pth):
-                        shutil.copy2(weights_pth, dest_infer_path)
-                        await job.queue.put(
-                            {
-                                "type": "log",
-                                "message": f"Generated + saved inference model → {dest_infer_path} ({_result})",
-                                "phase": "index",
-                            }
-                        )
-                    else:
-                        raise RuntimeError(f"save_small_model returned '{_result}' but {weights_pth} not found")
-                except Exception as _ssm_err:
-                    await job.queue.put(
-                        {
+                        shutil.copy2(weights_pth, dest_path)
+                        await job.queue.put({
                             "type": "log",
-                            "message": f"Warning: could not generate inference model: {_ssm_err}",
+                            "message": f"Generated {label} → {dest_path} ({_result})",
                             "phase": "index",
-                        }
-                    )
+                        })
+                        return True
+                    raise RuntimeError(f"save_small_model returned '{_result}' but {weights_pth} not found")
+                except Exception as _e:
+                    await job.queue.put({
+                        "type": "log",
+                        "message": f"Warning: could not generate {label}: {_e}",
+                        "phase": "index",
+                    })
+                    return False
+
+            # ── model_infer.pth (latest epoch, used by default) ──────────────
+            if os.path.exists(weights_pth):
+                # train.py wrote it at natural end of training
+                shutil.copy2(weights_pth, dest_infer_path)
+                await job.queue.put({
+                    "type": "log",
+                    "message": f"Saved inference model → {dest_infer_path}",
+                    "phase": "index",
+                })
+            elif os.path.exists(g_latest):
+                # Early stop — generate from G_latest.pth
+                ok = await _make_infer_model(g_latest, dest_infer_path, "inference model from G_latest.pth")
+                if not ok:
                     dest_infer_path = None
             else:
-                # Neither weights_pth nor G_latest.pth — overtraining fired
-                # before the first checkpoint save. No inference model possible.
-                await job.queue.put(
-                    {
-                        "type": "log",
-                        "message": (
-                            f"Warning: no checkpoint or inference model found — "
-                            f"overtraining stop fired before first checkpoint save "
-                            f"(save_every={effective_save_every}). "
-                            f"Try a lower overtrain_threshold or more epochs."
-                        ),
-                        "phase": "index",
-                    }
-                )
+                await job.queue.put({
+                    "type": "log",
+                    "message": (
+                        f"Warning: no checkpoint or inference model found — "
+                        f"overtraining stop fired before first checkpoint save "
+                        f"(save_every={effective_save_every}). "
+                        f"Try a lower overtrain_threshold or more epochs."
+                    ),
+                    "phase": "index",
+                })
                 dest_infer_path = None
+
+            # ── model_best.pth (best epoch, used when "Use best variant" is on) ─
+            # G_best.pth was written by train.py at the exact best epoch.
+            # Generate a stripped inference model from it so it matches the
+            # same format as model_infer.pth (small, no optimiser state).
+            g_best_src = os.path.join(exp_dir, "G_best.pth")
+            if os.path.exists(g_best_src):
+                ok = await _make_infer_model(g_best_src, dest_best_infer_path, f"best inference model (epoch {_best_epoch_num}) from G_best.pth")
+                if not ok and dest_infer_path and os.path.exists(dest_infer_path):
+                    # Fall back to copying model_infer.pth
+                    shutil.copy2(dest_infer_path, dest_best_infer_path)
+            elif dest_infer_path and os.path.exists(dest_infer_path):
+                # No G_best.pth (loss never improved past first epoch) — best = latest
+                shutil.copy2(dest_infer_path, dest_best_infer_path)
 
             shutil.copy2(added_index_path, dest_index_path)
             await job.queue.put(

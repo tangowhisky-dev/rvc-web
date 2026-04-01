@@ -70,6 +70,8 @@ absl-py                   # transitive: required by tensorboard
 Jinja2                    # transitive: required by torch
 fsspec                    # transitive: required by torch, huggingface_hub
 colorama                  # transitive: required by sacrebleu (fairseq dep)
+transformers              # used directly: HubertModel in rtrvc.py + extract_feature_print.py
+huggingface_hub           # used directly: model weight downloads; transitive dep of transformers
 Markdown                  # transitive: required by tensorboard
 pyasn1                    # transitive: required by pyasn1-modules chain
 

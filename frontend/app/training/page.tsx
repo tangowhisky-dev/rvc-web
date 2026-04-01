@@ -394,7 +394,7 @@ function LossChart({ points, totalEpochs: totalEpochsProp }: { points: EpochPoin
 // ---------------------------------------------------------------------------
 
 // Batch size must be a power of two — RVC's data loader expects 2^n
-const POW2 = [1, 2, 4, 8, 16, 32] as const;
+const POW2 = [1, 2, 4, 8, 16, 32, 64, 128, 256] as const;
 type Pow2 = typeof POW2[number];
 
 function nearestPow2Index(v: number): number {
@@ -499,7 +499,7 @@ function BatchSizeSelector({
             {POW2.map((p, i) => (
               <span
                 key={p}
-                className={`text-[9px] font-mono -translate-x-1/2 ${
+                className={`text-[8px] font-mono -translate-x-1/2 ${
                   i === idx ? (isRisky ? 'text-red-400' : isSweet ? 'text-emerald-400' : 'text-zinc-200')
                   : i <= idx ? 'text-zinc-500'
                   : 'text-zinc-700'
@@ -513,8 +513,8 @@ function BatchSizeSelector({
         </div>
 
         {/* Value + badge — fixed-width container so the slider track never reflows */}
-        <div className="flex items-center gap-2 shrink-0 w-36">
-          <span className={`text-2xl font-mono font-bold tabular-nums w-10 text-right shrink-0 ${
+        <div className="flex items-center gap-2 shrink-0 w-40">
+          <span className={`text-2xl font-mono font-bold tabular-nums w-14 text-right shrink-0 ${
             isRisky ? 'text-red-400' : isSweet ? 'text-emerald-400' : 'text-zinc-100'
           }`}>
             {POW2[idx]}
