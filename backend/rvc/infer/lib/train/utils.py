@@ -70,7 +70,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
 
 def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path):
     logger.info(
-        "Saving model and optimizer state at epoch {} to {}".format(
+        "Saving model & optimizer state at epoch {} to {}".format(
             iteration, checkpoint_path
         )
     )

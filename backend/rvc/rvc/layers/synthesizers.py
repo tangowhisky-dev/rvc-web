@@ -130,25 +130,21 @@ class SynthesizerTrnMsNSFsid(nn.Module):
 
     def __prepare_scriptable__(self):
         for hook in self.dec._forward_pre_hooks.values():
-            # The hook we want to remove is an instance of WeightNorm class, so
-            # normally we would do `if isinstance(...)` but this class is not accessible
-            # because of shadowing, so we check the module name directly.
-            # https://github.com/pytorch/pytorch/blob/be0ca00c5ce260eb5bcec3237357f7a30cc08983/torch/nn/utils/__init__.py#L3
             if (
-                hook.__module__ == "torch.nn.utils.weight_norm"
+                hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                 and hook.__class__.__name__ == "WeightNorm"
             ):
                 torch.nn.utils.remove_weight_norm(self.dec)
         for hook in self.flow._forward_pre_hooks.values():
             if (
-                hook.__module__ == "torch.nn.utils.weight_norm"
+                hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                 and hook.__class__.__name__ == "WeightNorm"
             ):
                 torch.nn.utils.remove_weight_norm(self.flow)
         if hasattr(self, "enc_q"):
             for hook in self.enc_q._forward_pre_hooks.values():
                 if (
-                    hook.__module__ == "torch.nn.utils.weight_norm"
+                    hook.__module__ == "torch.nn.utils.parametrizations.weight_norm"
                     and hook.__class__.__name__ == "WeightNorm"
                 ):
                     torch.nn.utils.remove_weight_norm(self.enc_q)
@@ -365,7 +361,7 @@ class SynthesizerTrnMs256NSFsid_nono(SynthesizerTrnMsNSFsid):
             upsample_kernel_sizes,
             spk_embed_dim,
             gin_channels,
-            None,   # sr — unused for _nono (no F0 conditioning)
+            None,  # sr — unused for _nono (no F0 conditioning)
             256,
             False,
             vocoder=vocoder,
@@ -414,7 +410,7 @@ class SynthesizerTrnMs768NSFsid_nono(SynthesizerTrnMsNSFsid):
             upsample_kernel_sizes,
             spk_embed_dim,
             gin_channels,
-            None,   # sr — unused for _nono (no F0 conditioning)
+            None,  # sr — unused for _nono (no F0 conditioning)
             768,
             False,
             vocoder=vocoder,

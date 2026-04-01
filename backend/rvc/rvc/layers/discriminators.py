@@ -4,7 +4,8 @@ import torch
 from torch import nn
 from torch.nn import Conv1d, Conv2d
 from torch.nn import functional as F
-from torch.nn.utils import spectral_norm, weight_norm
+from torch.nn.utils import spectral_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 from .residuals import LRELU_SLOPE
 from .utils import get_padding
@@ -45,7 +46,9 @@ class MultiPeriodDiscriminator(torch.nn.Module):
             ]
         )
 
-    def __call__(self, y: torch.Tensor, y_hat: torch.Tensor) -> Tuple[
+    def __call__(
+        self, y: torch.Tensor, y_hat: torch.Tensor
+    ) -> Tuple[
         List[torch.Tensor],
         List[torch.Tensor],
         List[List[torch.Tensor]],
@@ -53,7 +56,9 @@ class MultiPeriodDiscriminator(torch.nn.Module):
     ]:
         return super().__call__(y, y_hat)
 
-    def forward(self, y: torch.Tensor, y_hat: torch.Tensor) -> Tuple[
+    def forward(
+        self, y: torch.Tensor, y_hat: torch.Tensor
+    ) -> Tuple[
         List[torch.Tensor],
         List[torch.Tensor],
         List[List[torch.Tensor]],
