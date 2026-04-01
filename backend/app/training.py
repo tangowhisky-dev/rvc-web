@@ -290,6 +290,27 @@ def _write_config(
       because _drain_stdout buffers and replaces it on each loss line seen.
       Loss accuracy is unaffected; only spectrogram images are sparser.
 
+    learning_rate auto-scaling (sqrt rule):
+    - The pretrained weights were tuned at batch_size=32, LR=1e-4.
+    - AdamW with a smaller batch sees noisier gradients; the sqrt scaling rule
+      compensates: LR_eff = LR_base * sqrt(batch_size / reference_batch_size).
+    - At batch_size=8:  LR = 1e-4 * sqrt(8/32)  = 5e-5.
+    - At batch_size=16: LR = 1e-4 * sqrt(16/32) ≈ 7.07e-5.
+    - At batch_size=32: LR = 1e-4 * sqrt(32/32) = 1e-4 (unchanged, matches CUDA baseline).
+    - This eliminates the ~2x effective over-learning-rate that caused noisy
+      loss curves and a higher loss plateau on MPS vs CUDA.
+
+    fp16_run disabled on MPS (fp32 always):
+    - MPS fp16 AMP is experimental and has two compounding instabilities:
+      1. 137 weight_norm hooks: ‖weight_v‖ can underflow to 0 in fp16 → NaN
+         gradient → GradScaler halves scale; with growth_interval=2000 and
+         ~125 steps/epoch (bs=8), scale recovery takes ~16 epochs per event.
+      2. CUDA uses higher-precision fused ops for reductions; MPS does not.
+    - fp16 is valuable on CUDA to reduce off-chip VRAM bandwidth; MPS unified
+      memory has no off-chip bandwidth to save, so fp16 has no throughput benefit.
+    - On CUDA torch.cuda.is_available() is True → fp16_run=True (unchanged).
+    - On MPS torch.cuda.is_available() is False → fp16_run=False (fp32).
+
     spk_embed_dim alignment for RefineGAN:
     - The pretrained RefineGAN f0G32k.pth was trained with spk_embed_dim=129
       but 32k.json has spk_embed_dim=109 (the HiFi-GAN pretrain value).
@@ -300,6 +321,7 @@ def _write_config(
       for HiFi-GAN too (its pretrain also has 109, matching the config).
     """
     import json as _json
+    import math as _math
     import torch as _torch
 
     config_save_path = os.path.join(exp_dir, "config.json")
@@ -312,10 +334,29 @@ def _write_config(
 
     # log_interval=10: log every 10 batches instead of every batch.
     # Eliminates ~90% of the matplotlib MPS→CPU syncs that account for ~15s/epoch.
-    # Loss values attached to epoch_done still come from the final batch since
-    # _drain_stdout buffers and overwrites last_loss_line on each emitted loss line.
     cfg["train"]["log_interval"] = 10
     cfg["train"]["c_spk"] = c_spk
+
+    # Auto-scale learning rate by sqrt(batch_size / reference_batch_size).
+    # Reference: pretrained weights were optimised at batch_size=32, LR=1e-4.
+    # Smaller batches produce noisier gradients; the sqrt rule keeps the
+    # effective per-sample update magnitude constant for AdamW.
+    _REFERENCE_BATCH_SIZE = 32
+    _BASE_LR = 1e-4
+    _scaled_lr = _BASE_LR * _math.sqrt(batch_size / _REFERENCE_BATCH_SIZE)
+    cfg["train"]["learning_rate"] = round(_scaled_lr, 7)
+
+    # Disable fp16 on MPS — train in fp32 on Apple Silicon.
+    # MPS fp16 has two compounding instabilities:
+    #   1. weight_norm (137 hooks in this model) computes weight_g × (weight_v / ‖weight_v‖).
+    #      In fp16, ‖weight_v‖ can underflow to zero for small weights early in training
+    #      → NaN gradient → GradScaler halves its scale. With growth_interval=2000 and
+    #      ~125 steps/epoch on MPS (bs=8), scale recovery takes ~16 epochs per NaN event.
+    #   2. MPS fp16 AMP is still experimental; CUDA uses higher-precision fused ops
+    #      for reductions that reduce inf/NaN occurrence significantly.
+    # fp16 is valuable on CUDA primarily to reduce off-chip VRAM bandwidth — MPS uses
+    # unified memory so there is no off-chip bandwidth to save. fp32 on MPS is correct.
+    cfg["train"]["fp16_run"] = _torch.cuda.is_available()
 
     # Align spk_embed_dim with the pretrained weights.
     # The embedding table shape is [spk_embed_dim, gin_channels]. If the
@@ -938,7 +979,9 @@ async def _run_pipeline(
     # Checkpoint save schedule: every 25% of the run or every 10 epochs,
     # whichever is smaller — ensures at least 4 saves and no more than
     # one save per 10 epochs on longer runs.
-    effective_save_every = max(1, min(10, total_epoch // 4))
+    # Save every 20% of the run, capped at every 10 epochs.
+    # Examples: 10→2, 20→4, 50→10, 100→10, 200→10
+    effective_save_every = max(1, min(10, total_epoch // 5))
 
     # Cumulative epoch target: train.py resumes from prior_epochs (loaded
     # from G_latest.pth) and runs until it hits this number.
