@@ -99,7 +99,10 @@ def _extract_embedding(audio: np.ndarray, sr: int, encoder) -> np.ndarray:
 
     embeddings = []
     for chunk in chunks:
-        audio_tensor = torch.from_numpy(chunk).unsqueeze(0)  # [1, T]
+        # Move audio to the encoder's device — numpy arrays are always CPU,
+        # so we must explicitly transfer before passing to get_embedding.
+        # (get_embedding no longer does .to(self.device) internally)
+        audio_tensor = torch.from_numpy(chunk).unsqueeze(0).to(encoder.device)  # [1, T]
         with torch.no_grad():
             emb = encoder.get_embedding(audio_tensor)  # [1, 192]
         embeddings.append(emb)

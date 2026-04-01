@@ -1473,7 +1473,10 @@ async def _run_pipeline(
                     _hps.author      = ""
                     _hps.save_every_weights = "0"
 
-                    _g_ckpt = _torch_ssm.load(src_ckpt, map_location="cpu", weights_only=True)
+                    # weights_only=False needed: checkpoint includes optimizer
+                    # state dict (Adam moments) which torch refuses to load with
+                    # weights_only=True. We only use ['model'] and ['iteration'].
+                    _g_ckpt = _torch_ssm.load(src_ckpt, map_location="cpu", weights_only=False)
                     _state  = _g_ckpt.get("model", _g_ckpt)
                     _epoch  = _g_ckpt.get("iteration", _last_completed_epoch)
 

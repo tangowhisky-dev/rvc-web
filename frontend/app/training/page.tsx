@@ -555,7 +555,7 @@ export default function TrainingPage() {
   const [selectedId, setSelectedId] = useState('');
   const [profilesError, setProfilesError] = useState<string | null>(null);
 
-  const [epochs, setEpochs] = useState(300);
+  const [epochs, setEpochs] = useState(100);
   const [batchSize, setBatchSize] = useState(8);
   const [overtrainEnabled, setOvertrainEnabled] = useState(false);
   const [overtrainThreshold, setOvertrainThreshold] = useState(50);
