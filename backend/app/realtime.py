@@ -143,6 +143,7 @@ class RealtimeManager:
         output_gain: float = 1.0,
         rvc_root: Optional[str] = None,
         save_path: Optional[str] = None,
+        use_best: bool = False,
     ) -> RealtimeSession:
         """Spawn isolated worker process and return a RealtimeSession.
 
@@ -186,7 +187,13 @@ class RealtimeManager:
                 if not os.path.isabs(stored_profile_dir)
                 else stored_profile_dir
             )
-            candidate_model = os.path.join(abs_profile_dir, "model_infer.pth")
+            # Resolve model: prefer model_best.pth when use_best is set and the
+            # file exists; fall back to model_infer.pth (latest) otherwise.
+            if use_best:
+                candidate_best = os.path.join(abs_profile_dir, "model_best.pth")
+                candidate_model = candidate_best if os.path.exists(candidate_best) else os.path.join(abs_profile_dir, "model_infer.pth")
+            else:
+                candidate_model = os.path.join(abs_profile_dir, "model_infer.pth")
             candidate_index = os.path.join(abs_profile_dir, "model.index")
             if os.path.exists(candidate_model):
                 db_model_path = candidate_model

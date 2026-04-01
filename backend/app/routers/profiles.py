@@ -97,6 +97,10 @@ class ProfileOut(BaseModel):
     embedder: str = "spin-v2"
     # Vocoder decoder architecture.  Locked after first training.
     vocoder: str = "HiFi-GAN"
+    # Best-epoch checkpoint info (None on old profiles that predate the feature).
+    best_model_path: Optional[str] = None   # model_best.pth on disk, or None
+    best_epoch: Optional[int] = None
+    best_avg_gen_loss: Optional[float] = None
     audio_files: list[AudioFileOut] = []
 
 
@@ -226,6 +230,16 @@ def _resolve_index_path(row) -> Optional[str]:
     return stored or None
 
 
+def _resolve_best_model_path(row) -> Optional[str]:
+    """Return path to model_best.pth if it exists on disk, else None."""
+    pdir = row["profile_dir"]
+    if pdir:
+        candidate = os.path.join(pdir, "model_best.pth")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def _resolve_sample_path_legacy(row) -> str:
     """Return best-available sample path for backward compat (training router)."""
     stored = row["sample_path"] or ""
@@ -267,6 +281,13 @@ async def _row_to_out(row, db) -> ProfileOut:
         vocoder=str(row["vocoder"])
         if "vocoder" in keys and row["vocoder"]
         else "HiFi-GAN",
+        best_model_path=_resolve_best_model_path(row),
+        best_epoch=int(row["best_epoch"])
+        if "best_epoch" in keys and row["best_epoch"] is not None
+        else None,
+        best_avg_gen_loss=float(row["best_avg_gen_loss"])
+        if "best_avg_gen_loss" in keys and row["best_avg_gen_loss"] is not None
+        else None,
         audio_files=audio_files,
     )
 
@@ -468,7 +489,8 @@ async def create_profile(
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder,
+                      best_epoch, best_avg_gen_loss
                FROM profiles WHERE id = ?""",
             (profile_id,),
         )
@@ -594,7 +616,8 @@ async def list_profiles() -> list[ProfileOut]:
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder,
+                      best_epoch, best_avg_gen_loss
                FROM profiles ORDER BY created_at DESC"""
         )
         rows = await cursor.fetchall()
@@ -616,7 +639,8 @@ async def get_profile(profile_id: str) -> ProfileOut:
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder,
+                      best_epoch, best_avg_gen_loss
                FROM profiles WHERE id = ?""",
             (profile_id,),
         )

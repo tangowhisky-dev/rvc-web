@@ -109,6 +109,33 @@ case "$PLATFORM" in
 esac
 
 # ---------------------------------------------------------------------------
+# 2b. Install system audio libraries (PortAudio, libsndfile)
+#     sounddevice and soundfile link against these at runtime.
+#     Must be installed before pip wheels are built/verified.
+# ---------------------------------------------------------------------------
+info "Installing system audio libraries..."
+case "$PLATFORM" in
+    Linux)
+        if command -v apt-get &>/dev/null; then
+            sudo apt-get install -y libportaudio2 libsndfile1 > /dev/null
+        elif command -v dnf &>/dev/null; then
+            sudo dnf install -y portaudio libsndfile > /dev/null
+        elif command -v pacman &>/dev/null; then
+            sudo pacman -S --noconfirm portaudio libsndfile > /dev/null
+        else
+            warn "Unknown package manager — install libportaudio2 and libsndfile1 manually before running start.sh"
+        fi
+        ;;
+    Darwin)
+        if command -v brew &>/dev/null; then
+            brew install portaudio libsndfile --quiet
+        else
+            warn "Homebrew not found — install portaudio and libsndfile manually: brew install portaudio libsndfile"
+        fi
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
 # 3. Create / update conda environment
 # ---------------------------------------------------------------------------
 if conda env list | grep -qE "^${ENV_NAME}\s"; then

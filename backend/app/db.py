@@ -102,6 +102,12 @@ _MIGRATIONS: list[tuple[str, str]] = [
     # Locked after the first training run — the decoder architecture is baked
     # into the G_latest.pth checkpoint and cannot be swapped mid-training.
     ("vocoder", "TEXT NOT NULL DEFAULT 'HiFi-GAN'"),
+    # Inference-ready fp16 model from the best-loss epoch of the most recent
+    # training run (profile_dir/model_best.pth).  NULL on older profiles.
+    ("best_model_path", "TEXT"),
+    # Epoch number and avg-generator-loss of the best epoch, for display.
+    ("best_epoch", "INTEGER"),
+    ("best_avg_gen_loss", "REAL"),
 ]
 
 # Migrations for epoch_losses table

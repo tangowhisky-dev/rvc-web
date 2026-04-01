@@ -23,6 +23,9 @@ interface Profile {
   total_epochs_trained: number;
   embedder?: string;
   vocoder?: string;
+  best_model_path?: string | null;
+  best_epoch?: number | null;
+  best_avg_gen_loss?: number | null;
 }
 
 interface SessionParams {
@@ -39,7 +42,8 @@ type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
 // Constants
 // ---------------------------------------------------------------------------
 
-const API = 'http://localhost:8000';
+const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
+const WS_BASE = (API ?? 'http://localhost:8000').replace('http://', 'ws://').replace('https://', 'wss://');
 const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.50, protect: 0.33, silence_threshold_db: -55, output_gain: 1.0 };
 
 // ---------------------------------------------------------------------------
@@ -152,6 +156,7 @@ export default function RealtimePage() {
   // Profiles
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [profileId, setProfileId] = useState<string | null>(null);
+  const [useBest, setUseBest] = useState(false);
 
   // Session
   const [sessionState, setSessionState] = useState<SessionState>('idle');
@@ -279,7 +284,7 @@ export default function RealtimePage() {
           sessionIdRef.current = status.session_id;
           setSessionState('active');
           // Reopen WS for live waveform feed
-          const ws = new WebSocket(`ws://localhost:8000/ws/realtime/${status.session_id}`);
+          const ws = new WebSocket(`${WS_BASE}/ws/realtime/${status.session_id}`);
           wsRef.current = ws;
           ws.onmessage = (event) => {
             try {
@@ -447,6 +452,7 @@ export default function RealtimePage() {
           input_device_id: inputDeviceId,
           output_device_id: outputDeviceId,
           ...params,
+          use_best: useBest,
           ...(saveEnabled && resolvedSavePath ? { save_path: resolvedSavePath } : {}),
         }),
       });
@@ -522,7 +528,7 @@ export default function RealtimePage() {
       // ---------------------------------------------------------------------------
       // Open WebSocket
       // ---------------------------------------------------------------------------
-      const ws = new WebSocket(`ws://localhost:8000/ws/realtime/${session_id}`);
+      const ws = new WebSocket(`${WS_BASE}/ws/realtime/${session_id}`);
       wsRef.current = ws;
 
       ws.onmessage = (event) => {
@@ -770,6 +776,19 @@ export default function RealtimePage() {
                 disabled={isActive || isBusy}
                 emptyMessage="No trained profiles — train one in the Training tab first"
               />
+              {/* Use best variant checkbox */}
+              <label className="flex items-center gap-2 cursor-pointer select-none mt-1">
+                <input
+                  type="checkbox"
+                  checked={useBest}
+                  disabled={!profiles.find(p => p.id === profileId)?.best_model_path || isActive || isBusy}
+                  onChange={(e) => setUseBest(e.target.checked)}
+                  className="w-4 h-4 rounded border border-zinc-600 bg-zinc-900 accent-amber-500 focus:ring-2 focus:ring-amber-500/50 disabled:opacity-40"
+                />
+                <span className="text-[11px] font-mono text-zinc-300">
+                  Use best variant
+                </span>
+              </label>
             </div>
           </div>
         </section>

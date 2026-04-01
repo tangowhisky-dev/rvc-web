@@ -46,6 +46,7 @@ class StartSessionRequest(BaseModel):
     silence_threshold_db: float = -55.0
     output_gain: float = 1.0
     save_path: Optional[str] = None
+    use_best: bool = False  # if True, use model_best.pth instead of model_infer.pth
 
 
 class StopSessionRequest(BaseModel):
@@ -133,6 +134,7 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
             output_gain=request.output_gain,
             rvc_root=project_root,
             save_path=request.save_path,
+            use_best=request.use_best,
         )
         # start_session is async on the real manager; MagicMock returns sync in tests
         session = await result if asyncio.iscoroutine(result) else result

@@ -10,8 +10,8 @@ import { TipsPanel } from '../TipsPanel';
 import { LossGuide } from '../SettingsGuide';
 import { ProfilePicker } from '../ProfilePicker';
 
-const API = 'http://localhost:8000';
-const WS_BASE = 'ws://localhost:8000';
+const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
+const WS_BASE = (API ?? 'http://localhost:8000').replace('http://', 'ws://').replace('https://', 'wss://');
 
 // ---------------------------------------------------------------------------
 // Types
@@ -555,10 +555,11 @@ export default function TrainingPage() {
   const [selectedId, setSelectedId] = useState('');
   const [profilesError, setProfilesError] = useState<string | null>(null);
 
-  const [epochs, setEpochs] = useState(50);
+  const [epochs, setEpochs] = useState(300);
   const [batchSize, setBatchSize] = useState(8);
-  const [overtrainThreshold, setOvertrainThreshold] = useState(0);
-  const [speakerLossWeight, setSpeakerLossWeight] = useState(2);
+  const [overtrainEnabled, setOvertrainEnabled] = useState(false);
+  const [overtrainThreshold, setOvertrainThreshold] = useState(50);
+  const [speakerLossWeight, setSpeakerLossWeight] = useState(0);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
 
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -761,7 +762,7 @@ export default function TrainingPage() {
       const res = await fetch(`${API}/api/training/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainThreshold, c_spk: speakerLossWeight }),
+        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainEnabled ? overtrainThreshold : 0, c_spk: speakerLossWeight }),
       });
 
       if (res.status === 409) {
@@ -937,23 +938,42 @@ export default function TrainingPage() {
                   <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
                     <span className="text-amber-400">⚠</span> Overtraining Stop
                   </label>
-                  <div className="flex items-center gap-2">
+                  {/* Checkbox row */}
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
                     <input
-                      type="number" value={overtrainThreshold} min={0} max={200}
+                      type="checkbox"
+                      checked={overtrainEnabled}
                       disabled={isRunning}
-                      onChange={(e) => setOvertrainThreshold(Math.max(0, Math.min(200, Number(e.target.value))))}
-                      className="w-24 bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
-                                 font-mono text-zinc-200 focus:outline-none focus:border-amber-600
-                                 disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
+                      onChange={(e) => setOvertrainEnabled(e.target.checked)}
+                      className="w-4 h-4 accent-amber-500 disabled:opacity-40 cursor-pointer"
                     />
-                    <span className="text-[11px] font-mono text-zinc-500">
-                      {overtrainThreshold === 0
-                        ? 'disabled'
-                        : `stop after ${overtrainThreshold} epoch${overtrainThreshold !== 1 ? 's' : ''} without improvement`}
+                    <span className="text-[12px] font-mono text-zinc-300">
+                      {overtrainEnabled ? 'Enabled' : 'Disabled'}
                     </span>
-                  </div>
+                  </label>
+                  {/* Slider — only shown when enabled */}
+                  {overtrainEnabled && (
+                    <div className="flex flex-col gap-1 mt-1">
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="range"
+                          min={10} max={200} step={5}
+                          value={overtrainThreshold}
+                          disabled={isRunning}
+                          onChange={(e) => setOvertrainThreshold(Number(e.target.value))}
+                          className="w-40 accent-amber-500 disabled:opacity-40"
+                        />
+                        <span className="text-[12px] font-mono text-amber-400 w-8 text-right">
+                          {overtrainThreshold}
+                        </span>
+                      </div>
+                      <span className="text-[10px] font-mono text-zinc-500">
+                        stop after {overtrainThreshold} epoch{overtrainThreshold !== 1 ? 's' : ''} without improvement
+                      </span>
+                    </div>
+                  )}
                   <span className="text-[10px] font-mono text-zinc-600">
-                    0 = run all epochs · recommended: 10–20 for fine-tuning
+                    Tracks epoch-average loss · best model always saved · recommended: 50
                   </span>
                 </div>
 

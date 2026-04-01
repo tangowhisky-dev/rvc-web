@@ -89,6 +89,14 @@ if !errorlevel!==0 (
 )
 
 REM ---------------------------------------------------------------------------
+REM 2b. Install system audio libraries via conda
+REM     On Windows the sounddevice wheel bundles PortAudio, but conda's
+REM     libsndfile package is needed for soundfile to link correctly.
+REM ---------------------------------------------------------------------------
+echo [install] Installing system audio libraries (conda)...
+call conda install -n !ENV_NAME! -c conda-forge libsndfile -y -q
+
+REM ---------------------------------------------------------------------------
 REM 3. Create / update conda environment
 REM ---------------------------------------------------------------------------
 conda env list | findstr /C:"!ENV_NAME!" >nul 2>&1

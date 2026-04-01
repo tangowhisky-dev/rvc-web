@@ -34,11 +34,15 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 interface Profile {
   id: string;
   name: string;
+  status: string;
   model_path: string | null;
   index_path: string | null;
   total_epochs_trained: number;
   embedder: string;
   vocoder: string;
+  best_model_path?: string | null;
+  best_epoch?: number | null;
+  best_avg_gen_loss?: number | null;
 }
 
 interface VoiceAnalysis {
@@ -714,6 +718,7 @@ function VoiceAnalysisPanel({
 export default function OfflinePage() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [profileId, setProfileId] = useState<string | null>(null);
+  const [useBest, setUseBest] = useState(false);
 
   // Input audio
   const [inputFile, setInputFile]     = useState<File | null>(null);
@@ -742,13 +747,14 @@ export default function OfflinePage() {
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const outputFilePathRef = useRef<string | null>(null);
 
-  // Load profiles
+  // Load profiles — use shared /api/profiles, filter to inference-ready only
   useEffect(() => {
-    fetch(`${API}/api/offline/profiles`)
+    fetch(`${API}/api/profiles`)
       .then(r => r.json())
       .then((data: Profile[]) => {
-        setProfiles(data);
-        const first = data.find(p => p.model_path && p.total_epochs_trained > 0);
+        const inferReady = data.filter((p: Profile) => p.status === 'trained');
+        setProfiles(inferReady);
+        const first = inferReady.find((p: Profile) => p.model_path && p.total_epochs_trained > 0);
         if (first) setProfileId(first.id);
       })
       .catch(() => {});
@@ -805,6 +811,7 @@ export default function OfflinePage() {
     form.append('pitch', String(pitch));
     form.append('index_rate', String(indexRate));
     form.append('protect', String(protect));
+    form.append('use_best', String(useBest));
     form.append('file', inputFile);
 
     const abort = new AbortController();
@@ -978,11 +985,27 @@ export default function OfflinePage() {
               total_epochs_trained: p.total_epochs_trained,
               embedder: p.embedder,
               vocoder: p.vocoder,
+              best_model_path: p.best_model_path,
+              best_epoch: p.best_epoch,
+              best_avg_gen_loss: p.best_avg_gen_loss,
             }))}
             selectedId={profileId}
             onChange={setProfileId}
             emptyMessage="No trained profiles found."
           />
+          {/* Use best variant checkbox */}
+          <label className="flex items-center gap-2 cursor-pointer select-none mt-1">
+            <input
+              type="checkbox"
+              checked={useBest}
+              disabled={!profiles.find(p => p.id === profileId)?.best_model_path || jobStatus === 'running'}
+              onChange={(e) => setUseBest(e.target.checked)}
+              className="w-4 h-4 rounded border border-zinc-600 bg-zinc-900 accent-amber-500 focus:ring-2 focus:ring-amber-500/50 disabled:opacity-40"
+            />
+            <span className="text-[11px] font-mono text-zinc-300">
+              Use best variant
+            </span>
+          </label>
         </section>
 
         {/* Inference params */}

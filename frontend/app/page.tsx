@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 
-const API = 'http://localhost:8000';
+const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,6 +32,9 @@ interface Profile {
   needs_retraining: boolean;
   embedder: string;
   vocoder: string;
+  best_model_path: string | null;
+  best_epoch: number | null;
+  best_avg_gen_loss: number | null;
   audio_files: AudioFile[];
 }
 
@@ -1000,6 +1003,14 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
               )}
               {profile.total_epochs_trained > 0 && (
                 <span className="text-[11px] font-mono text-cyan-600">{profile.total_epochs_trained} epochs</span>
+              )}
+              {/* Checkpoint badge — best vs final */}
+              {profile.best_model_path && profile.best_epoch !== null && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono
+                               bg-amber-950/40 border border-amber-800/40 text-amber-400"
+                      title="Best checkpoint by avg generator loss">
+                  ⭐ best (epoch {profile.best_epoch}, {profile.best_avg_gen_loss?.toFixed(3) ?? ''})
+                </span>
               )}
               {/* Embedder badge — clickable if not locked */}
               <span

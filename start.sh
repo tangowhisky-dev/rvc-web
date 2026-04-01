@@ -67,6 +67,7 @@ fi
 # ---------------------------------------------------------------------------
 kill_port() {
   local port=$1
+  # Try lsof first (macOS, most Linux)
   if command -v lsof >/dev/null 2>&1; then
     local pids
     pids=$(lsof -ti:"$port" 2>/dev/null) || true
@@ -74,10 +75,22 @@ kill_port() {
       echo "[start] Killing stale process(es) on port $port..."
       echo "$pids" | xargs kill -9 2>/dev/null || true
       sleep 1
+      return
     fi
-  else
-    # Fallback: Python-based port kill (works on Windows Git Bash)
-    python - "$port" <<'PYEOF' 2>/dev/null || true
+  fi
+  # Try fuser (Linux)
+  if command -v fuser >/dev/null 2>&1; then
+    local pids
+    pids=$(fuser "$port/tcp" 2>/dev/null) || true
+    if [ -n "$pids" ]; then
+      echo "[start] Killing stale process(es) on port $port..."
+      echo "$pids" | xargs kill -9 2>/dev/null || true
+      sleep 1
+      return
+    fi
+  fi
+  # Fallback: Python-based port kill (works on Windows Git Bash)
+  python - "$port" <<'PYEOF' 2>/dev/null || true
 import sys, subprocess
 port = sys.argv[1]
 try:
@@ -94,7 +107,6 @@ try:
 except Exception:
     pass
 PYEOF
-  fi
 }
 
 kill_next_dev() {
@@ -123,6 +135,7 @@ kill_dangling() {
 
 kill_port 8000
 kill_port 3000
+kill_port 3001
 kill_next_dev
 kill_dangling
 
@@ -135,7 +148,84 @@ export PROJECT_ROOT="$(pwd)"
 echo "[start] PROJECT_ROOT=$PROJECT_ROOT"
 
 # ---------------------------------------------------------------------------
-# 7. Print device summary banner
+# 7. Detect all IP addresses and let user choose
+# ---------------------------------------------------------------------------
+echo "[start] Detecting network interfaces..."
+
+# Collect IPs into a newline-separated string (avoids bash array issues with set -u)
+IP_LIST="localhost"
+
+if [ "$PLATFORM" = "mac" ]; then
+  ADDRS=$(ifconfig 2>/dev/null | grep -oE 'inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | grep -v '^127\.0\.0\.1$' | sort -u)
+  if [ -n "$ADDRS" ]; then
+    IP_LIST="$IP_LIST"$'\n'"$ADDRS"
+  fi
+elif [ "$PLATFORM" = "linux" ]; then
+  if command -v ip >/dev/null 2>&1; then
+    ADDRS=$(ip -4 addr show 2>/dev/null | grep -oP 'inet \K[\d.]+' | grep -v '^127\.0\.0\.1$' | sort -u)
+  else
+    ADDRS=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^127\.0\.0\.1$' | sort -u)
+  fi
+  if [ -n "$ADDRS" ]; then
+    IP_LIST="$IP_LIST"$'\n'"$ADDRS"
+  fi
+elif [ "$PLATFORM" = "windows" ]; then
+  ADDRS=$(ipconfig 2>/dev/null | grep -oE 'IPv4 Address[^:]*: [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | grep -v '^127\.0\.0\.1$' | sort -u)
+  if [ -n "$ADDRS" ]; then
+    IP_LIST="$IP_LIST"$'\n'"$ADDRS"
+  fi
+fi
+
+# Count entries (trim whitespace from wc output)
+IP_COUNT=$(printf '%s\n' "$IP_LIST" | wc -l | tr -d ' ')
+
+if [ "$IP_COUNT" -le 1 ]; then
+  export NEXT_PUBLIC_API_URL="http://localhost:8000"
+  echo "[start] No network interfaces found — using localhost only"
+else
+  echo ""
+  echo "  Available network interfaces for frontend access:"
+  echo ""
+
+  # Display options
+  IDX=1
+  while IFS= read -r ip; do
+    if [ "$ip" = "localhost" ]; then
+      echo "    $IDX) $ip (local only)"
+    else
+      echo "    $IDX) $ip"
+    fi
+    IDX=$((IDX + 1))
+  done <<< "$IP_LIST"
+  echo ""
+
+  # Default to first non-localhost IP
+  DEFAULT_CHOICE=1
+  IDX=1
+  while IFS= read -r ip; do
+    if [ "$ip" != "localhost" ]; then
+      DEFAULT_CHOICE=$IDX
+      break
+    fi
+    IDX=$((IDX + 1))
+  done <<< "$IP_LIST"
+
+  read -rp "  Select interface [default: $DEFAULT_CHOICE]: " CHOICE
+  CHOICE=${CHOICE:-$DEFAULT_CHOICE}
+
+  if echo "$CHOICE" | grep -qE '^[0-9]+$' && [ "$CHOICE" -ge 1 ] && [ "$CHOICE" -le "$IP_COUNT" ]; then
+    SELECTED_IP=$(echo "$IP_LIST" | sed -n "${CHOICE}p")
+    export NEXT_PUBLIC_API_URL="http://${SELECTED_IP}:8000"
+    echo "[start] Selected: $SELECTED_IP → NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL"
+  else
+    echo "[start] Invalid selection — falling back to localhost"
+    export NEXT_PUBLIC_API_URL="http://localhost:8000"
+  fi
+  echo ""
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Print device summary banner
 # ---------------------------------------------------------------------------
 echo "[start] -----------------------------------------------"
 echo "[start] Device summary"
@@ -149,19 +239,15 @@ if torch.cuda.is_available():
     vram  = props.total_memory / 1024**3
     d = f"  GPU:     {props.name}  ({vram:.1f} GB VRAM)"
 elif torch.backends.mps.is_available():
-    import psutil
-    ram = psutil.virtual_memory().total / 1024**3
-    d = f"  MPS:     Apple Silicon  ({ram:.1f} GB unified memory)"
+    d = "  MPS:     Apple Silicon  (unified memory)"
 else:
-    import psutil
-    ram = psutil.virtual_memory().total / 1024**3
-    d = f"  CPU:     {torch.get_num_threads()} threads  ({ram:.1f} GB RAM)"
+    d = f"  CPU:     {torch.get_num_threads()} threads"
 print(f"[start] {d}")
 PYEOF
 echo "[start] -----------------------------------------------"
 
 # ---------------------------------------------------------------------------
-# 8. Start backend
+# 9. Start backend
 #    Respects RVC_CONDA_ENV (default: rvc) or falls back to plain python
 #    if conda is not in use.
 # ---------------------------------------------------------------------------
@@ -180,7 +266,7 @@ echo "$BACKEND_PID" > .pids/backend.pid
 echo "[start] Backend PID $BACKEND_PID"
 
 # ---------------------------------------------------------------------------
-# 9. Wait for backend to be ready (up to 30s)
+# 10. Wait for backend to be ready (up to 30s)
 # ---------------------------------------------------------------------------
 echo "[start] Waiting for backend to be ready..."
 for i in $(seq 1 30); do
@@ -192,7 +278,7 @@ for i in $(seq 1 30); do
 done
 
 # ---------------------------------------------------------------------------
-# 10. Start frontend
+# 11. Start frontend
 # ---------------------------------------------------------------------------
 echo "[start] Starting frontend..."
 if [ ! -d "frontend/node_modules" ]; then
@@ -205,7 +291,7 @@ echo "$FRONTEND_PID" > .pids/frontend.pid
 echo "[start] Frontend PID $FRONTEND_PID"
 
 # ---------------------------------------------------------------------------
-# 11. Wait for frontend (up to 60s)
+# 12. Wait for frontend (up to 60s)
 # ---------------------------------------------------------------------------
 echo "[start] Waiting for frontend to compile..."
 FRONTEND_URL=""

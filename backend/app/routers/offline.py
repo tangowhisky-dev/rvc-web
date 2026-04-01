@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from backend.app.db import get_db
+from backend.app.routers.profiles import ProfileOut
 
 # MIME types for common audio formats
 _AUDIO_MIME = {
@@ -94,57 +95,6 @@ _jobs: dict[str, dict] = {}  # job_id → {status, result_path, error, sample_ra
 # ---------------------------------------------------------------------------
 # Profile list — re-uses same DB query as training page
 # ---------------------------------------------------------------------------
-
-
-class ProfileOut(BaseModel):
-    id: str
-    name: str
-    model_path: Optional[str]
-    index_path: Optional[str]
-    total_epochs_trained: int
-    embedder: str = "spin-v2"
-    vocoder: str = "HiFi-GAN"
-
-
-@router.get("/profiles", response_model=list[ProfileOut])
-async def list_profiles():
-    async with get_db() as db:
-        cursor = await db.execute(
-            """SELECT id, name, profile_dir, checkpoint_path, total_epochs_trained, embedder, vocoder
-               FROM profiles
-               WHERE status != 'untrained'
-               ORDER BY created_at DESC"""
-        )
-        rows = await cursor.fetchall()
-
-    out = []
-    for row in rows:
-        pdir = row["profile_dir"]
-        # model_infer.pth is the inference-ready small model
-        model_path = None
-        index_path = None
-        if pdir and os.path.isdir(pdir):
-            mp = os.path.join(pdir, "model_infer.pth")
-            if os.path.exists(mp):
-                model_path = mp
-            # find index
-            import glob
-
-            matches = glob.glob(os.path.join(pdir, "*.index"))
-            if matches:
-                index_path = matches[0]
-        out.append(
-            ProfileOut(
-                id=row["id"],
-                name=row["name"],
-                model_path=model_path,
-                index_path=index_path,
-                total_epochs_trained=int(row["total_epochs_trained"] or 0),
-                embedder=row["embedder"] or "spin-v2",
-                vocoder=row["vocoder"] or "HiFi-GAN",
-            )
-        )
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +353,7 @@ async def convert_audio(
     pitch: float = Form(0.0),
     index_rate: float = Form(0.50),
     protect: float = Form(0.33),
+    use_best: bool = Form(False),
     file: UploadFile = File(...),
 ):
     """Convert an uploaded audio file using a trained profile.
@@ -425,7 +376,13 @@ async def convert_audio(
     model_path = None
     index_path = None
     if pdir and os.path.isdir(pdir):
-        mp = os.path.join(pdir, "model_infer.pth")
+        # Resolve model: prefer model_best.pth when use_best is set and file
+        # exists; fall back to model_infer.pth (latest) otherwise.
+        if use_best:
+            best_candidate = os.path.join(pdir, "model_best.pth")
+            mp = best_candidate if os.path.exists(best_candidate) else os.path.join(pdir, "model_infer.pth")
+        else:
+            mp = os.path.join(pdir, "model_infer.pth")
         if os.path.exists(mp):
             model_path = mp
         import glob
