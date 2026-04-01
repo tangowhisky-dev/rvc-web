@@ -96,7 +96,7 @@ case "$PLATFORM" in
             TORCH_INDEX=""
         fi
         if [ "$CUDA_DEVICE" = "cuda" ]; then
-            FAISS_PKG="faiss-gpu"
+            FAISS_PKG="faiss-cpu"   # faiss-gpu has no cp311+ wheels on PyPI; faiss-cpu works for index building
             ONNX_PKG="onnxruntime-gpu"
         else
             FAISS_PKG="faiss-cpu"

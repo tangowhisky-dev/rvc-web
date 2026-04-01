@@ -60,20 +60,20 @@ if !errorlevel!==0 (
         for /f "tokens=2 delims=." %%n in ("!CUDA_VER!") do set CUDA_MINOR=%%n
         if !CUDA_MAJOR! GEQ 13 (
             set TORCH_INDEX=https://download.pytorch.org/whl/cu130
-            set FAISS_PKG=faiss-gpu
+            set FAISS_PKG=faiss-cpu
             set ONNX_PKG=onnxruntime-gpu
             set CUDA_DEVICE=cuda
             echo [install] Using cu130 index ^(CUDA 13.x^)
         ) else if !CUDA_MAJOR! EQU 12 (
             if !CUDA_MINOR! GEQ 8 (
                 set TORCH_INDEX=https://download.pytorch.org/whl/cu128
-                set FAISS_PKG=faiss-gpu
+                set FAISS_PKG=faiss-cpu
                 set ONNX_PKG=onnxruntime-gpu
                 set CUDA_DEVICE=cuda
                 echo [install] Using cu128 index ^(CUDA 12.8^)
             ) else if !CUDA_MINOR! GEQ 6 (
                 set TORCH_INDEX=https://download.pytorch.org/whl/cu126
-                set FAISS_PKG=faiss-gpu
+                set FAISS_PKG=faiss-cpu
                 set ONNX_PKG=onnxruntime-gpu
                 set CUDA_DEVICE=cuda
                 echo [install] Using cu126 index ^(CUDA 12.6^)
