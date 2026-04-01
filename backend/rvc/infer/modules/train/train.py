@@ -727,7 +727,7 @@ def train_and_evaluate(
 
                 logger.info([global_step, lr])
                 logger.info(
-                    f"losses :_disc={loss_disc:.3f}, _gen={loss_gen:.3f}, _fm={loss_fm:.3f},_mel={loss_mel:.3f}, _kl={loss_kl:.3f}, _spk={loss_spk:.3f}"
+                    f"loss_disc={loss_disc:.3f}, loss_gen={loss_gen:.3f}, loss_fm={loss_fm:.3f},loss_mel={loss_mel:.3f}, loss_kl={loss_kl:.3f}, loss_spk={loss_spk:.3f}"
                 )
                 scalar_dict = {
                     "loss/g/total": loss_gen_all,
