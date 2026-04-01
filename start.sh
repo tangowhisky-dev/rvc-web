@@ -22,10 +22,13 @@ echo "[start] Platform: $PLATFORM ($OS_TYPE)"
 # 2. Detect available compute device
 #    Priority: CUDA > MPS > CPU
 #    Exports RVC_DEVICE so Python subprocesses can read it.
+#    Use conda env's Python — system Python may not have torch or may be
+#    CPU-only.
 # ---------------------------------------------------------------------------
-if python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+CONDA_ENV="${RVC_CONDA_ENV:-rvc}"
+if conda run -n "$CONDA_ENV" python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
   export RVC_DEVICE="cuda"
-elif python -c "import torch; exit(0 if torch.backends.mps.is_available() else 1)" 2>/dev/null; then
+elif conda run -n "$CONDA_ENV" python -c "import torch; exit(0 if torch.backends.mps.is_available() else 1)" 2>/dev/null; then
   export RVC_DEVICE="mps"
 else
   export RVC_DEVICE="cpu"
