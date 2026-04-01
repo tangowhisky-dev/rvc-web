@@ -618,10 +618,6 @@ async def _run_pipeline(
             )
 
     n_cpu = multiprocessing.cpu_count()
-    # Cap CPU workers: beyond ~8 parallel audio readers there's no throughput
-    # gain (disk I/O bound).  For GPU devices extract_f0_print.py ignores this
-    # and runs single-process anyway — we pass 1 explicitly to make it clear.
-    _f0_n_proc = 1 if _rvc_device in ("cuda", "mps") else min(n_cpu, 8)
     python = sys.executable
 
     # Base environment: inherit everything, then layer overrides
@@ -730,6 +726,9 @@ async def _run_pipeline(
     _is_half_str: str = "True" if _rvc_device.startswith("cuda") else "False"
     # CUDA device index for tools that accept i_gpu as a separate arg
     _cuda_device_idx: str = base_env.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+    # F0 worker count: GPU is GPU-bound — forking N processes wastes VRAM with
+    # zero throughput gain.  CPU is genuinely parallel; cap at 8 (I/O bound).
+    _f0_n_proc = 1 if _rvc_device in ("cuda", "mps") else min(n_cpu, 8)
 
     await job.queue.put(
         {
@@ -1139,19 +1138,22 @@ async def _run_pipeline(
 
                     # Parse individual loss scalars from the last buffered loss
                     # line for frontend chart display.
+                    # Log format: "losses: disc=X, gen=Y, fm=Z, mel=A, kl=B, spk=C"
+                    # Short keys in the log → map to long keys expected by frontend.
                     losses: dict = {}
-                    for key in (
-                        "loss_disc",
-                        "loss_gen",
-                        "loss_fm",
-                        "loss_mel",
-                        "loss_kl",
-                        "loss_spk",
-                    ):
-                        lm = _re.search(rf"{key}=([0-9.]+)", last_loss_line)
+                    _key_map = {
+                        "disc": "loss_disc",
+                        "gen":  "loss_gen",
+                        "fm":   "loss_fm",
+                        "mel":  "loss_mel",
+                        "kl":   "loss_kl",
+                        "spk":  "loss_spk",
+                    }
+                    for short_key, long_key in _key_map.items():
+                        lm = _re.search(rf"(?<![a-z]){short_key}=([0-9.]+)", last_loss_line)
                         if lm:
                             try:
-                                losses[key] = float(lm.group(1))
+                                losses[long_key] = float(lm.group(1))
                             except ValueError:
                                 pass
 
