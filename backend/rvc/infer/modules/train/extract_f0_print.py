@@ -97,11 +97,8 @@ class FeatureInput(object):
 
 
 if __name__ == "__main__":
-    # exp_dir=r"E:\codes\py39\dataset\mi-test"
-    # n_p=16
-    # f = open("%s/log_extract_f0.log"%exp_dir, "w")
     printt(" ".join(sys.argv))
-    featureInput = FeatureInput(is_half, device)
+
     paths = []
     inp_root = "%s/1_16k_wavs" % (exp_dir)
     opt_root1 = "%s/2a_f0" % (exp_dir)
@@ -117,16 +114,32 @@ if __name__ == "__main__":
         opt_path2 = "%s/%s" % (opt_root2, name)
         paths.append([inp_path, opt_path1, opt_path2])
 
-    ps = []
-    for i in range(n_p):
-        p = Process(
-            target=featureInput.go,
-            args=(
-                paths[i::n_p],
-                f0method,
-            ),
-        )
-        ps.append(p)
-        p.start()
-    for i in range(n_p):
-        ps[i].join()
+    # GPU devices (cuda / mps): RMVPE is GPU-bound — multiple processes all
+    # contend on the same device, gaining zero throughput while each holding
+    # ~600 MiB of VRAM.  Load the model once in this process and process all
+    # files sequentially.
+    #
+    # CPU: genuinely CPU-bound — fork n_p workers for real parallelism.
+    is_gpu = device.startswith("cuda") or device.startswith("mps")
+    effective_n_p = 1 if is_gpu else max(1, n_p)
+
+    featureInput = FeatureInput(is_half, device)
+
+    if effective_n_p == 1:
+        # Single-process path: no fork, no extra GPU contexts
+        featureInput.go(paths, f0method)
+    else:
+        # CPU multi-process path
+        ps = []
+        for i in range(effective_n_p):
+            p = Process(
+                target=featureInput.go,
+                args=(
+                    paths[i::effective_n_p],
+                    f0method,
+                ),
+            )
+            ps.append(p)
+            p.start()
+        for i in range(effective_n_p):
+            ps[i].join()

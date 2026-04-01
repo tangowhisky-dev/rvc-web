@@ -618,6 +618,10 @@ async def _run_pipeline(
             )
 
     n_cpu = multiprocessing.cpu_count()
+    # Cap CPU workers: beyond ~8 parallel audio readers there's no throughput
+    # gain (disk I/O bound).  For GPU devices extract_f0_print.py ignores this
+    # and runs single-process anyway — we pass 1 explicitly to make it clear.
+    _f0_n_proc = 1 if _rvc_device in ("cuda", "mps") else min(n_cpu, 8)
     python = sys.executable
 
     # Base environment: inherit everything, then layer overrides
@@ -749,7 +753,7 @@ async def _run_pipeline(
         python,
         "infer/modules/train/extract_f0_print.py",
         exp_dir,  # exp_dir absolute
-        str(n_cpu),
+        str(_f0_n_proc),  # n_p — 1 for GPU (prevent forking 80 RMVPE processes), capped at 8 for CPU
         "rmvpe",  # f0method
         _rvc_device,  # device — resolved at runtime
         _is_half_str,  # is_half

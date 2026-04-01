@@ -339,7 +339,25 @@ def _run_offline_inference(
     if output_gain != 1.0 and len(result) > 0:
         result = result * output_gain
 
-    return result, tgt_sr
+    # ── Explicit GPU cleanup ──────────────────────────────────────────────────
+    # RVC loads synthesizer + embedder + RMVPE onto GPU.  Without explicit
+    # deletion and cache flush, every offline call leaks all three models on
+    # the GPU for the lifetime of the process, exhausting VRAM across calls.
+    # Use try/finally so cleanup also runs when an exception is raised above.
+    try:
+        return result, tgt_sr
+    finally:
+        del rvc
+        del resample_16_tgt
+        del resample_tgt_16
+        del rolling_buf
+        del sola_buf
+        del fade_in_win
+        del fade_out_win
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
 
 # ---------------------------------------------------------------------------
