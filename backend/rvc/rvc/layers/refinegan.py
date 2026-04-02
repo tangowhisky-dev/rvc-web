@@ -266,7 +266,13 @@ class RefineGANGenerator(nn.Module):
         self.conv_post.apply(init_weights)
 
     def forward(self, mel: torch.Tensor, f0: torch.Tensor,
-                g: torch.Tensor = None):
+                g: torch.Tensor = None, n_res: int = None):
+        # n_res: optional target length — resize mel to match, keeping the
+        # same interface as the HiFi-GAN generator so callers are uniform.
+        if n_res is not None:
+            n = int(n_res)
+            if n != mel.shape[-1]:
+                mel = F.interpolate(mel, size=n, mode="linear")
         f0_size = mel.shape[-1]
         f0 = F.interpolate(f0.unsqueeze(1), size=f0_size * self.upp, mode="linear")
         har_source = self.m_source(f0.transpose(1, 2)).transpose(1, 2)
