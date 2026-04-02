@@ -28,19 +28,24 @@ DELETE /api/profiles/{id}/audio/{file_id}         — delete audio file
 POST   /api/profiles/{id}/audio/{file_id}/clean   — run noise removal in-place
 
 GET    /api/profiles/{id}/health                  — file-existence health check
+GET    /api/profiles/{id}/export                  — export profile as rvc-profile-v1.zip
+POST   /api/profiles/import                       — import profile from rvc-profile-v1.zip
 """
 
 import asyncio
+import json
 import logging
 import os
 import shutil
+import tempfile
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from typing import Optional
 
 import aiofiles
 from fastapi import APIRouter, Form, HTTPException, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi import UploadFile
 from pydantic import BaseModel
 
@@ -980,6 +985,431 @@ async def delete_profile(profile_id: str) -> Response:
             shutil.rmtree(exp_dir, ignore_errors=True)
 
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/profiles/{id}/export  — export profile as rvc-profile-v1.zip
+# ---------------------------------------------------------------------------
+
+# Files included in the export bundle (relative to profile_dir).
+# D_latest.pth is excluded — it's the discriminator checkpoint (~431 MB) which
+# is only useful mid-training and would inflate the zip for little benefit.
+_EXPORT_FILES = [
+    "model_infer.pth",
+    "model_best.pth",
+    "model.index",
+    "profile_embedding.pt",
+    "train.log",
+    "checkpoints/G_latest.pth",
+    "checkpoints/G_best.pth",
+]
+
+
+@router.get("/{profile_id}/export")
+async def export_profile(profile_id: str):
+    """Build a portable rvc-profile-v1.zip and stream it to the client.
+
+    Zip layout:
+        manifest.json             — DB metadata, no absolute paths
+        audio/voice.wav           — all audio files
+        model_infer.pth           — inference model (if present)
+        model_best.pth            — best-epoch model (if present)
+        model.index               — FAISS index (if present)
+        profile_embedding.pt      — speaker embedding (if present)
+        checkpoints/G_latest.pth  — resume checkpoint (if present)
+        checkpoints/G_best.pth    — best-epoch generator (if present)
+        train.log                 — training log (if present)
+
+    D_latest.pth (discriminator) is excluded: ~431 MB, not needed for inference
+    or resume training (train.py reconstructs it from pretrain weights on resume).
+    """
+    async with get_db() as db:
+        cursor = await db.execute(
+            """SELECT id, name, status, created_at, batch_size,
+                      profile_dir, total_epochs_trained, needs_retraining,
+                      profile_rms, embedder, vocoder,
+                      best_epoch, best_avg_gen_loss
+               FROM profiles WHERE id = ?""",
+            (profile_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Profile not found: {profile_id}")
+
+        audio_cursor = await db.execute(
+            """SELECT filename, file_path, duration, is_cleaned, created_at
+               FROM audio_files WHERE profile_id = ? ORDER BY created_at ASC""",
+            (profile_id,),
+        )
+        audio_rows = await audio_cursor.fetchall()
+
+        loss_cursor = await db.execute(
+            """SELECT epoch, loss_mel, loss_gen, loss_disc, loss_fm, loss_kl, loss_spk, trained_at
+               FROM epoch_losses WHERE profile_id = ? ORDER BY epoch ASC""",
+            (profile_id,),
+        )
+        loss_rows = await loss_cursor.fetchall()
+
+    pdir = row["profile_dir"]
+    if not pdir or not os.path.isdir(pdir):
+        raise HTTPException(
+            status_code=400, detail="Profile directory not found — cannot export"
+        )
+
+    files_included: list[str] = []
+    manifest: dict = {
+        "format_version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "profile": {
+            "name": row["name"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "batch_size": row["batch_size"] or 8,
+            "embedder": row["embedder"] or "spin-v2",
+            "vocoder": row["vocoder"] or "HiFi-GAN",
+            "total_epochs_trained": int(row["total_epochs_trained"] or 0),
+            "needs_retraining": bool(row["needs_retraining"]),
+            "profile_rms": float(row["profile_rms"]) if row["profile_rms"] is not None else None,
+            "best_epoch": int(row["best_epoch"]) if row["best_epoch"] is not None else None,
+            "best_avg_gen_loss": float(row["best_avg_gen_loss"]) if row["best_avg_gen_loss"] is not None else None,
+        },
+        "audio_files": [
+            {
+                "filename": r["filename"],
+                "duration": r["duration"],
+                "is_cleaned": bool(r["is_cleaned"]),
+                "created_at": r["created_at"],
+            }
+            for r in audio_rows
+        ],
+        "epoch_losses": [
+            {
+                "epoch": r["epoch"],
+                "loss_mel": r["loss_mel"],
+                "loss_gen": r["loss_gen"],
+                "loss_disc": r["loss_disc"],
+                "loss_fm": r["loss_fm"],
+                "loss_kl": r["loss_kl"],
+                "loss_spk": r["loss_spk"],
+                "trained_at": r["trained_at"],
+            }
+            for r in loss_rows
+        ],
+        "files_included": [],  # filled after we know what actually exists
+    }
+
+    # Write the zip to a temp file on disk — never holds file data in RAM.
+    # zipfile.ZipFile.write() copies directly from source path to the zip file
+    # on disk without buffering through Python. ZIP_STORED is used because
+    # .pth/.wav files are already binary-dense and don't compress meaningfully.
+    # The temp file is streamed back in 64 KB chunks and deleted in the
+    # generator's finally block, so it is cleaned up even if the client
+    # disconnects mid-download.
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="rvc-export-")
+    os.close(tmp_fd)  # zipfile opens by path; release the fd
+
+    try:
+        with zipfile.ZipFile(tmp_path, mode="w", compression=zipfile.ZIP_STORED) as zf:
+            # Audio files
+            for ar in audio_rows:
+                src = ar["file_path"]
+                if src and os.path.isfile(src):
+                    arc_name = f"audio/{ar['filename']}"
+                    zf.write(src, arc_name)
+                    files_included.append(arc_name)
+                else:
+                    logger.warning("export: audio file missing on disk: %s", src)
+
+            # Static known files
+            for rel in _EXPORT_FILES:
+                src = os.path.join(pdir, rel)
+                if os.path.isfile(src):
+                    zf.write(src, rel)
+                    files_included.append(rel)
+
+            # Finalize manifest with the actual file list
+            manifest["files_included"] = files_included
+            zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    safe_name = row["name"].replace(" ", "_").replace("/", "_")[:40]
+    filename = f"{safe_name}.rvc-profile.zip"
+    size_mb = os.path.getsize(tmp_path) / 1024 / 1024
+
+    logger.info(
+        "export: profile=%s name=%s files=%d size=%.1f MB",
+        profile_id, row["name"], len(files_included), size_mb,
+    )
+
+    def _stream_and_delete(path: str, chunk_size: int = 64 * 1024):
+        """Yield file in chunks, delete temp file when done or on error."""
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    return StreamingResponse(
+        _stream_and_delete(tmp_path),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/profiles/import  — import profile from rvc-profile-v1.zip
+#
+# IMPORTANT: this route must be registered BEFORE /{profile_id} routes so
+# FastAPI does not match the literal string "import" as a profile_id.
+# The import endpoint is wired in main.py via a separate sub-router registered
+# with higher priority, or simply declared first in this file. Since FastAPI
+# resolves routes in declaration order for the same HTTP method, declaring
+# POST /import before POST /{profile_id}/audio is sufficient.
+# ---------------------------------------------------------------------------
+
+
+class ImportProfileResponse(BaseModel):
+    profile: ProfileOut
+    warnings: list[str] = []
+
+
+@router.post("/import", status_code=200, response_model=ImportProfileResponse)
+async def import_profile(
+    file: UploadFile = ...,
+    name_override: Optional[str] = Form(None),
+) -> ImportProfileResponse:
+    """Import a profile from a rvc-profile-v1.zip bundle.
+
+    Always creates a new profile with a fresh UUID — the source profile_id is
+    never reused.  If the profile name already exists in the DB and no
+    name_override is supplied, returns HTTP 409 with a JSON detail describing
+    the collision and a suggested alternative name.
+
+    Request: multipart/form-data
+        file:          the .zip file  (required)
+        name_override: rename profile on import  (optional)
+
+    Responses:
+        200 — success; body: ImportProfileResponse
+        409 — name collision; detail: {code, name, suggested}
+        422 — invalid zip or manifest format
+    """
+    warnings: list[str] = []
+
+    # FastAPI UploadFile.file is a SpooledTemporaryFile backed by disk once it
+    # exceeds the spool threshold (~1 MB by default).  We seek to 0 and pass it
+    # directly to zipfile — no read() into memory.  Size check via seek/tell.
+    upload_fh = file.file
+    upload_fh.seek(0, 2)  # seek to end
+    upload_size = upload_fh.tell()
+    upload_fh.seek(0)
+
+    if upload_size > 4 * 1024 * 1024 * 1024:  # 4 GB hard cap
+        raise HTTPException(status_code=413, detail="Import file exceeds 4 GB limit")
+
+    try:
+        zf = zipfile.ZipFile(upload_fh)
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=422, detail=f"Not a valid zip file: {exc}") from exc
+
+    if "manifest.json" not in zf.namelist():
+        raise HTTPException(status_code=422, detail="manifest.json not found in zip")
+
+    try:
+        manifest = json.loads(zf.read("manifest.json"))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"manifest.json parse error: {exc}") from exc
+
+    if manifest.get("format_version") != 1:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported format_version: {manifest.get('format_version')} (expected 1)",
+        )
+
+    prof_meta = manifest.get("profile", {})
+    if not prof_meta.get("name"):
+        raise HTTPException(status_code=422, detail="manifest.json: profile.name is missing")
+
+    source_name: str = prof_meta["name"]
+    import_name: str = name_override.strip() if (name_override and name_override.strip()) else source_name
+
+    # --- Name collision check ---
+    async with get_db() as db:
+        cursor = await db.execute("SELECT id FROM profiles WHERE name = ?", (import_name,))
+        collision = await cursor.fetchone()
+
+    if collision:
+        # Suggest a free name: "Original Name (1)", "(2)", etc.
+        n = 1
+        async with get_db() as db:
+            while True:
+                candidate = f"{source_name} ({n})"
+                cursor = await db.execute("SELECT id FROM profiles WHERE name = ?", (candidate,))
+                if await cursor.fetchone() is None:
+                    break
+                n += 1
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "name_taken",
+                "name": import_name,
+                "suggested": candidate,
+            },
+        )
+
+    # --- Allocate new profile directory ---
+    new_profile_id = uuid.uuid4().hex
+    pdir = os.path.join(_profiles_root(), new_profile_id)
+    audio_dir = os.path.join(pdir, "audio")
+    ckpt_dir = os.path.join(pdir, "checkpoints")
+    os.makedirs(audio_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    zip_names = set(zf.namelist())
+    files_included = set(manifest.get("files_included", []))
+
+    try:
+        # Extract audio files
+        audio_meta = manifest.get("audio_files", [])
+        extracted_audio: list[dict] = []
+        for af in audio_meta:
+            arc_name = f"audio/{af['filename']}"
+            if arc_name in zip_names:
+                dest = os.path.join(audio_dir, af["filename"])
+                with zf.open(arc_name) as src_f, open(dest, "wb") as dst_f:
+                    shutil.copyfileobj(src_f, dst_f)
+                extracted_audio.append({**af, "file_path": dest})
+            else:
+                warnings.append(f"Audio file missing from zip: {af['filename']}")
+                logger.warning("import: audio file %s not in zip", arc_name)
+
+        # Extract static files
+        _STATIC_IMPORTS = [
+            "model_infer.pth",
+            "model_best.pth",
+            "model.index",
+            "profile_embedding.pt",
+            "train.log",
+            "checkpoints/G_latest.pth",
+            "checkpoints/G_best.pth",
+        ]
+        for rel in _STATIC_IMPORTS:
+            if rel in zip_names:
+                dest = os.path.join(pdir, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with zf.open(rel) as src_f, open(dest, "wb") as dst_f:
+                    shutil.copyfileobj(src_f, dst_f)
+            elif rel in files_included:
+                warnings.append(f"Expected file missing from zip: {rel}")
+
+    except Exception as exc:
+        shutil.rmtree(pdir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Failed to extract zip: {exc}") from exc
+
+    # --- Write DB rows ---
+    created_at = datetime.now(timezone.utc).isoformat()
+    epoch_losses = manifest.get("epoch_losses", [])
+
+    async with get_db() as db:
+        await db.execute(
+            """INSERT INTO profiles
+               (id, name, status, sample_path, batch_size, audio_duration,
+                preprocessed_path, profile_dir, profile_rms, embedder, vocoder,
+                total_epochs_trained, needs_retraining, best_epoch, best_avg_gen_loss,
+                created_at)
+               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                new_profile_id,
+                import_name,
+                prof_meta.get("status", "untrained"),
+                extracted_audio[0]["file_path"] if extracted_audio else "",
+                int(prof_meta.get("batch_size", 8)),
+                sum(af.get("duration") or 0 for af in extracted_audio) or None,
+                pdir,
+                float(prof_meta["profile_rms"]) if prof_meta.get("profile_rms") is not None else None,
+                prof_meta.get("embedder", "spin-v2"),
+                prof_meta.get("vocoder", "HiFi-GAN"),
+                int(prof_meta.get("total_epochs_trained", 0)),
+                int(bool(prof_meta.get("needs_retraining", False))),
+                int(prof_meta["best_epoch"]) if prof_meta.get("best_epoch") is not None else None,
+                float(prof_meta["best_avg_gen_loss"]) if prof_meta.get("best_avg_gen_loss") is not None else None,
+                created_at,
+            ),
+        )
+
+        for af in extracted_audio:
+            await db.execute(
+                """INSERT INTO audio_files
+                   (id, profile_id, filename, file_path, duration, is_cleaned, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    uuid.uuid4().hex,
+                    new_profile_id,
+                    af["filename"],
+                    af["file_path"],
+                    af.get("duration"),
+                    int(bool(af.get("is_cleaned", False))),
+                    af.get("created_at", created_at),
+                ),
+            )
+
+        for el in epoch_losses:
+            if el.get("epoch") is None:
+                continue
+            await db.execute(
+                """INSERT OR IGNORE INTO epoch_losses
+                   (id, profile_id, epoch, loss_mel, loss_gen, loss_disc,
+                    loss_fm, loss_kl, loss_spk, trained_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    uuid.uuid4().hex,
+                    new_profile_id,
+                    el["epoch"],
+                    el.get("loss_mel"),
+                    el.get("loss_gen"),
+                    el.get("loss_disc"),
+                    el.get("loss_fm"),
+                    el.get("loss_kl"),
+                    el.get("loss_spk"),
+                    el.get("trained_at", created_at),
+                ),
+            )
+
+        await db.commit()
+
+        cursor = await db.execute(
+            """SELECT id, name, status, created_at, sample_path,
+                      batch_size, audio_duration, preprocessed_path,
+                      profile_dir, model_path, checkpoint_path, index_path,
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder,
+                      best_epoch, best_avg_gen_loss
+               FROM profiles WHERE id = ?""",
+            (new_profile_id,),
+        )
+        new_row = await cursor.fetchone()
+        profile_out = await _row_to_out(new_row, db)
+
+    logger.info(
+        "import: new_id=%s name=%s epochs=%d audio=%d warnings=%d",
+        new_profile_id, import_name,
+        prof_meta.get("total_epochs_trained", 0),
+        len(extracted_audio), len(warnings),
+    )
+
+    return ImportProfileResponse(profile=profile_out, warnings=warnings)
 
 
 # ---------------------------------------------------------------------------
