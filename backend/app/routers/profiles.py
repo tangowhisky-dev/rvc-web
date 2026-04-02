@@ -65,7 +65,7 @@ router = APIRouter(prefix="/api/profiles", tags=["profiles"])
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 
 # Audio duration constraints (seconds)
-MAX_DURATION_SEC = 30 * 60  # 30 minutes
+MAX_DURATION_SEC = 60 * 60  # 60 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +357,7 @@ async def _upload_and_clip(
             pass
         raise HTTPException(
             status_code=422,
-            detail=f"Audio is {duration / 60:.1f} min — max allowed is 30 min",
+            detail=f"Audio is {duration / 60:.1f} min — max allowed is 60 min",
         )
 
     # Derive a clean stem from the original filename

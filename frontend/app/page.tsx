@@ -98,7 +98,7 @@ function HealthPill({ ok, label, loading }: { ok: boolean; label: string; loadin
 // ---------------------------------------------------------------------------
 
 const MIN_SEG_SEC = 10 * 60;  // 10 min
-const MAX_SEG_SEC = 15 * 60;  // 15 min
+const MAX_SEG_SEC = 30 * 60;  // 30 min
 
 interface WaveformProps {
   file: File;
@@ -483,7 +483,7 @@ function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField, showE
       URL.revokeObjectURL(url);
 
       if (!isFinite(dur) || dur <= 0) { setDurationError('Could not determine duration'); return; }
-      if (dur > 30 * 60)              { setDurationError(`${(dur / 60).toFixed(1)} min — max is 30 min`); return; }
+      if (dur > 60 * 60)              { setDurationError(`${(dur / 60).toFixed(1)} min — max is 60 min`); return; }
 
       setFileDuration(dur);
       const defaultEnd   = Math.min(dur, MAX_SEG_SEC);
@@ -541,7 +541,7 @@ function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField, showE
           <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
             Audio File
             <span className="ml-2 font-normal text-zinc-600 normal-case tracking-normal">
-              max 30 min · select 10–15 min segment below
+              max 60 min · select 10–30 min segment below
             </span>
           </label>
           <input
