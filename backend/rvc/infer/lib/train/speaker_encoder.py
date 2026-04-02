@@ -491,6 +491,7 @@ class SpeakerEncoder:
             )
 
         self.model.to(device)
+        self._device = device
         for param in self.model.parameters():
             param.requires_grad = False
 
@@ -505,11 +506,25 @@ class SpeakerEncoder:
             mapped[new_key] = value
         return mapped
 
-    @torch.no_grad()
     def get_embedding(self, audio: torch.Tensor) -> torch.Tensor:
+        """Forward pass through encoder. Gradients flow through audio input.
+        
+        The encoder parameters are frozen (requires_grad=False), but gradients
+        from the output back through the audio input are preserved — this is
+        required when computing speaker loss during generator training.
+        """
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
-        # audio is already on the training device — avoid redundant .to() transfer
+        audio = audio.to(self._device)
+        _, embs = self.model(audio)
+        return embs
+
+    @torch.no_grad()
+    def get_embedding_frozen(self, audio: torch.Tensor) -> torch.Tensor:
+        """No-grad variant for profile embedding extraction (inference only)."""
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        audio = audio.to(self._device)
         _, embs = self.model(audio)
         return embs
 

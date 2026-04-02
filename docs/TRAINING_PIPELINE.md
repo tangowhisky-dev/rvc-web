@@ -316,6 +316,6 @@ loss_spk = (1 - cosine_sim(gen_emb, ref_emb)) × c_spk
 - Embeddings from 0.4s segments are noisy and content-dependent
 
 ### Planned: Profile-Level Embeddings
-- Compute **one robust speaker embedding** from all profile audio before training
+- Compute **one robust speaker embedding** from all profile audio before training (completed)
 - Compare each generated segment's embedding against this fixed target
 - Eliminates per-segment noise, provides consistent speaker identity target

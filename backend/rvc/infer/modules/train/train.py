@@ -12,10 +12,19 @@ sys.path.append(os.path.join(now_dir))
 import datetime
 
 from infer.lib.train import utils
+from infer.lib.train.db_writer import TrainingDBWriter
 
 hps = utils.get_hparams()
 os.environ["CUDA_VISIBLE_DEVICES"] = hps.gpus.replace("-", ",")
 n_gpus = len(hps.gpus.split("-"))
+
+# Direct DB writer — no stdout, no parsing, no glue code.
+# Writes best_epoch and epoch_losses straight to rvc.db from the subprocess.
+_db_writer = TrainingDBWriter(
+    db_path=getattr(hps, "db_path", ""),
+    profile_id=getattr(hps, "profile_id", ""),
+)
+
 from random import randint, shuffle
 import torch
 
@@ -289,15 +298,15 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         net_d = DDP(net_d)
 
     try:  # 如果能加载自动resume
-        _, _, _, epoch_str = utils.load_checkpoint(
-            utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d
-        )  # D多半加载没事
+        # Always use explicit *_latest.pth names — the glob "G_*.pth" also
+        # matches G_best.pth which has a lower epoch, causing resume to restart
+        # from the best epoch instead of the latest checkpoint epoch.
+        _d_ckpt = os.path.join(hps.model_dir, "D_latest.pth")
+        _g_ckpt = os.path.join(hps.model_dir, "G_latest.pth")
+        _, _, _, epoch_str = utils.load_checkpoint(_d_ckpt, net_d, optim_d)
         if rank == 0:
             logger.info("loaded D")
-        # _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g,load_opt=0)
-        _, _, _, epoch_str = utils.load_checkpoint(
-            utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g
-        )
+        _, _, _, epoch_str = utils.load_checkpoint(_g_ckpt, net_g, optim_g)
         # epoch_str is the epoch that was just *saved* (completed). Advance by
         # one so the loop starts at the next unfinished epoch.
         epoch_str += 1
@@ -361,11 +370,13 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
     else:
         _fn_mel_loss = None  # use F.l1_loss directly
 
-    # Speaker encoder + profile embedding — loaded once if c_spk > 0
+    # Speaker encoder + profile embedding — loaded when loss_mode requires it
     _spk_encoder = None
     _profile_emb = None
     _c_spk = getattr(hps.train, "c_spk", 0.0)
-    if _c_spk > 0 and rank == 0:
+    _loss_mode = getattr(hps.train, "loss_mode", "classic")
+    _needs_spk = _loss_mode == "combined" or _c_spk > 0
+    if _needs_spk and rank == 0:
         try:
             _spk_encoder = _get_speaker_encoder(_device)
             logger.info(f"Speaker encoder loaded (c_spk={_c_spk})")
@@ -466,8 +477,13 @@ def train_and_evaluate(
     global global_step
     global lowest_loss_g
 
-    # Per-epoch loss accumulation for best-epoch detection
+    # Per-epoch loss accumulation for best-epoch detection and DB writes
     _epoch_gen_sum: float = 0.0
+    _epoch_disc_sum: float = 0.0
+    _epoch_fm_sum: float = 0.0
+    _epoch_mel_sum: float = 0.0
+    _epoch_kl_sum: float = 0.0
+    _epoch_spk_sum: float = 0.0
     _epoch_gen_count: int = 0
 
     net_g.train()
@@ -699,7 +715,14 @@ def train_and_evaluate(
                     ref_emb = profile_emb.unsqueeze(0)  # [1, 192] → broadcast [B, 192]
                     loss_spk = _spk_loss_fn(gen_emb, ref_emb) * c_spk
 
-                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_spk
+                # loss_mode controls which terms contribute to the generator update:
+                #   "classic"  — reconstruction + GAN (no speaker loss)
+                #   "combined" — classic + ECAPA speaker identity loss
+                _loss_mode = getattr(hps.train, "loss_mode", "classic")
+                if _loss_mode == "combined":
+                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_spk
+                else:  # "classic" — default
+                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
         scaler.unscale_(optim_g)
@@ -707,9 +730,14 @@ def train_and_evaluate(
         scaler.step(optim_g)
         scaler.update()
 
-        # Accumulate generator loss for epoch-average best-epoch tracking
+        # Accumulate per-step losses for epoch-average tracking and DB writes
         if rank == 0:
-            _epoch_gen_sum += loss_gen.item()
+            _epoch_gen_sum  += loss_gen.item()
+            _epoch_disc_sum += loss_disc.item()
+            _epoch_fm_sum   += loss_fm.item()
+            _epoch_mel_sum  += loss_mel.item()
+            _epoch_kl_sum   += loss_kl.item()
+            _epoch_spk_sum  += loss_spk.item() if hasattr(loss_spk, 'item') else float(loss_spk)
             _epoch_gen_count += 1
 
         if rank == 0:
@@ -856,6 +884,20 @@ def train_and_evaluate(
                 logger.info(
                     f"best model updated → G_best.pth  (epoch={epoch}, avg_loss_g={avg_loss_g:.4f})"
                 )
+                # Write directly to DB — no stdout events, no parsing.
+                _db_writer.update_best_epoch(epoch, avg_loss_g)
+
+        # Write epoch-average losses directly to DB
+        if rank == 0 and _epoch_gen_count > 0:
+            _n = _epoch_gen_count
+            _db_writer.insert_epoch_loss(epoch, {
+                "loss_gen":  round(_epoch_gen_sum  / _n, 4),
+                "loss_disc": round(_epoch_disc_sum / _n, 4),
+                "loss_fm":   round(_epoch_fm_sum   / _n, 4),
+                "loss_mel":  round(_epoch_mel_sum  / _n, 4),
+                "loss_kl":   round(_epoch_kl_sum   / _n, 4),
+                "loss_spk":  round(_epoch_spk_sum  / _n, 4),
+            })
 
         logger.info("====> Epoch: {} {}".format(epoch, epoch_recorder.record()))
     if epoch >= hps.total_epoch and rank == 0:

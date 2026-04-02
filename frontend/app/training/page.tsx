@@ -657,7 +657,8 @@ export default function TrainingPage() {
   const [batchSize, setBatchSize] = useState(8);
   const [overtrainEnabled, setOvertrainEnabled] = useState(false);
   const [overtrainThreshold, setOvertrainThreshold] = useState(50);
-  const [speakerLossWeight, setSpeakerLossWeight] = useState(0);
+  const [lossMode, setLossMode] = useState<'classic' | 'combined'>('classic');
+  const [speakerLossWeight, setSpeakerLossWeight] = useState(3);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
 
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -705,6 +706,32 @@ export default function TrainingPage() {
   // -------------------------------------------------------------------------
   function attachWs(profileId: string) {
     closeWs();
+
+    // Seed chart with all historical losses before live events arrive.
+    // This ensures resumed runs show prior epochs immediately.
+    fetch(`${API}/api/training/losses/${profileId}`)
+      .then(r => r.ok ? r.json() : [])
+      .then((rows: EpochLossPoint[]) => {
+        if (!rows.length) return;
+        setEpochPoints(prev => {
+          const existingEpochs = new Set(prev.map(p => p.epoch));
+          const fresh = rows
+            .filter(r => !existingEpochs.has(r.epoch))
+            .map(r => ({
+              epoch:     r.epoch,
+              loss_mel:  r.loss_mel  ?? 0,
+              loss_gen:  r.loss_gen  ?? 0,
+              loss_disc: r.loss_disc ?? 0,
+              loss_fm:   r.loss_fm   ?? 0,
+              loss_kl:   r.loss_kl   ?? 0,
+              loss_spk:  r.loss_spk  ?? 0,
+            }));
+          if (!fresh.length) return prev;
+          return [...prev, ...fresh].sort((a, b) => a.epoch - b.epoch);
+        });
+      })
+      .catch(() => {});
+
     const ws = new WebSocket(`${WS_BASE}/ws/training/${profileId}`);
     wsRef.current = ws;
 
@@ -721,7 +748,7 @@ export default function TrainingPage() {
           if (msg.message) appendLog(`✓ ${msg.message}`);
           if (msg.epoch != null && msg.losses) {
             const l = msg.losses;
-            setEpochPoints(prev => [...prev, {
+            const point = {
               epoch:     msg.epoch!,
               loss_mel:  l.loss_mel  ?? 0,
               loss_gen:  l.loss_gen  ?? 0,
@@ -729,7 +756,12 @@ export default function TrainingPage() {
               loss_fm:   l.loss_fm   ?? 0,
               loss_kl:   l.loss_kl   ?? 0,
               loss_spk:  l.loss_spk  ?? 0,
-            }]);
+            };
+            // Upsert by epoch — live event replaces any history row for same epoch
+            setEpochPoints(prev => {
+              const without = prev.filter(p => p.epoch !== point.epoch);
+              return [...without, point].sort((a, b) => a.epoch - b.epoch);
+            });
           }
           // Keep best_epoch marker in sync during live training
           if (msg.is_best && msg.best_epoch != null) {
@@ -748,12 +780,20 @@ export default function TrainingPage() {
           fetch(`${API}/api/profiles`).then(r => r.ok ? r.json() : null).then(d => { if (d) setProfiles(d); }).catch(() => {});
           closeWs();
         } else if (msg.type === 'error') {
-          setJobState('failed');
-          jobStateRef.current = 'failed';
           const t = msg.message ?? 'Unknown error';
-          setErrorMsg(t);
-          appendLog(`ERROR: ${t}`);
-          closeWs();
+          // User-cancel is not a terminal failure — the pipeline continues to
+          // save the checkpoint and build the index. Keep the WS open and stay
+          // in 'running' state so subsequent log/done messages are received.
+          const isCancel = t.toLowerCase().includes('cancelled');
+          if (isCancel) {
+            appendLog(`⚠ ${t}`);
+          } else {
+            setJobState('failed');
+            jobStateRef.current = 'failed';
+            setErrorMsg(t);
+            appendLog(`ERROR: ${t}`);
+            closeWs();
+          }
         }
       } catch { /* malformed JSON */ }
     };
@@ -871,7 +911,7 @@ export default function TrainingPage() {
       const res = await fetch(`${API}/api/training/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainEnabled ? overtrainThreshold : 0, c_spk: speakerLossWeight }),
+        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainEnabled ? overtrainThreshold : 0, c_spk: lossMode === 'classic' ? 0 : speakerLossWeight, loss_mode: lossMode }),
       });
 
       if (res.status === 409) {
@@ -908,10 +948,10 @@ export default function TrainingPage() {
         body: JSON.stringify({ profile_id: selectedId }),
       });
     } catch { /* best-effort */ }
-    closeWs();
-    setJobState('idle');
-    jobStateRef.current = 'idle';
-    appendLog('(training cancelled)');
+    // Do NOT close the WS here — the pipeline continues (index build +
+    // artifact save) and will send log messages and a final 'done' event.
+    // The 'done' handler will close the WS and set state to 'done'.
+    appendLog('(cancel requested — waiting for checkpoint save and index build…)');
   }
 
   const isRunning = jobState === 'running';
@@ -1086,30 +1126,86 @@ export default function TrainingPage() {
                   </span>
                 </div>
 
-                {/* Speaker Loss Weight */}
-                <div className="flex flex-col gap-2 min-w-[180px]">
-                  <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
-                    <span className="text-pink-400">🎤</span> Speaker Loss Weight (c_spk)
-                  </label>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="range" value={speakerLossWeight} min={0} max={3} step={0.5}
-                      disabled={isRunning}
-                      onChange={(e) => setSpeakerLossWeight(Number(e.target.value))}
-                      className="flex-1 accent-pink-600"
-                    />
-                    <span className="text-[13px] font-mono text-pink-300 w-8 text-right">
-                      {speakerLossWeight === 0 ? 'off' : speakerLossWeight.toFixed(1)}
-                    </span>
-                  </div>
-                  <span className="text-[10px] font-mono text-zinc-600">
-                    {speakerLossWeight === 0
-                      ? 'disabled — no speaker identity loss'
-                      : `ECAPA-TDNN cosine loss · recommended: 2.0–3.0 for voice cloning`}
-                  </span>
+              </div>
+
+              {/* Loss Mode — full-width below the two columns */}
+              <div className="flex flex-col gap-2 pt-3 border-t border-zinc-800/60">
+                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+                  Training Objective
+                </label>
+                <div className="flex flex-col gap-1.5">
+                  {([
+                    {
+                      value: 'classic' as const,
+                      label: 'Classic',
+                      color: 'text-cyan-400',
+                      dot: 'bg-cyan-500',
+                      desc: 'Mel + KL + adversarial + feature matching. Standard RVC training — best for most use cases.',
+                    },
+                    {
+                      value: 'combined' as const,
+                      label: 'Combined',
+                      color: 'text-violet-400',
+                      dot: 'bg-violet-500',
+                      desc: 'Classic + ECAPA speaker identity loss. Adds explicit speaker similarity pressure on top of standard training.',
+                    },
+                  ] as const).map(opt => {
+                    const active = lossMode === opt.value;
+                    return (
+                      <button
+                        key={opt.value}
+                        disabled={isRunning}
+                        onClick={() => setLossMode(opt.value)}
+                        className={`flex items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-colors border
+                          ${active
+                            ? 'border-zinc-600 bg-zinc-800/80'
+                            : 'border-zinc-800 bg-zinc-900/40 hover:bg-zinc-800/40'
+                          } ${isRunning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                      >
+                        {/* Radio dot */}
+                        <span className="mt-0.5 w-3.5 h-3.5 rounded-full border-2 shrink-0 flex items-center justify-center
+                          border-zinc-500"
+                          style={{ borderColor: active ? undefined : undefined }}
+                        >
+                          {active && <span className={`w-1.5 h-1.5 rounded-full ${opt.dot}`} />}
+                        </span>
+                        <span className="flex flex-col gap-0.5">
+                          <span className={`text-[12px] font-mono font-semibold ${active ? opt.color : 'text-zinc-400'}`}>
+                            {opt.label}
+                          </span>
+                          <span className="text-[10px] font-mono text-zinc-500 leading-relaxed">
+                            {opt.desc}
+                          </span>
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
 
+                {/* c_spk slider — only visible for combined */}
+                {lossMode === 'combined' && (
+                  <div className="flex items-center gap-3 mt-1 pl-1">
+                    <span className="text-[10px] font-mono text-zinc-500 shrink-0 w-20">
+                      c_spk weight
+                    </span>
+                    <input
+                      type="range"
+                      min={1} max={5} step={0.5}
+                      value={speakerLossWeight}
+                      disabled={isRunning}
+                      onChange={e => setSpeakerLossWeight(Number(e.target.value))}
+                      className="flex-1 accent-pink-500"
+                    />
+                    <span className="text-[12px] font-mono text-pink-300 w-6 text-right">
+                      {speakerLossWeight.toFixed(1)}
+                    </span>
+                    <span className="text-[10px] font-mono text-zinc-600 shrink-0">
+                      recommended 2–3
+                    </span>
+                  </div>
+                )}
               </div>
+
             </div>
 
             {/* Actions */}
@@ -1157,9 +1253,19 @@ export default function TrainingPage() {
             <div className="bg-zinc-950 rounded-lg p-3 border border-zinc-800">
               <LossChart
                 points={epochPoints}
-                totalEpochs={isRunning
-                  ? Math.max(epochPoints.length > 0 ? epochPoints[epochPoints.length - 1].epoch : 0, epochs)
-                  : undefined}
+                totalEpochs={(() => {
+                  const sel = profiles.find(p => p.id === selectedId);
+                  const priorEpochs = sel?.total_epochs_trained ?? 0;
+                  // When running: domain extends to absolute target (prior + new)
+                  // When idle: domain = max epoch actually recorded
+                  if (isRunning) {
+                    return Math.max(
+                      epochPoints.length > 0 ? epochPoints[epochPoints.length - 1].epoch : 0,
+                      priorEpochs + epochs,
+                    );
+                  }
+                  return undefined; // LossChart falls back to max(points.epoch)
+                })()}
                 bestEpoch={profiles.find(p => p.id === selectedId)?.best_epoch ?? null}
               />
             </div>

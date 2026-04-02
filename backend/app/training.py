@@ -40,7 +40,7 @@ from typing import Dict, Optional
 import aiofiles
 import numpy as np
 
-from backend.app.db import get_db, save_epoch_loss
+from backend.app.db import get_db
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +274,7 @@ def _write_config(
     exp_dir: str,
     batch_size: int = 8,
     c_spk: float = 2.0,
+    loss_mode: str = "classic",
     vocoder: str = "HiFi-GAN",
     pretrain_g: str = "",
 ) -> None:
@@ -336,6 +337,7 @@ def _write_config(
     # Eliminates ~90% of the matplotlib MPS→CPU syncs that account for ~15s/epoch.
     cfg["train"]["log_interval"] = 10
     cfg["train"]["c_spk"] = c_spk
+    cfg["train"]["loss_mode"] = loss_mode
 
     # Auto-scale learning rate by sqrt(batch_size / reference_batch_size).
     # Reference: pretrained weights were optimised at batch_size=32, LR=1e-4.
@@ -440,6 +442,7 @@ async def _run_pipeline(
     overtrain_threshold: int = 0,
     vocoder: str = "HiFi-GAN",
     c_spk: float = 2.0,
+    loss_mode: str = "classic",
 ) -> None:
     """Orchestrate the full training pipeline for one TrainingJob.
 
@@ -580,7 +583,7 @@ async def _run_pipeline(
         # whose .npy exists — but those .npy files may now be paired with the
         # WRONG audio segments because sorted(listdir) indices shifted.
         _FEATURE_DIRS = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
-        _KEEP_FILES = {"G_latest.pth", "D_latest.pth"} if seeded_checkpoint else set()
+        _KEEP_FILES = ({"G_latest.pth", "D_latest.pth", "G_best.pth"} if seeded_checkpoint else set()) | {"profile_embedding.pt"}
         await job.queue.put(
             {
                 "type": "log",
@@ -603,14 +606,14 @@ async def _run_pipeline(
         os.makedirs(exp_dir, exist_ok=True)
         # Re-seed checkpoints after clearing feature dirs
         if seeded_checkpoint and ckpt_dir:
-            for ckpt_file in ("G_latest.pth", "D_latest.pth"):
+            for ckpt_file in ("G_latest.pth", "D_latest.pth", "G_best.pth"):
                 src = os.path.join(ckpt_dir, ckpt_file)
                 dst = os.path.join(exp_dir, ckpt_file)
                 if os.path.exists(src):
                     shutil.copy2(src, dst)
     else:
         _KEEP_DIRS = {"0_gt_wavs", "1_16k_wavs", "2a_f0", "2b-f0nsf", "3_feature768"}
-        _KEEP_FILES = {"G_latest.pth", "D_latest.pth"} if seeded_checkpoint else set()
+        _KEEP_FILES = ({"G_latest.pth", "D_latest.pth", "G_best.pth"} if seeded_checkpoint else set()) | {"profile_embedding.pt"}
         if os.path.isdir(exp_dir):
             for entry in os.listdir(exp_dir):
                 if entry in _KEEP_DIRS or entry in _KEEP_FILES:
@@ -845,7 +848,7 @@ async def _run_pipeline(
         return
 
     # ------------------------------------------------------------------
-    # Pre-phase 3: Extract profile-level speaker embedding (if c_spk > 0)
+    # Pre-phase 3: Extract profile-level speaker embedding (if loss_mode requires it)
     # Single source of truth: profile_dir/profile_embedding.pt
     # ------------------------------------------------------------------
     profile_emb_path = (
@@ -853,15 +856,29 @@ async def _run_pipeline(
     )
     exp_emb_path = os.path.join(exp_dir, "profile_embedding.pt")  # copy for training
 
-    if c_spk > 0:
+    _needs_spk_emb = loss_mode == "combined" or c_spk > 0
+    if _needs_spk_emb:
         _emit_phase("extract_profile_emb", "Extracting profile speaker embedding")
         gt_wavs_dir = os.path.join(exp_dir, "0_gt_wavs")
+
+        # Also re-extract if the extraction script itself is newer than the embedding
+        # (catches chunk duration changes like the 3s → 400ms migration)
+        _extractor_path = os.path.join(
+            rvc_pkg_dir, "infer/modules/train/extract_profile_embedding.py"
+        )
+        _script_newer = (
+            profile_emb_path
+            and os.path.isfile(profile_emb_path)
+            and os.path.isfile(_extractor_path)
+            and os.path.getmtime(_extractor_path) > os.path.getmtime(profile_emb_path)
+        )
 
         needs_extraction = (
             not profile_emb_path
             or not os.path.isfile(profile_emb_path)
             or files_changed
             or different_profile
+            or _script_newer
         )
 
         if needs_extraction:
@@ -917,7 +934,7 @@ async def _run_pipeline(
         await job.queue.put(
             {
                 "type": "log",
-                "message": f"Speaker loss disabled (c_spk={c_spk})",
+                "message": f"Speaker loss disabled (loss_mode={loss_mode}, c_spk={c_spk})",
                 "phase": "setup",
             }
         )
@@ -950,6 +967,7 @@ async def _run_pipeline(
             exp_dir,
             batch_size=batch_size,
             c_spk=c_spk,
+            loss_mode=loss_mode,
             vocoder=vocoder,
             pretrain_g=pretrain_g,
         )
@@ -1011,6 +1029,11 @@ async def _run_pipeline(
         base_env.get("CUDA_VISIBLE_DEVICES", "0") if _rvc_device == "cuda" else "0"
     )
 
+    # Pass profile identity and DB path to train.py so it can write
+    # best_epoch and epoch_losses directly without stdout/parsing glue.
+    profile_id = job.profile_id
+    db_path = os.path.join(project_root, "data", "rvc.db")
+
     train_args = [
         python,
         "infer/modules/train/train.py",
@@ -1046,6 +1069,10 @@ async def _run_pipeline(
         vocoder,
         "-emb",
         embedder,
+        "-pid",
+        profile_id,
+        "-db",
+        db_path,
     ]
 
     train_proc = await asyncio.create_subprocess_exec(
@@ -1057,12 +1084,9 @@ async def _run_pipeline(
     )
     job._proc = train_proc
 
-    # Tracks the last epoch_done seen in stdout — used for accurate DB epoch count
-    # on early-stop (overtraining) so we don't credit epochs that didn't run.
+    # Tracks the last epoch_done seen in stdout — used for accurate DB epoch
+    # count on early-stop / cancel so we don't credit epochs that didn't run.
     _last_completed_epoch: int = prior_epochs
-    # Best epoch tracking — updated by _drain_stdout, read in artifact phase.
-    _best_epoch_num: int = 0
-    _best_epoch_avg_gen: float = float("inf")
 
     log_path = os.path.join(exp_dir, "train.log")
 
@@ -1090,38 +1114,43 @@ async def _run_pipeline(
     # in case the FileHandler works in some configurations)
     tail_task = asyncio.create_task(_tail_train_log(job, log_path))
 
-    # Stream stdout into job queue — the root logger's StreamHandler (basicConfig)
-    # writes all INFO/DEBUG lines here. This is the primary log source since the
-    # FileHandler's file handle is lost when the logger is pickled into mp.Process.
-    # Parse epoch markers to emit structured epoch/epoch_done events.
+    # Stream stdout into job queue for real-time frontend display.
+    # Responsibilities:
+    #   - Stream log lines to the WS client
+    #   - Parse epoch markers → emit structured epoch_done events
+    #   - Overtraining detection (terminate subprocess when threshold hit)
+    # NOT responsible for: DB writes (train.py owns those directly).
     async def _drain_stdout() -> None:
         if train_proc.stdout is None:
             return
         import re as _re
 
-        # With log_interval=10, loss lines fire every 10 batches (4-5 times/epoch).
-        # Buffer the latest loss line and attach it to epoch_done.
-        # All mid-epoch log noise is suppressed.
-        last_loss_line: str = ""
-        # Track last completed epoch for accurate DB update (early-stop safe).
         nonlocal _last_completed_epoch
-        nonlocal _best_epoch_num, _best_epoch_avg_gen
 
-        # Per-epoch loss accumulation — collect every loss line within the epoch
-        # then compute the mean at epoch-done.  This matches ultimate-rvc's
-        # avg_global_gen_loss logic and gives a stable signal for overtraining
-        # detection instead of a single noisy last-batch value.
-        _epoch_gen_sum: float = 0.0
-        _epoch_disc_sum: float = 0.0
-        _epoch_loss_count: int = 0
+        # Buffer latest loss line per epoch for display in epoch_done message.
+        last_loss_line: str = ""
 
-        # Best-epoch tracking — mirrors ultimate-rvc's lowest_g_value logic.
-        # Used both for overtraining detection and for saving the best model.
+        # Overtraining detection — track session-local best gen loss.
+        # Seed from DB so resume runs don't restart the OT counter from scratch.
         _best_avg_gen: float = float("inf")
-        _best_epoch: int = 0
-        _min_delta: float = 0.004  # must improve by at least this to count
+        _best_epoch: int = prior_epochs
+        _min_delta: float = 0.004
+        if overtrain_threshold > 0 and prior_epochs > 0:
+            try:
+                async with get_db() as _db:
+                    row = await _db.execute_fetchall(
+                        "SELECT best_avg_gen_loss, best_epoch FROM profiles WHERE id = ?",
+                        (job.profile_id,),
+                    )
+                    if row and row[0][0] is not None:
+                        _best_avg_gen = float(row[0][0])
+                        _best_epoch = int(row[0][1] or prior_epochs)
+            except Exception:
+                pass
 
-        # Overtraining detection state (epoch-level, not batch-level).
+        # is_best flag for the current epoch — set when train.py's "best model
+        # updated" line is seen; consumed and reset at epoch_done.
+        _current_epoch_is_best: bool = False
         _ot_consecutive_gen: int = 0
         _ot_consecutive_disc: int = 0
         _ot_triggered: bool = False
@@ -1137,6 +1166,7 @@ async def _run_pipeline(
                     pass
             if not line:
                 continue
+
             # Filter faiss loader spam
             if line.startswith("DEBUG:faiss") or line.startswith("INFO:faiss"):
                 continue
@@ -1145,24 +1175,13 @@ async def _run_pipeline(
             if not clean:
                 continue
 
-            # Loss line — buffer for display AND accumulate for epoch average
-            # Format: "losses: disc=X, gen=Y, fm=Z, mel=A, kl=B, spk=C"
+            # Loss line — buffer for display only (epoch_done message suffix).
+            # DB writes happen in train.py directly.
             if "losses:" in clean:
                 last_loss_line = clean
-                # Accumulate gen and disc loss for epoch-average OT detection
-                import re as _re2
-                _gm = _re2.search(r"gen=([0-9.]+)", clean)
-                _dm = _re2.search(r"disc=([0-9.]+)", clean)
-                if _gm and _dm:
-                    try:
-                        _epoch_gen_sum += float(_gm.group(1))
-                        _epoch_disc_sum += float(_dm.group(1))
-                        _epoch_loss_count += 1
-                    except ValueError:
-                        pass
                 continue
 
-            # "Train Epoch: N [pct%]" — suppress (fires every batch with log_interval=1)
+            # "Train Epoch: N [pct%]" — suppress (fires every batch)
             if "Train Epoch:" in clean:
                 continue
 
@@ -1170,131 +1189,96 @@ async def _run_pipeline(
             if clean.startswith("[") and "," in clean:
                 continue
 
-            # Epoch done: "====> Epoch: N [timestamp] | (elapsed)"
+            # Best-epoch line — update local OT state so the detection threshold
+            # is accurate. DB write already done by train.py.
+            if "best model updated" in clean and "G_best.pth" in clean:
+                _bm = _re.search(r"epoch=(\d+).*avg_loss_g=([0-9.]+)", clean)
+                if _bm:
+                    _best_epoch = int(_bm.group(1))
+                    _best_avg_gen = float(_bm.group(2))
+                    _current_epoch_is_best = True
+                await job.queue.put({"type": "log", "message": clean, "phase": "train"})
+                continue
+
+            # Epoch done: "====> Epoch: N [timestamp] (elapsed)"
             if "====> Epoch:" in clean:
                 m = _re.search(r"====> Epoch:\s*(\d+)", clean)
-                if m:
-                    epoch_num = int(m.group(1))
-                    elapsed_m = _re.search(r"\(([^)]+)\)", clean)
-                    elapsed = elapsed_m.group(1) if elapsed_m else ""
-                    loss_suffix = f" | {last_loss_line}" if last_loss_line else ""
-
-                    # Parse individual loss scalars from the last buffered loss
-                    # line for frontend chart display.
-                    # Log format: "losses: disc=X, gen=Y, fm=Z, mel=A, kl=B, spk=C"
-                    # Short keys in the log → map to long keys expected by frontend.
-                    losses: dict = {}
-                    _key_map = {
-                        "disc": "loss_disc",
-                        "gen":  "loss_gen",
-                        "fm":   "loss_fm",
-                        "mel":  "loss_mel",
-                        "kl":   "loss_kl",
-                        "spk":  "loss_spk",
-                    }
-                    for short_key, long_key in _key_map.items():
-                        lm = _re.search(rf"(?<![a-z]){short_key}=([0-9.]+)", last_loss_line)
-                        if lm:
-                            try:
-                                losses[long_key] = float(lm.group(1))
-                            except ValueError:
-                                pass
-
-                    # Compute epoch-average generator and discriminator loss.
-                    # This is the stable signal used for overtraining detection
-                    # and best-epoch tracking — not the noisy last-batch value.
-                    avg_gen = (
-                        _epoch_gen_sum / _epoch_loss_count
-                        if _epoch_loss_count > 0
-                        else losses.get("loss_gen", float("inf"))
-                    )
-                    avg_disc = (
-                        _epoch_disc_sum / _epoch_loss_count
-                        if _epoch_loss_count > 0
-                        else losses.get("loss_disc", float("inf"))
-                    )
-
-                    # Best-epoch tracking — save best model when avg gen loss
-                    # reaches a new minimum (mirrors ultimate-rvc strategy).
-                    is_best_epoch = avg_gen < _best_avg_gen - _min_delta
-                    if is_best_epoch:
-                        _best_avg_gen = avg_gen
-                        _best_epoch = epoch_num
-                        _best_epoch_num = epoch_num
-                        _best_epoch_avg_gen = avg_gen
-
-                    # Overtraining detection — epoch-average loss, both gen and disc.
-                    # Matches ultimate-rvc: fire when gen stagnates for threshold
-                    # consecutive epochs OR disc stagnates for 2×threshold epochs.
-                    ot_label = ""
-                    if overtrain_threshold > 0 and not _ot_triggered:
-                        if avg_gen < _best_avg_gen + _min_delta:
-                            # avg_gen is at or near best — reset gen counter
-                            _ot_consecutive_gen = 0
-                        else:
-                            _ot_consecutive_gen += 1
-
-                        # disc uses 2× threshold (less reliable signal)
-                        if avg_disc < _best_avg_gen + _min_delta:
-                            _ot_consecutive_disc = 0
-                        else:
-                            _ot_consecutive_disc += 1
-
-                        gen_remaining = max(overtrain_threshold - _ot_consecutive_gen, 0)
-                        disc_remaining = max(overtrain_threshold * 2 - _ot_consecutive_disc, 0)
-
-                        if gen_remaining == 0 or disc_remaining == 0:
-                            _ot_triggered = True
-                            ot_label = f" ⚠ overtraining ({_ot_consecutive_gen} epochs no improvement)"
-                            await job.queue.put(
-                                {
-                                    "type": "log",
-                                    "message": (
-                                        f"Stopping early at epoch {epoch_num}: "
-                                        f"avg generator loss has not improved for "
-                                        f"{_ot_consecutive_gen} consecutive epochs "
-                                        f"(threshold={overtrain_threshold}). "
-                                        f"Best was epoch {_best_epoch} "
-                                        f"(avg_gen={_best_avg_gen:.4f})."
-                                    ),
-                                    "phase": "train",
-                                }
-                            )
-                            try:
-                                train_proc.terminate()
-                            except Exception:
-                                pass
-
-                    msg: dict = {
-                        "type": "epoch_done",
-                        "message": f"Epoch {epoch_num} ({elapsed}){loss_suffix}{ot_label}",
-                        "phase": "train",
-                        "epoch": epoch_num,
-                        "is_best": is_best_epoch,
-                        "avg_gen": round(avg_gen, 4),
-                        "best_avg_gen": round(_best_avg_gen, 4),
-                        "best_epoch": _best_epoch,
-                    }
-                    if losses:
-                        msg["losses"] = losses
-                    if overtrain_threshold > 0:
-                        msg["overtrain_consecutive"] = _ot_consecutive_gen
-                        msg["overtrain_consecutive_disc"] = _ot_consecutive_disc
-                    await job.queue.put(msg)
-                    # Track last completed epoch for accurate DB update
-                    _last_completed_epoch = epoch_num
-                    # Persist losses to DB
-                    if losses:
-                        try:
-                            await save_epoch_loss(job.profile_id, epoch_num, losses)
-                        except Exception as _e:
-                            logger.warning(f"epoch_loss DB write failed: {_e}")
-                    # Reset per-epoch accumulators
-                    last_loss_line = ""
-                    _epoch_gen_sum = 0.0
-                    _epoch_disc_sum = 0.0
-                    _epoch_loss_count = 0
+                if not m:
+                    await job.queue.put({"type": "log", "message": clean, "phase": "train"})
                     continue
+
+                epoch_num = int(m.group(1))
+                elapsed_m = _re.search(r"\(([^)]+)\)", clean)
+                elapsed = elapsed_m.group(1) if elapsed_m else ""
+
+                # Parse last-batch losses for display only (chart data comes
+                # from DB epoch_losses written by train.py).
+                losses: dict = {}
+                _key_map = {"disc": "loss_disc", "gen": "loss_gen", "fm": "loss_fm",
+                            "mel": "loss_mel", "kl": "loss_kl", "spk": "loss_spk"}
+                for short_key, long_key in _key_map.items():
+                    lm = _re.search(rf"(?<![a-z]){short_key}=([0-9.]+)", last_loss_line)
+                    if lm:
+                        try:
+                            losses[long_key] = float(lm.group(1))
+                        except ValueError:
+                            pass
+
+                is_best_epoch = _current_epoch_is_best
+                _current_epoch_is_best = False
+
+                # Overtraining detection using _best_avg_gen kept in sync above.
+                ot_label = ""
+                if overtrain_threshold > 0 and not _ot_triggered:
+                    cur_gen = losses.get("loss_gen", float("inf"))
+                    if cur_gen < _best_avg_gen + _min_delta:
+                        _ot_consecutive_gen = 0
+                    else:
+                        _ot_consecutive_gen += 1
+
+                    if cur_gen < _best_avg_gen + _min_delta:
+                        _ot_consecutive_disc = 0
+                    else:
+                        _ot_consecutive_disc += 1
+
+                    if (_ot_consecutive_gen >= overtrain_threshold or
+                            _ot_consecutive_disc >= overtrain_threshold * 2):
+                        _ot_triggered = True
+                        ot_label = f" ⚠ overtraining ({_ot_consecutive_gen} epochs no improvement)"
+                        await job.queue.put({
+                            "type": "log",
+                            "message": (
+                                f"Stopping early at epoch {epoch_num}: generator loss "
+                                f"has not improved for {_ot_consecutive_gen} consecutive "
+                                f"epochs (threshold={overtrain_threshold}). "
+                                f"Best was epoch {_best_epoch} (avg_gen={_best_avg_gen:.4f})."
+                            ),
+                            "phase": "train",
+                        })
+                        try:
+                            train_proc.terminate()
+                        except Exception:
+                            pass
+
+                loss_suffix = f" | {last_loss_line}" if last_loss_line else ""
+                msg: dict = {
+                    "type": "epoch_done",
+                    "message": f"Epoch {epoch_num} ({elapsed}){loss_suffix}{ot_label}",
+                    "phase": "train",
+                    "epoch": epoch_num,
+                    "is_best": is_best_epoch,
+                    "best_epoch": _best_epoch,
+                    "best_avg_gen": round(_best_avg_gen, 4) if _best_avg_gen < float("inf") else None,
+                }
+                if losses:
+                    msg["losses"] = losses
+                if overtrain_threshold > 0:
+                    msg["overtrain_consecutive"] = _ot_consecutive_gen
+                    msg["overtrain_consecutive_disc"] = _ot_consecutive_disc
+                await job.queue.put(msg)
+                _last_completed_epoch = epoch_num
+                last_loss_line = ""
+                continue
 
             await job.queue.put({"type": "log", "message": clean, "phase": "train"})
 
@@ -1362,7 +1346,7 @@ async def _run_pipeline(
                     "type": "log",
                     "message": (
                         f"Training cancelled by user at epoch {_last_completed_epoch} — "
-                        f"saving last checkpoint to profile."
+                        f"proceeding to save checkpoint and build index."
                     ),
                     "phase": "train",
                 }
@@ -1467,7 +1451,7 @@ async def _run_pipeline(
                     await job.queue.put(
                         {
                             "type": "log",
-                            "message": f"Saved best checkpoint (epoch {_best_epoch_num}, avg_gen={_best_epoch_avg_gen:.4f}) → {dest_best_g}",
+                            "message": f"Saved best checkpoint → {dest_best_g}",
                             "phase": "index",
                         }
                     )
@@ -1586,7 +1570,7 @@ async def _run_pipeline(
                 ok = await _make_infer_model(
                     g_best_src,
                     dest_best_infer_path,
-                    f"best inference model (epoch {_best_epoch_num}, avg_gen={_best_epoch_avg_gen:.4f}) from G_best.pth",
+                    "best inference model from G_best.pth",
                 )
                 if not ok:
                     await job.queue.put({
@@ -1639,7 +1623,29 @@ async def _run_pipeline(
 
     # Use _last_completed_epoch (updated per epoch_done event) rather than
     # prior_epochs + total_epoch — the two diverge on overtraining early-stop.
+    # For user cancels, prefer the iteration stored in G_latest.pth — it is
+    # the epoch at which the last checkpoint was written (a multiple of
+    # save_every_epoch), which may be lower than _last_completed_epoch if the
+    # cancel fired between two checkpoint saves.
     new_total_epochs = _last_completed_epoch
+    if job.status == "cancelled" and os.path.exists(g_latest):
+        try:
+            import torch as _torch_db
+            _ckpt_db = _torch_db.load(g_latest, map_location="cpu", weights_only=False)
+            _ckpt_epoch = int(_ckpt_db.get("iteration", 0))
+            if _ckpt_epoch > 0:
+                new_total_epochs = _ckpt_epoch
+                await job.queue.put({
+                    "type": "log",
+                    "message": (
+                        f"DB updated to epoch {new_total_epochs} "
+                        f"(last checkpoint save; training was at {_last_completed_epoch})."
+                    ),
+                    "phase": "done",
+                })
+        except Exception as _e:
+            logger.warning(f"Could not read epoch from G_latest.pth on cancel: {_e}")
+            # Fall back to _last_completed_epoch
 
     async with get_db() as db:
         await db.execute(
@@ -1650,9 +1656,7 @@ async def _run_pipeline(
                    index_path = ?,
                    total_epochs_trained = ?,
                    needs_retraining = 0,
-                   best_model_path = ?,
-                   best_epoch = ?,
-                   best_avg_gen_loss = ?
+                   best_model_path = ?
                WHERE id = ?""",
             (
                 dest_infer_path,
@@ -1660,8 +1664,6 @@ async def _run_pipeline(
                 dest_index_path,
                 new_total_epochs,
                 dest_best_infer_path if profile_dir and os.path.exists(dest_best_infer_path) else None,
-                _best_epoch_num if _best_epoch_num > 0 else new_total_epochs,
-                round(_best_epoch_avg_gen, 4) if _best_epoch_avg_gen < float("inf") else None,
                 job.profile_id,
             ),
         )
@@ -1716,6 +1718,7 @@ class TrainingManager:
         overtrain_threshold: int = 0,
         vocoder: str = "HiFi-GAN",
         c_spk: float = 2.0,
+        loss_mode: str = "classic",
     ) -> TrainingJob:
         """Create and launch a training job for profile_id.
 
@@ -1765,6 +1768,7 @@ class TrainingManager:
                 overtrain_threshold,
                 vocoder,
                 c_spk,
+                loss_mode,
             )
         )
 

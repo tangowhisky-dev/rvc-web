@@ -1,13 +1,16 @@
 """Extract a single robust speaker embedding from all profile audio.
 
-Chunks all audio files into 2-4s segments, extracts ECAPA-TDNN embeddings
+Chunks all audio files into 400ms segments (matching the RVC training segment
+size of 12800 samples @ 32k = 400ms @ 16k), extracts ECAPA-TDNN embeddings
 for each chunk, and averages them into one profile-level embedding.
 
-This embedding is computed once before training and used as the fixed
-speaker identity target throughout training.
+Using 400ms chunks (same duration as the training segments fed to ECAPA at
+training time) ensures the reference embedding and the training-time embeddings
+are computed from the same-length input — making cosine similarity a consistent
+and apples-to-apples signal throughout training.
 
 Usage:
-    python extract_profile_embedding.py /path/to/profile/audio/dir /path/to/output/embedding.pt
+    python extract_profile_embedding.py <audio_dir> <output_path> [device]
 """
 
 import os
@@ -17,14 +20,19 @@ import torch
 import numpy as np
 
 
-def chunk_audio(audio, sample_rate, chunk_duration=3.0, stride_duration=2.0):
+def chunk_audio(audio, sample_rate, chunk_duration=0.4, stride_duration=0.2):
     """Split audio into overlapping chunks.
+
+    Default chunk_duration=0.4s matches the RVC training segment_size
+    (12800 samples @ 32k = 6400 samples @ 16k = 400ms). Using the same
+    duration for reference embedding extraction ensures apples-to-apples
+    cosine similarity during training.
 
     Args:
         audio: 1D numpy array of audio samples.
         sample_rate: Sample rate of the audio.
-        chunk_duration: Duration of each chunk in seconds.
-        stride_duration: Stride between chunks in seconds.
+        chunk_duration: Duration of each chunk in seconds (default 0.4s).
+        stride_duration: Stride between chunks in seconds (default 0.2s, 50% overlap).
 
     Returns:
         List of 1D numpy arrays (chunks).
@@ -54,7 +62,7 @@ def chunk_audio(audio, sample_rate, chunk_duration=3.0, stride_duration=2.0):
 
 
 def extract_profile_embedding(
-    audio_dir, pt_path, device="cpu", chunk_duration=3.0, stride_duration=2.0
+    audio_dir, pt_path, device="cpu", chunk_duration=0.4, stride_duration=0.2
 ):
     """Extract a single robust speaker embedding from all audio in a directory."""
     # Add backend/rvc to sys.path so 'infer' package is importable
@@ -113,7 +121,7 @@ def extract_profile_embedding(
         for chunk in chunks:
             audio_tensor = torch.from_numpy(chunk).unsqueeze(0)  # [1, T]
             with torch.no_grad():
-                emb = encoder.get_embedding(audio_tensor)  # [1, 192]
+                emb = encoder.get_embedding_frozen(audio_tensor)  # [1, 192]
             all_embeddings.append(emb)
             total_chunks += 1
 

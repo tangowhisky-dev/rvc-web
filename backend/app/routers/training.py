@@ -42,6 +42,7 @@ class StartTrainingRequest(BaseModel):
     batch_size: int = 8
     overtrain_threshold: int = 0
     c_spk: float = 2.0
+    loss_mode: str = "classic"  # "classic" | "combined"
 
 
 class CancelTrainingRequest(BaseModel):
@@ -266,6 +267,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
             overtrain_threshold=int(request.overtrain_threshold or 0),
             vocoder=profile_vocoder,
             c_spk=request.c_spk,
+            loss_mode=request.loss_mode,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

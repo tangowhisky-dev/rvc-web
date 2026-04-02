@@ -1096,7 +1096,7 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
                        text-zinc-400 border border-zinc-700/60 bg-zinc-800/40
                        hover:bg-zinc-700/50 hover:text-zinc-200 transition-colors
                        disabled:opacity-40">
-            {exporting ? '⟳' : '↓ Export'}
+            {exporting ? '⟳' : '↑ Export'}
           </button>
           <button onClick={handleDelete} disabled={deleting}
             className="px-3 py-1.5 rounded-md text-[11px] font-mono uppercase tracking-wider
@@ -1313,7 +1313,7 @@ function ImportModal({ onImported, onCancel }: ImportModalProps) {
             className="px-4 py-1.5 rounded-lg text-[12px] font-mono uppercase tracking-wide border transition-all
                        bg-cyan-900/40 border-cyan-600/40 text-cyan-300 hover:bg-cyan-800/40
                        disabled:opacity-40 disabled:cursor-not-allowed">
-            {importing ? '⟳ Importing…' : '↑ Import'}
+            {importing ? '⟳ Importing…' : '↓ Import'}
           </button>
           <button
             type="button"
@@ -1404,7 +1404,7 @@ export default function LibraryPage() {
                   ? 'bg-zinc-800 border-zinc-700 text-zinc-300'
                   : 'bg-zinc-800/60 border-zinc-700 text-zinc-400 hover:bg-zinc-700/50 hover:text-zinc-200'
               }`}>
-              {showImport ? '✕ Cancel' : '↑ Import'}
+              {showImport ? '✕ Cancel' : '↓ Import'}
             </button>
             <button
               onClick={() => { setShowUpload((v) => !v); setShowImport(false); }}
