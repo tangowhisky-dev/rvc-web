@@ -34,6 +34,7 @@ interface SessionParams {
   protect: number;
   silence_threshold_db: number;
   output_gain: number;
+  noise_reduction: boolean;
 }
 
 type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
@@ -44,7 +45,7 @@ type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 const WS_BASE = (API ?? 'http://localhost:8000').replace('http://', 'ws://').replace('https://', 'wss://');
-const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.50, protect: 0.33, silence_threshold_db: -55, output_gain: 1.0 };
+const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.50, protect: 0.33, silence_threshold_db: -55, output_gain: 1.0, noise_reduction: true };
 
 // ---------------------------------------------------------------------------
 // Utility: find default device by name fragment
@@ -361,7 +362,7 @@ export default function RealtimePage() {
   );
 
   const handleParamChange = useCallback(
-    (key: keyof SessionParams, value: number) => {
+    (key: keyof SessionParams, value: number | boolean) => {
       const next = { ...paramsRef.current, [key]: value };
       setParams(next);
       if (sessionIdRef.current) {
@@ -910,6 +911,31 @@ export default function RealtimePage() {
                 disabled={false}
                 onChange={(v) => handleParamChange('output_gain', v)}
               />
+            </div>
+
+            {/* Noise Reduction toggle */}
+            <div className="flex items-center justify-between px-1 py-2 rounded-lg bg-zinc-900/60 border border-zinc-800">
+              <div className="flex flex-col gap-0.5">
+                <span className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">Noise Reduction</span>
+                <span className="text-[11px] text-zinc-500">
+                  {params.noise_reduction
+                    ? 'RNNoise active — mic, room & fan noise suppressed'
+                    : 'Disabled — raw mic signal passed to model'}
+                </span>
+              </div>
+              <button
+                onClick={() => handleParamChange('noise_reduction', !params.noise_reduction)}
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
+                  params.noise_reduction ? 'bg-cyan-500' : 'bg-zinc-700'
+                }`}
+                aria-label="Toggle noise reduction"
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                    params.noise_reduction ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
             </div>
 
             {/* Start / Stop */}

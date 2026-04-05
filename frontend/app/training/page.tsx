@@ -163,14 +163,25 @@ function recentSlope(values: number[], window = 15): number {
 
 // Convergence status derived from mel EMA slope and KL EMA slope.
 // Mel is the primary quality signal; KL indicates latent alignment.
+//
+// Thresholds use normalised slope (fractional change per epoch):
+//   mel 'still improving' : < -0.001  (≈ 0.02 units/epoch at mel=19)
+//   mel 'overtraining'    : >  0.005
+//   kl  'latent converging': < -0.002  (≈ 0.004 units/epoch at kl=2)
+//
+// Rationale: late-stage fine-tuning has small absolute drops that are still
+// meaningful.  The old thresholds (-0.003 mel, -0.005 kl) were calibrated for
+// early training where mel≈35 and produced false-positive "converged" once mel
+// settled below ~20 and both slopes slowed proportionally.
 function convergenceStatus(
   melSlope: number,
   klSlope: number,
   epochCount: number,
 ): { label: string; color: string; detail: string } {
-  // Need at least ~20 epochs for a meaningful trend
-  if (epochCount < 20) {
-    return { label: 'warming up', color: '#71717a', detail: 'Not enough epochs for trend analysis' };
+  // Need at least 30 epochs: EMA with α=0.15 takes ~20 epochs to wash out
+  // early transients, so the 15-epoch slope window isn't reliable before that.
+  if (epochCount < 30) {
+    return { label: 'warming up', color: '#71717a', detail: 'Not enough epochs for trend analysis.' };
   }
   // Rising mel = overtraining signal
   if (melSlope > 0.005) {
@@ -180,8 +191,8 @@ function convergenceStatus(
       detail: 'Mel loss is rising — spectral quality may be degrading. Consider stopping.',
     };
   }
-  // Both still dropping meaningfully
-  if (melSlope < -0.003) {
+  // Mel still dropping meaningfully
+  if (melSlope < -0.001) {
     return {
       label: 'still improving',
       color: '#34d399',
@@ -189,7 +200,7 @@ function convergenceStatus(
     };
   }
   // Mel flat, KL still dropping — latent alignment in progress
-  if (klSlope < -0.005) {
+  if (klSlope < -0.002) {
     return {
       label: 'latent converging',
       color: '#60a5fa',
@@ -659,6 +670,10 @@ export default function TrainingPage() {
   const [overtrainThreshold, setOvertrainThreshold] = useState(50);
   const [lossMode, setLossMode] = useState<'classic' | 'combined'>('classic');
   const [speakerLossWeight, setSpeakerLossWeight] = useState(3);
+  const [advLoss, setAdvLoss] = useState<'lsgan' | 'tprls'>('lsgan');
+  const [klAnneal, setKlAnneal] = useState(false);
+  const [klAnnealEpochs, setKlAnnealEpochs] = useState(40);
+  const [optimizer, setOptimizer] = useState<'adamw' | 'adamspd'>('adamw');
   const [hw, setHw] = useState<HardwareInfo | null>(null);
 
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -841,12 +856,15 @@ export default function TrainingPage() {
           const hwData: HardwareInfo = await hwRes.json();
           if (!cancelled) {
             setHw(hwData);
+            // Only apply hardware recommendation when no job is running —
+            // on reconnect, the running job's batch size is restored below.
             setBatchSize(hwData.sweet_spot_batch_size);
           }
         }
 
         // Check every profile for a running job; pick the first one found.
         let resumedId: string | null = null;
+        let resumedStatus: { total_epoch?: number; batch_size?: number } = {};
         for (const p of data) {
           try {
             const sRes = await fetch(`${API}/api/training/status/${p.id}`);
@@ -857,6 +875,7 @@ export default function TrainingPage() {
                 (s.phase === 'train' || s.phase === 'preprocess' || s.phase === 'extract_f0' || s.phase === 'extract_feature' || s.phase === 'index')
               ) {
                 resumedId = p.id;
+                resumedStatus = { total_epoch: s.total_epoch, batch_size: s.batch_size };
                 break;
               }
             }
@@ -870,6 +889,10 @@ export default function TrainingPage() {
           setSelectedId(resumedId);
           setJobState('running');
           jobStateRef.current = 'running';
+          // Restore the exact epochs + batch size from the running job so the
+          // UI shows the correct values instead of defaults/hardware suggestions.
+          if (resumedStatus.total_epoch != null) setEpochs(resumedStatus.total_epoch);
+          if (resumedStatus.batch_size   != null) setBatchSize(resumedStatus.batch_size);
           appendLog(`(reconnected — training for profile ${data.find(p => p.id === resumedId)?.name ?? resumedId} already in progress)`);
           attachWs(resumedId);
         } else if (data.length) {
@@ -911,7 +934,7 @@ export default function TrainingPage() {
       const res = await fetch(`${API}/api/training/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainEnabled ? overtrainThreshold : 0, c_spk: lossMode === 'classic' ? 0 : speakerLossWeight, loss_mode: lossMode }),
+        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainEnabled ? overtrainThreshold : 0, c_spk: lossMode === 'classic' ? 0 : speakerLossWeight, loss_mode: lossMode, adv_loss: advLoss, kl_anneal: klAnneal, kl_anneal_epochs: klAnnealEpochs, optimizer }),
       });
 
       if (res.status === 409) {
@@ -1204,6 +1227,99 @@ export default function TrainingPage() {
                     </span>
                   </div>
                 )}
+              </div>
+
+              {/* Adversarial Loss */}
+              <div className="flex flex-col gap-2 pt-3 border-t border-zinc-800/60">
+                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+                  Adversarial Loss
+                </label>
+                <div className="flex gap-2">
+                  {([
+                    { value: 'lsgan' as const, label: 'LSGAN', color: 'text-sky-400', desc: 'Least-squares GAN — original RVC. Stable baseline, can stall if discriminator dominates early.' },
+                    { value: 'tprls' as const, label: 'TPRLS', color: 'text-amber-400', desc: 'Truncated Paired Relative LS — median-centering reduces mode collapse. Better when training from scratch or at low batch size.' },
+                  ] as const).map(opt => {
+                    const active = advLoss === opt.value;
+                    return (
+                      <button
+                        key={opt.value}
+                        disabled={isRunning}
+                        onClick={() => setAdvLoss(opt.value)}
+                        className={`flex-1 flex flex-col gap-1 rounded-lg px-3 py-2.5 text-left transition-colors border
+                          ${active ? 'border-zinc-600 bg-zinc-800/80' : 'border-zinc-800 bg-zinc-900/40 hover:bg-zinc-800/40'}
+                          ${isRunning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                      >
+                        <span className={`text-[12px] font-mono font-semibold ${active ? opt.color : 'text-zinc-400'}`}>{opt.label}</span>
+                        <span className="text-[10px] font-mono text-zinc-500 leading-relaxed">{opt.desc}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* KL Annealing */}
+              <div className="flex flex-col gap-2 pt-3 border-t border-zinc-800/60">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+                    KL Annealing
+                  </label>
+                  <button
+                    disabled={isRunning}
+                    onClick={() => setKlAnneal(v => !v)}
+                    className={`relative w-9 h-5 rounded-full transition-colors shrink-0
+                      ${klAnneal ? 'bg-emerald-600' : 'bg-zinc-700'}
+                      ${isRunning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform
+                      ${klAnneal ? 'translate-x-4' : 'translate-x-0'}`} />
+                  </button>
+                </div>
+                <span className="text-[10px] font-mono text-zinc-500 leading-relaxed">
+                  Ramps KL weight 0→1 over N epochs then repeats. Prevents posterior collapse in early training.
+                </span>
+                {klAnneal && (
+                  <div className="flex items-center gap-3 mt-0.5">
+                    <span className="text-[10px] font-mono text-zinc-500 shrink-0 w-20">cycle epochs</span>
+                    <input
+                      type="range"
+                      min={10} max={100} step={5}
+                      value={klAnnealEpochs}
+                      disabled={isRunning}
+                      onChange={e => setKlAnnealEpochs(Number(e.target.value))}
+                      className="flex-1 accent-emerald-500"
+                    />
+                    <span className="text-[12px] font-mono text-emerald-300 w-8 text-right">{klAnnealEpochs}</span>
+                    <span className="text-[10px] font-mono text-zinc-600 shrink-0">recommended 30–50</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Optimizer */}
+              <div className="flex flex-col gap-2 pt-3 border-t border-zinc-800/60">
+                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+                  Optimizer
+                </label>
+                <div className="flex gap-2">
+                  {([
+                    { value: 'adamw' as const, label: 'AdamW', color: 'text-sky-400', desc: 'Standard adaptive optimizer. Best default for most fine-tuning runs.' },
+                    { value: 'adamspd' as const, label: 'AdamSPD', color: 'text-violet-400', desc: 'Adam + Selective Projection Decay. Pulls weights toward pretrain anchor when gradient would increase drift. Reduces catastrophic forgetting on short runs.' },
+                  ] as const).map(opt => {
+                    const active = optimizer === opt.value;
+                    return (
+                      <button
+                        key={opt.value}
+                        disabled={isRunning}
+                        onClick={() => setOptimizer(opt.value)}
+                        className={`flex-1 flex flex-col gap-1 rounded-lg px-3 py-2.5 text-left transition-colors border
+                          ${active ? 'border-zinc-600 bg-zinc-800/80' : 'border-zinc-800 bg-zinc-900/40 hover:bg-zinc-800/40'}
+                          ${isRunning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                      >
+                        <span className={`text-[12px] font-mono font-semibold ${active ? opt.color : 'text-zinc-400'}`}>{opt.label}</span>
+                        <span className="text-[10px] font-mono text-zinc-500 leading-relaxed">{opt.desc}</span>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
 
             </div>

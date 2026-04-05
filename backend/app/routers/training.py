@@ -42,7 +42,11 @@ class StartTrainingRequest(BaseModel):
     batch_size: int = 8
     overtrain_threshold: int = 0
     c_spk: float = 2.0
-    loss_mode: str = "classic"  # "classic" | "combined"
+    loss_mode: str = "classic"       # "classic" | "combined"
+    adv_loss: str = "lsgan"          # "lsgan" | "tprls"
+    kl_anneal: bool = False
+    kl_anneal_epochs: int = 40
+    optimizer: str = "adamw"         # "adamw" | "adamspd"
 
 
 class CancelTrainingRequest(BaseModel):
@@ -58,6 +62,8 @@ class StatusResponse(BaseModel):
     progress_pct: int
     status: str
     error: Optional[str] = None
+    total_epoch: Optional[int] = None
+    batch_size: Optional[int] = None
 
 
 class EpochLossPoint(BaseModel):
@@ -268,6 +274,10 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
             vocoder=profile_vocoder,
             c_spk=request.c_spk,
             loss_mode=request.loss_mode,
+            adv_loss=request.adv_loss,
+            kl_anneal=request.kl_anneal,
+            kl_anneal_epochs=request.kl_anneal_epochs,
+            optimizer=request.optimizer,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -340,6 +350,8 @@ async def get_status(profile_id: str) -> StatusResponse:
         progress_pct=job.progress_pct,
         status=job.status,
         error=job.error,
+        total_epoch=job.total_epoch,
+        batch_size=job.batch_size,
     )
 
 

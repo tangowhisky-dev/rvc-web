@@ -58,6 +58,8 @@ class TrainingJob:
     progress_pct: int = 0
     status: str = "training"
     error: Optional[str] = None
+    total_epoch: int = 0
+    batch_size: int = 8
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     _proc: Optional[asyncio_subprocess.Process] = field(default=None, repr=False)
 
@@ -277,6 +279,10 @@ def _write_config(
     loss_mode: str = "classic",
     vocoder: str = "HiFi-GAN",
     pretrain_g: str = "",
+    adv_loss: str = "lsgan",
+    kl_anneal: bool = False,
+    kl_anneal_epochs: int = 40,
+    optimizer: str = "adamw",
 ) -> None:
     """Copy backend/rvc/configs/inuse/v2/32k.json into exp_dir/config.json, patching
     training hyperparameters for MPS performance.
@@ -338,6 +344,10 @@ def _write_config(
     cfg["train"]["log_interval"] = 10
     cfg["train"]["c_spk"] = c_spk
     cfg["train"]["loss_mode"] = loss_mode
+    cfg["train"]["adv_loss"] = adv_loss
+    cfg["train"]["kl_anneal"] = int(kl_anneal)
+    cfg["train"]["kl_anneal_epochs"] = max(1, kl_anneal_epochs)
+    cfg["train"]["optimizer"] = optimizer
 
     # Auto-scale learning rate by sqrt(batch_size / reference_batch_size).
     # Reference: pretrained weights were optimised at batch_size=32, LR=1e-4.
@@ -443,6 +453,10 @@ async def _run_pipeline(
     vocoder: str = "HiFi-GAN",
     c_spk: float = 2.0,
     loss_mode: str = "classic",
+    adv_loss: str = "lsgan",
+    kl_anneal: bool = False,
+    kl_anneal_epochs: int = 40,
+    optimizer: str = "adamw",
 ) -> None:
     """Orchestrate the full training pipeline for one TrainingJob.
 
@@ -970,6 +984,10 @@ async def _run_pipeline(
             loss_mode=loss_mode,
             vocoder=vocoder,
             pretrain_g=pretrain_g,
+            adv_loss=adv_loss,
+            kl_anneal=kl_anneal,
+            kl_anneal_epochs=kl_anneal_epochs,
+            optimizer=optimizer,
         )
         _build_filelist(project_root, exp_dir)
     except Exception as exc:
@@ -1127,10 +1145,7 @@ async def _run_pipeline(
 
         nonlocal _last_completed_epoch
 
-        # Buffer latest loss line per epoch for display in epoch_done message.
-        last_loss_line: str = ""
-
-        # Overtraining detection — track session-local best gen loss.
+        # Overtraining detection — track session-local best mel loss.
         # Seed from DB so resume runs don't restart the OT counter from scratch.
         _best_avg_gen: float = float("inf")
         _best_epoch: int = prior_epochs
@@ -1151,8 +1166,7 @@ async def _run_pipeline(
         # is_best flag for the current epoch — set when train.py's "best model
         # updated" line is seen; consumed and reset at epoch_done.
         _current_epoch_is_best: bool = False
-        _ot_consecutive_gen: int = 0
-        _ot_consecutive_disc: int = 0
+        _ot_consecutive: int = 0
         _ot_triggered: bool = False
 
         async for raw_line in train_proc.stdout:
@@ -1175,10 +1189,9 @@ async def _run_pipeline(
             if not clean:
                 continue
 
-            # Loss line — buffer for display only (epoch_done message suffix).
-            # DB writes happen in train.py directly.
+            # Per-batch loss lines — suppress entirely (DB epoch averages are
+            # the source of truth; no stdout parsing needed).
             if "losses:" in clean:
-                last_loss_line = clean
                 continue
 
             # "Train Epoch: N [pct%]" — suppress (fires every batch)
@@ -1192,7 +1205,7 @@ async def _run_pipeline(
             # Best-epoch line — update local OT state so the detection threshold
             # is accurate. DB write already done by train.py.
             if "best model updated" in clean and "G_best.pth" in clean:
-                _bm = _re.search(r"epoch=(\d+).*avg_loss_g=([0-9.]+)", clean)
+                _bm = _re.search(r"epoch=(\d+).*avg_mel=([0-9.]+)", clean)
                 if _bm:
                     _best_epoch = int(_bm.group(1))
                     _best_avg_gen = float(_bm.group(2))
@@ -1211,47 +1224,56 @@ async def _run_pipeline(
                 elapsed_m = _re.search(r"\(([^)]+)\)", clean)
                 elapsed = elapsed_m.group(1) if elapsed_m else ""
 
-                # Parse last-batch losses for display only (chart data comes
-                # from DB epoch_losses written by train.py).
-                losses: dict = {}
-                _key_map = {"disc": "loss_disc", "gen": "loss_gen", "fm": "loss_fm",
-                            "mel": "loss_mel", "kl": "loss_kl", "spk": "loss_spk"}
-                for short_key, long_key in _key_map.items():
-                    lm = _re.search(rf"(?<![a-z]){short_key}=([0-9.]+)", last_loss_line)
-                    if lm:
-                        try:
-                            losses[long_key] = float(lm.group(1))
-                        except ValueError:
-                            pass
-
                 is_best_epoch = _current_epoch_is_best
                 _current_epoch_is_best = False
 
-                # Overtraining detection using _best_avg_gen kept in sync above.
+                # Fetch epoch-average losses from DB (written by TrainingDBWriter
+                # in train.py at line ~1001, before the "====> Epoch:" log line).
+                # This replaces the previous stdout-parsed last-batch values which
+                # were single-batch noise, not epoch averages.
+                losses: dict = {}
+                try:
+                    async with get_db() as _db:
+                        _row = await _db.execute_fetchall(
+                            """SELECT loss_mel, loss_gen, loss_disc, loss_fm, loss_kl, loss_spk
+                               FROM epoch_losses
+                               WHERE profile_id = ? AND epoch = ?""",
+                            (job.profile_id, epoch_num),
+                        )
+                        if _row:
+                            r = _row[0]
+                            losses = {
+                                "loss_mel":  r[0],
+                                "loss_gen":  r[1],
+                                "loss_disc": r[2],
+                                "loss_fm":   r[3],
+                                "loss_kl":   r[4],
+                                "loss_spk":  r[5],
+                            }
+                except Exception:
+                    pass  # non-fatal — chart will catch up on next DB poll
+
+                # Overtraining detection using epoch-average mel from DB.
+                # loss_gen reaches equilibrium by epoch ~12 and provides no
+                # discriminating signal after that; mel decreases monotonically.
                 ot_label = ""
                 if overtrain_threshold > 0 and not _ot_triggered:
-                    cur_gen = losses.get("loss_gen", float("inf"))
-                    if cur_gen < _best_avg_gen + _min_delta:
-                        _ot_consecutive_gen = 0
+                    cur_mel = losses.get("loss_mel", float("inf"))
+                    if cur_mel < _best_avg_gen + _min_delta:
+                        _ot_consecutive = 0
                     else:
-                        _ot_consecutive_gen += 1
+                        _ot_consecutive += 1
 
-                    if cur_gen < _best_avg_gen + _min_delta:
-                        _ot_consecutive_disc = 0
-                    else:
-                        _ot_consecutive_disc += 1
-
-                    if (_ot_consecutive_gen >= overtrain_threshold or
-                            _ot_consecutive_disc >= overtrain_threshold * 2):
+                    if (_ot_consecutive >= overtrain_threshold):
                         _ot_triggered = True
-                        ot_label = f" ⚠ overtraining ({_ot_consecutive_gen} epochs no improvement)"
+                        ot_label = f" ⚠ overtraining ({_ot_consecutive} epochs no improvement)"
                         await job.queue.put({
                             "type": "log",
                             "message": (
-                                f"Stopping early at epoch {epoch_num}: generator loss "
-                                f"has not improved for {_ot_consecutive_gen} consecutive "
+                                f"Stopping early at epoch {epoch_num}: mel loss "
+                                f"has not improved for {_ot_consecutive} consecutive "
                                 f"epochs (threshold={overtrain_threshold}). "
-                                f"Best was epoch {_best_epoch} (avg_gen={_best_avg_gen:.4f})."
+                                f"Best was epoch {_best_epoch} (avg_mel={_best_avg_gen:.4f})."
                             ),
                             "phase": "train",
                         })
@@ -1260,10 +1282,9 @@ async def _run_pipeline(
                         except Exception:
                             pass
 
-                loss_suffix = f" | {last_loss_line}" if last_loss_line else ""
                 msg: dict = {
                     "type": "epoch_done",
-                    "message": f"Epoch {epoch_num} ({elapsed}){loss_suffix}{ot_label}",
+                    "message": f"Epoch {epoch_num} ({elapsed}){ot_label}",
                     "phase": "train",
                     "epoch": epoch_num,
                     "is_best": is_best_epoch,
@@ -1273,11 +1294,9 @@ async def _run_pipeline(
                 if losses:
                     msg["losses"] = losses
                 if overtrain_threshold > 0:
-                    msg["overtrain_consecutive"] = _ot_consecutive_gen
-                    msg["overtrain_consecutive_disc"] = _ot_consecutive_disc
+                    msg["overtrain_consecutive"] = _ot_consecutive
                 await job.queue.put(msg)
                 _last_completed_epoch = epoch_num
-                last_loss_line = ""
                 continue
 
             await job.queue.put({"type": "log", "message": clean, "phase": "train"})
@@ -1621,31 +1640,15 @@ async def _run_pipeline(
     if job.status != "cancelled":
         job.status = "done"
 
-    # Use _last_completed_epoch (updated per epoch_done event) rather than
-    # prior_epochs + total_epoch — the two diverge on overtraining early-stop.
-    # For user cancels, prefer the iteration stored in G_latest.pth — it is
-    # the epoch at which the last checkpoint was written (a multiple of
-    # save_every_epoch), which may be lower than _last_completed_epoch if the
-    # cancel fired between two checkpoint saves.
+    # _last_completed_epoch is the authoritative epoch counter on all exit paths:
+    #   - Normal end: tracks all epoch_done events up to total_epoch
+    #   - Overtraining stop: tracks epochs before the OT SIGTERM fires
+    #   - User cancel: train.py now handles SIGTERM by completing the current
+    #     epoch, saving G_latest.pth at that exact epoch, then emitting
+    #     "====> Epoch: N [cancel-flush]" before exit. _drain_stdout picks
+    #     that up and updates _last_completed_epoch correctly.
+    #     The old G_latest.pth-probing epoch downgrade is no longer needed.
     new_total_epochs = _last_completed_epoch
-    if job.status == "cancelled" and os.path.exists(g_latest):
-        try:
-            import torch as _torch_db
-            _ckpt_db = _torch_db.load(g_latest, map_location="cpu", weights_only=False)
-            _ckpt_epoch = int(_ckpt_db.get("iteration", 0))
-            if _ckpt_epoch > 0:
-                new_total_epochs = _ckpt_epoch
-                await job.queue.put({
-                    "type": "log",
-                    "message": (
-                        f"DB updated to epoch {new_total_epochs} "
-                        f"(last checkpoint save; training was at {_last_completed_epoch})."
-                    ),
-                    "phase": "done",
-                })
-        except Exception as _e:
-            logger.warning(f"Could not read epoch from G_latest.pth on cancel: {_e}")
-            # Fall back to _last_completed_epoch
 
     async with get_db() as db:
         await db.execute(
@@ -1719,6 +1722,10 @@ class TrainingManager:
         vocoder: str = "HiFi-GAN",
         c_spk: float = 2.0,
         loss_mode: str = "classic",
+        adv_loss: str = "lsgan",
+        kl_anneal: bool = False,
+        kl_anneal_epochs: int = 40,
+        optimizer: str = "adamw",
     ) -> TrainingJob:
         """Create and launch a training job for profile_id.
 
@@ -1750,7 +1757,8 @@ class TrainingManager:
             raise ValueError("job already running")
 
         job_id = uuid.uuid4().hex
-        job = TrainingJob(job_id=job_id, profile_id=profile_id)
+        job = TrainingJob(job_id=job_id, profile_id=profile_id,
+                         total_epoch=total_epoch, batch_size=batch_size)
         self._jobs[profile_id] = job
 
         asyncio.create_task(
@@ -1769,6 +1777,10 @@ class TrainingManager:
                 vocoder,
                 c_spk,
                 loss_mode,
+                adv_loss,
+                kl_anneal,
+                kl_anneal_epochs,
+                optimizer,
             )
         )
 
@@ -1800,24 +1812,29 @@ class TrainingManager:
 
         if job._proc is not None:
             try:
-                # Kill only the direct subprocess and its children via psutil,
-                # NOT os.killpg which would kill uvicorn's process group too.
+                # Send SIGTERM first — train.py's handler will complete the
+                # current epoch, save G_latest.pth at that exact epoch, then
+                # call os._exit(0).  We wait up to 120 s for a clean exit
+                # (each epoch at bs=8 on MPS is ~60–90 s) before escalating
+                # to SIGKILL.  psutil is used to also SIGTERM children so
+                # the spawned worker process (mp.Process) receives the signal.
                 import psutil
 
                 try:
                     parent = psutil.Process(job._proc.pid)
+                    # SIGTERM the whole process tree (parent + spawned child)
                     for child in parent.children(recursive=True):
                         try:
-                            child.kill()
+                            child.terminate()
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             pass
-                    parent.kill()
+                    parent.terminate()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
             except ImportError:
-                # psutil not available — fall back to direct kill (no killpg)
+                # psutil not available — SIGTERM the direct subprocess
                 try:
-                    job._proc.kill()
+                    job._proc.terminate()
                 except (ProcessLookupError, OSError):
                     pass
 

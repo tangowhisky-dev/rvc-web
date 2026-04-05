@@ -45,6 +45,7 @@ class StartSessionRequest(BaseModel):
     protect: float = 0.33
     silence_threshold_db: float = -55.0
     output_gain: float = 1.0
+    noise_reduction: bool = True
     save_path: Optional[str] = None
     use_best: bool = False  # if True, use model_best.pth instead of model_infer.pth
 
@@ -60,6 +61,7 @@ class UpdateParamsRequest(BaseModel):
     protect: Optional[float] = None
     silence_threshold_db: Optional[float] = None
     output_gain: Optional[float] = None
+    noise_reduction: Optional[bool] = None
 
 
 class StartSessionResponse(BaseModel):
@@ -132,6 +134,7 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
             protect=request.protect,
             silence_threshold_db=request.silence_threshold_db,
             output_gain=request.output_gain,
+            noise_reduction=request.noise_reduction,
             rvc_root=project_root,
             save_path=request.save_path,
             use_best=request.use_best,
@@ -231,6 +234,7 @@ async def update_params(request: UpdateParamsRequest) -> dict:
         protect=request.protect,
         silence_threshold_db=request.silence_threshold_db,
         output_gain=request.output_gain,
+        noise_reduction=request.noise_reduction,
     )
     return {"ok": True}
 

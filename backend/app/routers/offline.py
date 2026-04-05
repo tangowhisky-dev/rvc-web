@@ -134,6 +134,30 @@ def _compute_block_params(block_48k: int = _BLOCK_48K) -> dict:
     }
 
 
+def _apply_rnnoise(audio_48k: np.ndarray) -> np.ndarray:
+    """Denoise a float32 mono 48kHz array with pyrnnoise.
+
+    Processes in 480-sample (10ms) frames.  Returns float32 in the same range.
+    Fails silently — returns input unchanged if pyrnnoise is unavailable.
+    """
+    try:
+        from pyrnnoise.rnnoise import create, destroy, process_mono_frame, FRAME_SIZE
+    except Exception:
+        return audio_48k
+
+    state = create()
+    try:
+        pad = (-len(audio_48k)) % FRAME_SIZE
+        pcm = np.concatenate([audio_48k, np.zeros(pad, dtype=np.float32)]) if pad else audio_48k
+        frames_out = []
+        for i in range(0, len(pcm), FRAME_SIZE):
+            frame_out, _ = process_mono_frame(state, pcm[i:i + FRAME_SIZE])
+            frames_out.append(frame_out.astype(np.float32) / 32767.0)
+        return np.concatenate(frames_out)[:len(audio_48k)]
+    finally:
+        destroy(state)
+
+
 def _run_offline_inference(
     audio_16k: np.ndarray,  # float32, mono, 16 kHz
     audio_tgt: np.ndarray,  # float32, mono, tgt_sr  (for SOLA output alignment)
@@ -144,6 +168,7 @@ def _run_offline_inference(
     protect: float,
     progress_cb,  # callable(fraction: float)
     output_gain: float = 1.0,  # post-inference volume multiplier (1.0 = no change)
+    noise_reduction: bool = False,  # apply pyrnnoise to input before inference
 ) -> np.ndarray:
     """Run chunked RVC inference on a full audio array.
 
@@ -235,6 +260,23 @@ def _run_offline_inference(
     rvc.infer(_silence, block_16k, skip_head, return_length, "rmvpe", protect)
     del _silence
 
+    # ── pyrnnoise denoising (whole-file, before block loop) ──────────────────
+    # pyrnnoise operates at 48kHz.  Upsample → denoise → downsample back to 16k.
+    # Done here (not per-block) so the GRU context spans the full file naturally.
+    # audio_16k_orig is kept for RMS matching so denoising doesn't affect level.
+    audio_16k_orig = audio_16k
+    if noise_reduction:
+        _resamp_up   = torch.nn.functional.interpolate(
+            torch.from_numpy(audio_16k)[None, None, :],
+            scale_factor=3.0, mode="linear", align_corners=False,
+        ).squeeze().numpy()
+        _denoised_48k = _apply_rnnoise(_resamp_up)
+        _resamp_down = torch.nn.functional.interpolate(
+            torch.from_numpy(_denoised_48k)[None, None, :],
+            size=len(audio_16k), mode="linear", align_corners=False,
+        ).squeeze().numpy().astype(np.float32)
+        audio_16k = _resamp_down
+
     rolling_buf = torch.zeros(total_16k_samples, device=device)
 
     # SOLA state — sin² fade windows, same as realtime worker
@@ -321,7 +363,7 @@ def _run_offline_inference(
         result = np.zeros(0, dtype=np.float32)
 
     # Trim to original length at tgt_sr
-    total_16k = len(audio_16k)
+    total_16k = len(audio_16k_orig)
     expected_len = int(np.ceil(total_16k * tgt_sr / _SR_16K))
     result = result[:expected_len]
 
@@ -330,7 +372,7 @@ def _run_offline_inference(
     # naturally outputs at a different RMS than the input (measured ~3.8× higher).
     # Without this the output is significantly louder than the source file.
     if len(result) > 0 and len(audio_16k) > 0:
-        in_rms = float(np.sqrt(np.mean(audio_16k**2)) + 1e-8)
+        in_rms = float(np.sqrt(np.mean(audio_16k_orig**2)) + 1e-8)
         out_rms = float(np.sqrt(np.mean(result**2)) + 1e-8)
         rms_scale = in_rms / out_rms
         rms_scale = float(np.clip(rms_scale, 0.1, 10.0))
@@ -372,6 +414,7 @@ async def convert_audio(
     index_rate: float = Form(0.50),
     protect: float = Form(0.33),
     use_best: bool = Form(False),
+    noise_reduction: bool = Form(False),
     file: UploadFile = File(...),
 ):
     """Convert an uploaded audio file using a trained profile.
@@ -463,6 +506,7 @@ async def convert_audio(
                     index_rate=index_rate,
                     protect=protect,
                     progress_cb=_progress,
+                    noise_reduction=noise_reduction,
                 )
                 # Write result to temp file preserving original format
                 tmp = tempfile.NamedTemporaryFile(

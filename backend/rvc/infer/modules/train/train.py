@@ -1,5 +1,6 @@
 import os
 import sys
+import signal
 import logging
 from typing import Tuple
 
@@ -78,8 +79,10 @@ else:
     )
 from infer.lib.train.losses import (
     discriminator_loss,
+    discriminator_tprls_loss,
     feature_loss,
     generator_loss,
+    generator_tprls_loss,
     kl_loss,
     speaker_loss as _spk_loss_fn,
 )
@@ -95,6 +98,20 @@ from rvc.layers.utils import (
 # Speaker encoder (ECAPA-TDNN) — loaded once at module level if c_spk > 0
 # ---------------------------------------------------------------------------
 _speaker_encoder = None
+
+# ---------------------------------------------------------------------------
+# Graceful cancel — SIGTERM handler sets this flag; the epoch loop checks it
+# at epoch boundary (after all steps complete) and saves G_latest.pth before
+# exiting.  This ensures cancellation always produces a clean, complete-epoch
+# checkpoint at the exact epoch training reached, not the last save_every
+# boundary.
+# ---------------------------------------------------------------------------
+_cancel_requested: bool = False
+
+
+def _handle_sigterm(signum, frame):
+    global _cancel_requested
+    _cancel_requested = True
 
 
 def _get_speaker_encoder(device: torch.device):
@@ -115,7 +132,9 @@ def _get_speaker_encoder(device: torch.device):
 
 
 global_step = 0
-lowest_loss_g = float("inf")  # best epoch-average generator loss seen so far
+lowest_mel = float("inf")   # best EMA-smoothed mel seen so far (best-epoch criterion)
+_ema_mel   = float("inf")   # running EMA of epoch-average mel; inf until first epoch completes
+_EMA_MEL_ALPHA = 0.33       # α=0.33 → ~1.7 epoch half-life; smooths minibatch noise without lag
 
 
 class EpochRecorder:
@@ -159,6 +178,8 @@ def main():
 def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
     global global_step
     if rank == 0:
+        # Register SIGTERM handler so cancellation saves a clean checkpoint.
+        signal.signal(signal.SIGTERM, _handle_sigterm)
         # logger = utils.get_logger(hps.model_dir)
         logger.info(hps)
         # utils.check_git_hash(hps.model_dir)
@@ -270,18 +291,34 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         net_d = net_d.cuda(rank)
     elif _use_mps:
         net_d = net_d.to(_device)
-    optim_g = torch.optim.AdamW(
-        net_g.parameters(),
-        hps.train.learning_rate,
-        betas=hps.train.betas,
-        eps=hps.train.eps,
-    )
-    optim_d = torch.optim.AdamW(
-        net_d.parameters(),
-        hps.train.learning_rate,
-        betas=hps.train.betas,
-        eps=hps.train.eps,
-    )
+
+    _optimizer = getattr(hps.train, "optimizer", "adamw").lower()
+    logger.info(f"optimizer={_optimizer}  adv_loss={getattr(hps.train, 'adv_loss', 'lsgan')}  kl_anneal={bool(getattr(hps.train, 'kl_anneal', 0))}")
+
+    if _optimizer == "adamspd":
+        from infer.lib.train.adamspd import AdamSPD as _AdamSPD
+        import copy as _copy
+        # Snapshot pretrained weights as the stiffness anchor.
+        # Must be done before DDP wrapping and before any gradient steps.
+        _anchors_g = [p.data.clone() for p in net_g.parameters() if p.requires_grad]
+        _anchors_d = [p.data.clone() for p in net_d.parameters() if p.requires_grad]
+        _pg_g = [{"params": [p for p in net_g.parameters() if p.requires_grad], "pre": _anchors_g}]
+        _pg_d = [{"params": [p for p in net_d.parameters() if p.requires_grad], "pre": _anchors_d}]
+        optim_g = _AdamSPD(_pg_g, lr=hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps, weight_decay=0.1)
+        optim_d = _AdamSPD(_pg_d, lr=hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps, weight_decay=0.1)
+    else:
+        optim_g = torch.optim.AdamW(
+            net_g.parameters(),
+            hps.train.learning_rate,
+            betas=hps.train.betas,
+            eps=hps.train.eps,
+        )
+        optim_d = torch.optim.AdamW(
+            net_d.parameters(),
+            hps.train.learning_rate,
+            betas=hps.train.betas,
+            eps=hps.train.eps,
+        )
     # net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
     # net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -447,6 +484,31 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         scheduler_g.step()
         scheduler_d.step()
 
+        # Graceful cancel — parent sent SIGTERM; epoch is now fully complete.
+        # Save G_latest.pth / D_latest.pth at this exact epoch, then exit.
+        # The "====> Epoch: N" marker was already emitted inside train_and_evaluate,
+        # so _last_completed_epoch on the parent side is already correct.
+        if _cancel_requested and rank == 0:
+            logger.info(
+                f"Cancel received — saving checkpoint at epoch {epoch} before exit."
+            )
+            utils.save_checkpoint(
+                net_g,
+                optim_g,
+                hps.train.learning_rate,
+                epoch,
+                os.path.join(hps.model_dir, "G_latest.pth"),
+            )
+            utils.save_checkpoint(
+                net_d,
+                optim_d,
+                hps.train.learning_rate,
+                epoch,
+                os.path.join(hps.model_dir, "D_latest.pth"),
+            )
+            logging.shutdown()
+            os._exit(0)
+
 
 def train_and_evaluate(
     rank,
@@ -475,7 +537,8 @@ def train_and_evaluate(
 
     train_loader.batch_sampler.set_epoch(epoch)
     global global_step
-    global lowest_loss_g
+    global lowest_mel
+    global _ema_mel
 
     # Per-epoch loss accumulation for best-epoch detection and DB writes
     _epoch_gen_sum: float = 0.0
@@ -665,9 +728,14 @@ def train_and_evaluate(
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
             with autocast(_device.type, enabled=False):
-                loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
-                    y_d_hat_r, y_d_hat_g
-                )
+                _adv_loss = getattr(hps.train, "adv_loss", "lsgan")
+                if _adv_loss == "tprls":
+                    loss_disc = discriminator_tprls_loss(y_d_hat_r, y_d_hat_g)
+                    losses_disc_r, losses_disc_g = [], []
+                else:
+                    loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
+                        y_d_hat_r, y_d_hat_g
+                    )
         optim_d.zero_grad()
         scaler.scale(loss_disc).backward()
         scaler.unscale_(optim_d)
@@ -683,9 +751,29 @@ def train_and_evaluate(
                     loss_mel = fn_mel_loss(wave, y_hat) * hps.train.c_mel / 3.0
                 else:
                     loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
-                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+
+                # KL annealing — cyclic cosine schedule over kl_anneal_epochs.
+                # kl_beta ramps 0→1 over the cycle duration then repeats.
+                # Prevents posterior collapse in the first N epochs of each cycle.
+                # When disabled, kl_beta = 1.0 (equivalent to original behaviour).
+                _kl_anneal = bool(getattr(hps.train, "kl_anneal", 0))
+                if _kl_anneal:
+                    import math as _math
+                    _cycle = max(1, int(getattr(hps.train, "kl_anneal_epochs", 40)))
+                    _pos = (epoch - 1) % _cycle  # position within current cycle
+                    _kl_beta = 0.5 * (1.0 - _math.cos(_math.pi * _pos / _cycle))
+                else:
+                    _kl_beta = 1.0
+
+                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl * _kl_beta
                 loss_fm = feature_loss(fmap_r, fmap_g)
-                loss_gen, losses_gen = generator_loss(y_d_hat_g)
+
+                # Adversarial generator loss — matches discriminator loss choice
+                if _adv_loss == "tprls":
+                    loss_gen = generator_tprls_loss(y_d_hat_r, y_d_hat_g)
+                    losses_gen = []
+                else:
+                    loss_gen, losses_gen = generator_loss(y_d_hat_g)
 
                 # Speaker loss — profile-level embedding vs generated segment
                 loss_spk = torch.tensor(0.0, device=_device)
@@ -863,16 +951,35 @@ def train_and_evaluate(
             )
 
     if rank == 0:
-        # Best-epoch checkpoint — save G_best.pth whenever epoch-average
-        # generator loss hits a new minimum (mirrors ultimate-rvc strategy).
-        # This runs every epoch regardless of save_every_epoch so the best
-        # checkpoint is always captured at the exact right epoch, not the
-        # nearest save_every_epoch boundary.
+        # Best-epoch checkpoint — save G_best.pth whenever EMA-smoothed mel loss
+        # hits a new minimum.
+        #
+        # WHY EMA-smoothed mel:
+        #   loss_gen (adversarial term) reaches equilibrium by epoch ~10-15 and
+        #   stays flat at ~3.1-3.4 for the rest of training — useless as a
+        #   quality signal after that point.
+        #
+        #   loss_mel is the L1 spectrogram reconstruction error — the direct
+        #   proxy for inference output quality. Lower mel = better output.
+        #
+        #   Raw mel has per-epoch sampling noise (stdev ≈ 0.16 in late training).
+        #   loss_fm noise (stdev ≈ 0.19) can cause loss_gen_all to rank a
+        #   mid-training epoch above a genuinely better later epoch (false positive).
+        #   A short EMA (α=0.33, half-life ~1.7 epochs) smooths this noise without
+        #   adding meaningful lag — a real improvement clears the threshold within
+        #   1-2 epochs, while a single lucky epoch doesn't trigger a premature save.
+        #
+        # This runs every epoch regardless of save_every_epoch.
         if _epoch_gen_count > 0:
-            avg_loss_g = _epoch_gen_sum / _epoch_gen_count
+            avg_mel = _epoch_mel_sum / _epoch_gen_count
+            # Bootstrap: first epoch initialises EMA to its own value
+            if _ema_mel == float("inf"):
+                _ema_mel = avg_mel
+            else:
+                _ema_mel = _EMA_MEL_ALPHA * avg_mel + (1.0 - _EMA_MEL_ALPHA) * _ema_mel
             _min_delta = 0.004  # must improve by at least this to count
-            if avg_loss_g < lowest_loss_g - _min_delta:
-                lowest_loss_g = avg_loss_g
+            if _ema_mel < lowest_mel - _min_delta:
+                lowest_mel = _ema_mel
                 best_path = os.path.join(hps.model_dir, "G_best.pth")
                 utils.save_checkpoint(
                     net_g,
@@ -882,10 +989,11 @@ def train_and_evaluate(
                     best_path,
                 )
                 logger.info(
-                    f"best model updated → G_best.pth  (epoch={epoch}, avg_loss_g={avg_loss_g:.4f})"
+                    f"best model updated → G_best.pth  "
+                    f"(epoch={epoch}, avg_mel={avg_mel:.4f}, ema_mel={_ema_mel:.4f})"
                 )
-                # Write directly to DB — no stdout events, no parsing.
-                _db_writer.update_best_epoch(epoch, avg_loss_g)
+                # Store raw avg_mel in DB (more interpretable than the EMA value)
+                _db_writer.update_best_epoch(epoch, avg_mel)
 
         # Write epoch-average losses directly to DB
         if rank == 0 and _epoch_gen_count > 0:

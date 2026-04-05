@@ -223,6 +223,7 @@ def run_worker(
     protect: float,
     silence_threshold_db: float = -55.0,
     output_gain: float = 1.0,
+    noise_reduction: bool = True,
     save_path: str | None = None,
     model_path: str | None = None,
     index_path: str | None = None,
@@ -374,6 +375,28 @@ def run_worker(
         )
         del _silence_warmup
 
+        # ── pyrnnoise setup ───────────────────────────────────────────────
+        # Initialised unconditionally so the state is always ready; the flag
+        # noise_reduction controls whether it runs each block.
+        _rnn_state = None
+        _rnn_process_frame = None
+        _rnn_destroy = None
+        _rnn_frame_size = 480   # Xiph RNNoise fixed frame size at 48kHz
+        try:
+            from pyrnnoise.rnnoise import (
+                create as _rnn_create,
+                destroy as _rnn_destroy,
+                process_mono_frame as _rnn_process_frame,
+                FRAME_SIZE as _rnn_frame_size,
+            )
+            _rnn_state = _rnn_create()
+        except Exception as _rnn_err:
+            # pyrnnoise unavailable — noise_reduction will be silently disabled
+            noise_reduction = False
+            logging.getLogger("rvc_web.worker").warning(
+                "pyrnnoise unavailable — noise reduction disabled: %s", _rnn_err
+            )
+
         import sounddevice as sd
         from torchaudio.transforms import Resample as _Resample
         import torch.nn.functional as _F
@@ -519,6 +542,8 @@ def run_worker(
                             _rms_window.extend([0.0] * _RMS_WIN)
                         if "output_gain" in msg:
                             output_gain = float(msg["output_gain"])
+                        if "noise_reduction" in msg:
+                            noise_reduction = bool(msg["noise_reduction"])
             except Exception:
                 pass
 
@@ -533,6 +558,26 @@ def run_worker(
 
             x_in   = data.squeeze()
             x_in_t = _torch.from_numpy(x_in).to(infer_device)
+
+            # ── pyrnnoise denoising (input at 48kHz, in-place on x_in_t) ─
+            # Process before resampling so the denoiser always operates at its
+            # native 48kHz.  The GRU state persists across blocks for continuity.
+            # We work on CPU numpy (RNNoise C API), then move back to infer_device.
+            if noise_reduction and _rnn_state is not None and _rnn_process_frame is not None:
+                _rnn_pcm = x_in_t.cpu().numpy()  # float32 [-1,1], length=block_native_in
+                # Pad to multiple of _rnn_frame_size if needed
+                _rnn_pad = (-len(_rnn_pcm)) % _rnn_frame_size
+                if _rnn_pad:
+                    _rnn_pcm = np.concatenate([_rnn_pcm, np.zeros(_rnn_pad, dtype=np.float32)])
+                _rnn_out_frames = []
+                for _fi in range(0, len(_rnn_pcm), _rnn_frame_size):
+                    _rnn_frame_out, _ = _rnn_process_frame(
+                        _rnn_state, _rnn_pcm[_fi:_fi + _rnn_frame_size]
+                    )
+                    _rnn_out_frames.append(_rnn_frame_out.astype(np.float32) / 32767.0)
+                _rnn_denoised = np.concatenate(_rnn_out_frames)[:len(x_in)]
+                x_in_t = _torch.from_numpy(_rnn_denoised).to(infer_device)
+
             x_16k_t = _resample_in_16(x_in_t.unsqueeze(0)).squeeze(0)
 
             # ── update rolling 16k buffer (circular shift) ────────────────
@@ -705,6 +750,13 @@ def run_worker(
             audio_in_save_q.put(_SAVE_SENTINEL)
             if save_in_t is not None:
                 save_in_t.join(timeout=30)
+
+        # Release pyrnnoise GRU state
+        try:
+            if _rnn_state is not None and _rnn_destroy is not None:
+                _rnn_destroy(_rnn_state)
+        except Exception:
+            pass
 
         try:
             stream_in.stop(); stream_in.close()   # noqa: F821

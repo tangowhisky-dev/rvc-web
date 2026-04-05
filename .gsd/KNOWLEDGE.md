@@ -225,3 +225,29 @@ cfg["train"]["fp16_run"] = torch.cuda.is_available()
 ### Interaction with GradScaler in train.py
 
 When `fp16_run=False`, `train.py` still constructs `GradScaler(device, enabled=fp16_run)` and `autocast(device, enabled=fp16_run)`. Both are no-ops when `enabled=False` — no code changes needed in `train.py`.
+
+---
+
+## Best-Epoch Criterion: Use `loss_mel`, NOT `loss_gen`
+
+**Rule: `G_best.pth` and `best_epoch` in DB must track the epoch with lowest epoch-average `loss_mel`, not `loss_gen`.**
+
+### Root cause of the bug
+`train.py` accumulated `_epoch_gen_sum` (raw adversarial `loss_gen`) and compared it against `lowest_loss_g`. `loss_gen` reaches equilibrium by epoch ~12 (bottoms at ~3.13 for this dataset) and then stays flat at 3.1–3.4 for the entire remainder of training. Using it as the best-epoch signal means `G_best.pth` freezes at epoch 12 and never updates again, even as mel loss continues dropping from 20 → 17 over the next 100+ epochs.
+
+### Why `loss_mel`
+- `loss_mel` is the L1 spectrogram reconstruction error — the direct proxy for inference output quality. The vocoder reconstructs audio from mel, so lower mel = better output.
+- `loss_mel` decreases monotonically throughout training.
+- `loss_gen` (discriminator-fooling term) and `loss_fm` (feature matching) are important for training stability but plateau early and add noise to epoch ranking.
+- `loss_kl` (latent alignment) matters in early epochs (drops from ~9 to ~1.5) but provides little discrimination between late-stage epochs.
+
+### Fix applied
+- `lowest_loss_g` renamed to `lowest_mel` in `train.py`
+- `avg_loss_g` replaced with `avg_mel = _epoch_mel_sum / _epoch_gen_count`
+- Log line changed from `avg_loss_g=X` to `avg_mel=X`
+- `_drain_stdout` regex updated from `avg_loss_g=` to `avg_mel=`
+- OT detection updated to compare `loss_mel` (not `loss_gen`) against `_best_avg_gen`
+- DB column `best_avg_gen_loss` now stores `avg_mel` value (column name unchanged for backward compat)
+
+### For existing running jobs
+The fix only takes effect on new training runs. For a run already in progress, manually copy `G_latest.pth` to `G_best.pth` and update the DB `best_epoch`/`best_avg_gen_loss` to match the current best mel epoch from `epoch_losses`.

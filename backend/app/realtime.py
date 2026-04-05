@@ -99,6 +99,7 @@ class RealtimeSession:
     protect: float = 0.33
     silence_threshold_db: float = -45.0
     output_gain: float = 1.0
+    noise_reduction: bool = True
     status: str = "starting"    # starting | active | stopped | error
     error: Optional[str] = None
 
@@ -141,6 +142,7 @@ class RealtimeManager:
         protect: float = 0.33,
         silence_threshold_db: float = -45.0,
         output_gain: float = 1.0,
+        noise_reduction: bool = True,
         rvc_root: Optional[str] = None,
         save_path: Optional[str] = None,
         use_best: bool = False,
@@ -223,6 +225,7 @@ class RealtimeManager:
                 protect=protect,
                 silence_threshold_db=silence_threshold_db,
                 output_gain=output_gain,
+                noise_reduction=noise_reduction,
                 save_path=save_path,
                 model_path=db_model_path,
                 index_path=db_index_path,
@@ -281,6 +284,7 @@ class RealtimeManager:
             protect=protect,
             silence_threshold_db=silence_threshold_db,
             output_gain=output_gain,
+            noise_reduction=noise_reduction,
             status="active",
             _proc=proc,
             _cmd_q=cmd_q,
@@ -408,6 +412,7 @@ class RealtimeManager:
         protect: Optional[float] = None,
         silence_threshold_db: Optional[float] = None,
         output_gain: Optional[float] = None,
+        noise_reduction: Optional[bool] = None,
     ) -> None:
         """Hot-update session parameters without restarting."""
         session = self._sessions.get(session_id)
@@ -430,6 +435,9 @@ class RealtimeManager:
         if output_gain is not None:
             session.output_gain = output_gain
             msg["output_gain"] = output_gain
+        if noise_reduction is not None:
+            session.noise_reduction = noise_reduction
+            msg["noise_reduction"] = noise_reduction
 
         try:
             session._cmd_q.put(msg)
