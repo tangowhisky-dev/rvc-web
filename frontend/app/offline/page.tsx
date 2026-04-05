@@ -729,6 +729,7 @@ export default function OfflinePage() {
   const [indexRate, setIndexRate]       = useState(0.50);
   const [protect, setProtect]           = useState(0.33);
   const [noiseReduction, setNoiseReduction] = useState(false);
+  const [solaCrossfadeMs, setSolaCrossfadeMs] = useState(20);
 
   // Job state
   const [jobStatus, setJobStatus]   = useState<'idle' | 'running' | 'done' | 'error'>('idle');
@@ -814,6 +815,7 @@ export default function OfflinePage() {
     form.append('protect', String(protect));
     form.append('use_best', String(useBest));
     form.append('noise_reduction', String(noiseReduction));
+    form.append('sola_crossfade_ms', String(solaCrossfadeMs));
     form.append('file', inputFile);
 
     const abort = new AbortController();
@@ -1030,10 +1032,10 @@ export default function OfflinePage() {
             />
           </div>
 
-          {/* Noise Reduction + Post-conversion analysis toggles */}
-          <div className="flex flex-col gap-2 pt-2 border-t border-zinc-800/60">
+          {/* Noise Reduction + SOLA Crossfade — side by side */}
+          <div className="flex gap-2 items-stretch pt-2 border-t border-zinc-800/60">
             {/* Noise Reduction toggle */}
-            <div className="flex items-center justify-between px-1 py-2 rounded-lg bg-zinc-900/60 border border-zinc-800">
+            <div className="flex-1 flex items-center justify-between px-1 py-2 rounded-lg bg-zinc-900/60 border border-zinc-800">
               <div className="flex flex-col gap-0.5">
                 <span className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">Noise Reduction</span>
                 <span className="text-[11px] text-zinc-500">
@@ -1044,7 +1046,7 @@ export default function OfflinePage() {
               </div>
               <button
                 onClick={() => setNoiseReduction(v => !v)}
-                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
+                className={`ml-3 shrink-0 relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
                   noiseReduction ? 'bg-cyan-500' : 'bg-zinc-700'
                 }`}
                 aria-label="Toggle noise reduction"
@@ -1057,7 +1059,31 @@ export default function OfflinePage() {
               </button>
             </div>
 
-            {/* Post-conversion analysis checkbox */}
+            {/* SOLA Crossfade slider */}
+            <div className="flex-1 flex flex-col gap-1.5 px-1 py-2 rounded-lg bg-zinc-900/60 border border-zinc-800">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">SOLA Crossfade</span>
+                <span className="text-[11px] font-mono text-zinc-300 tabular-nums">
+                  {solaCrossfadeMs === 0 ? 'off' : `${solaCrossfadeMs} ms`}
+                </span>
+              </div>
+              <input
+                type="range" min={0} max={50} step={10}
+                value={solaCrossfadeMs}
+                disabled={jobStatus === 'running'}
+                onChange={(e) => setSolaCrossfadeMs(Number(e.target.value))}
+                className="w-full h-1 accent-cyan-500 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              />
+              <span className="text-[10px] text-zinc-500">
+                {solaCrossfadeMs === 0
+                  ? 'Disabled — raw block boundary, may click'
+                  : `${solaCrossfadeMs}ms overlap-add window. Longer = smoother joins, slightly more latency`}
+              </span>
+            </div>
+          </div>
+
+          {/* Post-conversion analysis toggle */}
+          <div className="flex flex-col gap-2">
             <div className="flex items-center gap-3 py-1">
               <input
                 type="checkbox"

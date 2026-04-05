@@ -1062,9 +1062,9 @@ export default function TrainingPage() {
                   <span className="text-cyan-400">⟳</span> Epochs
                 </label>
                 <input
-                  type="number" value={epochs} min={1} max={200}
+                  type="number" value={epochs} min={1} max={1000}
                   disabled={isRunning}
-                  onChange={(e) => setEpochs(Math.max(1, Math.min(200, Number(e.target.value))))}
+                  onChange={(e) => setEpochs(Math.max(1, Math.min(1000, Number(e.target.value))))}
                   className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
                              font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
                              disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"

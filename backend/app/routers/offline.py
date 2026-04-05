@@ -106,19 +106,22 @@ _SR_48K = 48000
 _WINDOW = 160
 _ZC = _SR_48K // 100  # 480
 _BLOCK_48K = 9600  # 200ms blocks — same as realtime
-_SOLA_BUF_48K = 2 * _ZC  # 960
+_SOLA_BUF_MS_DEFAULT = 20  # ms — matches realtime worker default
 _SOLA_SEARCH_48K = _ZC  # 480
 _EXTRA_TIME = 2.0  # 2s context window
 
 
-def _compute_block_params(block_48k: int = _BLOCK_48K) -> dict:
+def _compute_block_params(block_48k: int = _BLOCK_48K,
+                          sola_buf_ms: int = _SOLA_BUF_MS_DEFAULT) -> dict:
+    sola_buf_ms_clamped = max(0, min(sola_buf_ms, 50))
+    sola_buf_48k = int(sola_buf_ms_clamped * _SR_48K / 1000)
     block_16k = int(block_48k * _SR_16K / _SR_48K)
     f0_min = block_16k + 800
     f0_extractor_frame = 5120 * ((f0_min - 1) // 5120 + 1) - _WINDOW
     extra_16k = (int(_EXTRA_TIME * _SR_16K) // _WINDOW) * _WINDOW
     total_16k_samples = extra_16k + f0_extractor_frame
     p_len = total_16k_samples // _WINDOW
-    total_out_48k = block_48k + _SOLA_BUF_48K + _SOLA_SEARCH_48K
+    total_out_48k = block_48k + sola_buf_48k + _SOLA_SEARCH_48K
     return_length_frames = total_out_48k // _ZC
     skip_head_frames = p_len - return_length_frames
     return {
@@ -129,7 +132,7 @@ def _compute_block_params(block_48k: int = _BLOCK_48K) -> dict:
         "p_len": p_len,
         "return_length_frames": return_length_frames,
         "skip_head_frames": skip_head_frames,
-        "sola_buf_48k": _SOLA_BUF_48K,
+        "sola_buf_48k": sola_buf_48k,
         "sola_search_48k": _SOLA_SEARCH_48K,
     }
 
@@ -169,6 +172,7 @@ def _run_offline_inference(
     progress_cb,  # callable(fraction: float)
     output_gain: float = 1.0,  # post-inference volume multiplier (1.0 = no change)
     noise_reduction: bool = False,  # apply pyrnnoise to input before inference
+    sola_crossfade_ms: int = _SOLA_BUF_MS_DEFAULT,  # SOLA crossfade buffer length in ms
 ) -> np.ndarray:
     """Run chunked RVC inference on a full audio array.
 
@@ -219,7 +223,7 @@ def _run_offline_inference(
         orig_freq=tgt_sr, new_freq=_SR_16K, dtype=torch.float32
     ).to(device)
 
-    bp = _compute_block_params()
+    bp = _compute_block_params(sola_buf_ms=sola_crossfade_ms)
     block_16k = bp["block_16k"]
     total_16k_samples = bp["total_16k_samples"]
     skip_head = bp["skip_head_frames"]
@@ -415,6 +419,7 @@ async def convert_audio(
     protect: float = Form(0.33),
     use_best: bool = Form(False),
     noise_reduction: bool = Form(False),
+    sola_crossfade_ms: int = Form(_SOLA_BUF_MS_DEFAULT),
     file: UploadFile = File(...),
 ):
     """Convert an uploaded audio file using a trained profile.
@@ -507,6 +512,7 @@ async def convert_audio(
                     protect=protect,
                     progress_cb=_progress,
                     noise_reduction=noise_reduction,
+                    sola_crossfade_ms=sola_crossfade_ms,
                 )
                 # Write result to temp file preserving original format
                 tmp = tempfile.NamedTemporaryFile(
