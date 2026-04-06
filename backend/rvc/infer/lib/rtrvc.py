@@ -76,6 +76,9 @@ class RVC:
 
         # ── Load synthesizer first so we know the embedder stored in the ckpt ──
         self.net_g: Optional[nn.Module] = None
+        # Tracks the actual dtype net_g runs in — may differ from is_half when
+        # a vocoder is not fp16-stable (e.g. RefineGAN forces fp32 on CUDA).
+        self._net_g_is_half: bool = False
 
         def set_default_model():
             self.net_g, cpt = load_synthesizer(self.pth_path, self.device)
@@ -84,10 +87,27 @@ class RVC:
             self.if_f0 = cpt.get("f0", 1)
             self.version = cpt.get("version", "v1")
             self._embedder_name = cpt.get("embedder", "hubert")
-            if self.is_half:
+            # RefineGAN's residual upsample stack overflows fp16 on real CUDA
+            # hardware (CPU fp16 emulation masks this).  The residual additions
+            # across 4 upsample stages × 3 ResBlocks each accumulate until
+            # activations exceed fp16 max (~65504) → inf → NaN → tanh(NaN)=NaN
+            # which soundfile clips to ±1, producing a saturated noise output.
+            # Force fp32 for any non-HiFi-GAN vocoder; the extra VRAM cost is
+            # acceptable vs broken audio.
+            _vocoder = cpt.get("vocoder", "HiFi-GAN")
+            if self.is_half and _vocoder != "HiFi-GAN":
+                _log2.getLogger("rvc_web.rtrvc").info(
+                    "vocoder '%s' is not fp16-stable — loading net_g as fp32 "
+                    "on CUDA to prevent NaN overflow", _vocoder
+                )
+                self.net_g = self.net_g.float()
+                self._net_g_is_half = False
+            elif self.is_half:
                 self.net_g = self.net_g.half()
+                self._net_g_is_half = True
             else:
                 self.net_g = self.net_g.float()
+                self._net_g_is_half = False
 
         def set_jit_model():
             from rvc.jit import get_jit_model
@@ -119,6 +139,7 @@ class RVC:
             self.net_g = torch.jit.load(BytesIO(cpt["model"]), map_location=self.device)
             self.net_g.infer = self.net_g.forward
             self.net_g.eval().to(self.device)
+            self._net_g_is_half = self.is_half
 
         if (
             self.use_jit
@@ -315,6 +336,11 @@ class RVC:
             feats = feats.to(feats0.dtype)
         p_len = torch.LongTensor([p_len]).to(self.device)
         sid = torch.LongTensor([0]).to(self.device)
+        # Cast feats to net_g's actual dtype. When is_half=True but the vocoder
+        # forced fp32 (e.g. RefineGAN), feats is fp16 from the embedder but
+        # net_g expects fp32 — an explicit cast bridges the two.
+        _net_g_dtype = torch.float16 if self._net_g_is_half else torch.float32
+        feats = feats.to(_net_g_dtype)
         with torch.no_grad():
             infered_audio = (
                 self.net_g.infer(
