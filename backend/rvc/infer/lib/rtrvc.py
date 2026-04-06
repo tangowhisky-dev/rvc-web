@@ -190,7 +190,6 @@ class RVC:
                 hf_model = hf_model.float()
             hf_model.eval()
             self.embedder = hf_model
-            import logging as _log2
             _log2.getLogger("rvc_web.rtrvc").info(
                 "Loaded HuggingFace embedder: %s", embedder_name
             )
