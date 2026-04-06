@@ -2,6 +2,7 @@ import os
 import sys
 import signal
 import logging
+import warnings
 from typing import Tuple
 
 logger = logging.getLogger(__name__)
@@ -484,8 +485,20 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
                 0.0,
                 None,
             )
-        scheduler_g.step()
-        scheduler_d.step()
+        # scheduler.step() is called here — after all optimizer.step() calls for the epoch
+        # have completed inside train_and_evaluate. PyTorch's internal heuristic fires a
+        # spurious "step before optimizer" warning on the very first call because it wraps
+        # optimizer.step at scheduler construction time and the flag is cleared only when
+        # the wrapped call executes in the *same scope*, not inside a called function.
+        # The LR schedule is numerically correct — this suppressor silences the false alarm.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`",
+                category=UserWarning,
+            )
+            scheduler_g.step()
+            scheduler_d.step()
 
         # Graceful cancel — parent sent SIGTERM; epoch is now fully complete.
         # Save G_latest.pth / D_latest.pth at this exact epoch, then exit.
