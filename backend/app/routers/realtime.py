@@ -47,6 +47,8 @@ class StartSessionRequest(BaseModel):
     output_gain: float = 1.0
     noise_reduction: bool = True
     sola_crossfade_ms: int = 20
+    formant: float = 0.0
+    use_jit: bool = False
     save_path: Optional[str] = None
     use_best: bool = False  # if True, use model_best.pth instead of model_infer.pth
 
@@ -64,6 +66,7 @@ class UpdateParamsRequest(BaseModel):
     output_gain: Optional[float] = None
     noise_reduction: Optional[bool] = None
     sola_crossfade_ms: Optional[int] = None
+    formant: Optional[float] = None
 
 
 class StartSessionResponse(BaseModel):
@@ -138,6 +141,8 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
             output_gain=request.output_gain,
             noise_reduction=request.noise_reduction,
             sola_crossfade_ms=request.sola_crossfade_ms,
+            formant=request.formant,
+            use_jit=request.use_jit,
             rvc_root=project_root,
             save_path=request.save_path,
             use_best=request.use_best,
@@ -239,6 +244,7 @@ async def update_params(request: UpdateParamsRequest) -> dict:
         output_gain=request.output_gain,
         noise_reduction=request.noise_reduction,
         sola_crossfade_ms=request.sola_crossfade_ms,
+        formant=request.formant,
     )
     return {"ok": True}
 

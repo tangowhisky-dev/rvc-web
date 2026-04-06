@@ -93,6 +93,23 @@ class RVC:
             from rvc.jit import get_jit_model
             from rvc.synthesizer import synthesizer_jit_export
 
+            # Peek at the checkpoint to check vocoder before compiling.
+            # torch.jit.script walks the full model graph; RefineGAN and other
+            # non-standard vocoders lack __prepare_scriptable__ / @jit.export
+            # annotations and will fail at compile time.
+            import torch as _torch_peek
+            _peek = _torch_peek.load(self.pth_path, map_location="cpu", weights_only=True)
+            _vocoder = _peek.get("vocoder", "HiFi-GAN")
+            del _peek
+
+            if _vocoder != "HiFi-GAN":
+                _log2.getLogger("rvc_web.rtrvc").warning(
+                    "JIT compile skipped — vocoder '%s' is not TorchScript-compatible; "
+                    "falling back to eager mode", _vocoder
+                )
+                set_default_model()
+                return
+
             cpt = get_jit_model(self.pth_path, self.is_half, synthesizer_jit_export)
 
             self.tgt_sr = cpt["config"][-1]

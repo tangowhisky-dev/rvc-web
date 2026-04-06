@@ -7,7 +7,8 @@ Protocol (multiprocessing.Queue messages):
 
   Parent → child (cmd_q):
     {"cmd": "stop"}
-    {"cmd": "update_params", "pitch": float, "index_rate": float, "protect": float}
+    {"cmd": "update_params", "pitch": float, "index_rate": float, "protect": float,
+     "formant": float}
 
   Child → parent (evt_q):
     {"event": "warming_up",      "device": "mps" | "cpu"}
@@ -233,6 +234,8 @@ def run_worker(
     output_gain: float = 1.0,
     noise_reduction: bool = True,
     sola_crossfade_ms: int = _SOLA_BUF_MS_DEFAULT,
+    formant: float = 0.0,
+    use_jit: bool = False,
     save_path: str | None = None,
     model_path: str | None = None,
     index_path: str | None = None,
@@ -332,12 +335,13 @@ def run_worker(
 
         rvc = RVC(
             key=pitch,
-            formant=0,
+            formant=formant,
             pth_path=resolved_model_path,
             index_path=resolved_index_path,
             index_rate=index_rate,
             device=infer_device,
             is_half=_is_half,
+            use_jit=use_jit,
         )
 
         # tgt_sr is model-specific (32kHz for our 32k models).
@@ -549,6 +553,8 @@ def run_worker(
                             rvc.set_index_rate(msg["index_rate"])
                         if "protect" in msg:
                             protect = msg["protect"]
+                        if "formant" in msg:
+                            rvc.set_formant(float(msg["formant"]))
                         if "silence_threshold_db" in msg:
                             _silence_rms = 10 ** (msg["silence_threshold_db"] / 20.0)
                             _rms_window.clear()
