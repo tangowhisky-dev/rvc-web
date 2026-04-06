@@ -8,7 +8,7 @@ Protocol (multiprocessing.Queue messages):
   Parent → child (cmd_q):
     {"cmd": "stop"}
     {"cmd": "update_params", "pitch": float, "index_rate": float, "protect": float,
-     "formant": float}
+     "formant": float, "noise_reduction_output": bool}
 
   Child → parent (evt_q):
     {"event": "warming_up",      "device": "mps" | "cpu"}
@@ -233,6 +233,7 @@ def run_worker(
     silence_threshold_db: float = -55.0,
     output_gain: float = 1.0,
     noise_reduction: bool = True,
+    noise_reduction_output: bool = False,
     sola_crossfade_ms: int = _SOLA_BUF_MS_DEFAULT,
     formant: float = 0.0,
     use_jit: bool = False,
@@ -407,9 +408,19 @@ def run_worker(
         except Exception as _rnn_err:
             # pyrnnoise unavailable — noise_reduction will be silently disabled
             noise_reduction = False
+            noise_reduction_output = False
             logging.getLogger("rvc_web.worker").warning(
                 "pyrnnoise unavailable — noise reduction disabled: %s", _rnn_err
             )
+
+        # Second independent GRU state for post-model output denoising.
+        # Must be separate from _rnn_state — sharing state would corrupt both.
+        _rnn_state_out = None
+        if _rnn_state is not None:
+            try:
+                _rnn_state_out = _rnn_create()
+            except Exception:
+                noise_reduction_output = False
 
         import sounddevice as sd
         from torchaudio.transforms import Resample as _Resample
@@ -442,6 +453,11 @@ def run_worker(
                                      dtype=_torch.float32).to(infer_device)
         _resample_tgt_48 = _Resample(orig_freq=tgt_sr, new_freq=_SR_48K,
                                      dtype=_torch.float32).to(infer_device)
+        # For post-model NR: tgt_sr → 48k (feed RNNoise) and 48k → tgt_sr (back)
+        _resample_tgt_48_nr = _Resample(orig_freq=tgt_sr, new_freq=_SR_48K,
+                                        dtype=_torch.float32)  # CPU — RNNoise runs on CPU
+        _resample_48_tgt_nr = _Resample(orig_freq=_SR_48K, new_freq=tgt_sr,
+                                        dtype=_torch.float32)  # CPU
 
         stream_in = sd.InputStream(
             device=input_device_id,
@@ -563,6 +579,8 @@ def run_worker(
                             output_gain = float(msg["output_gain"])
                         if "noise_reduction" in msg:
                             noise_reduction = bool(msg["noise_reduction"])
+                        if "noise_reduction_output" in msg:
+                            noise_reduction_output = bool(msg["noise_reduction_output"])
                         if "sola_crossfade_ms" in msg:
                             _new_ms = int(msg["sola_crossfade_ms"])
                             _new_ms = max(0, min(_new_ms, 50))
@@ -734,6 +752,31 @@ def run_worker(
                                              block_tgt, device=infer_device)
                 out_tgt = _torch.clamp(infer_wav[:block_tgt] * gain_ramp, -1.0, 1.0)
 
+                # ── post-model noise reduction (optional) ─────────────────
+                # Runs on CPU: tgt_sr → 48kHz → RNNoise frames → tgt_sr back.
+                # Separate GRU state (_rnn_state_out) from the input denoiser.
+                # Adds ~5ms CPU time + one 10ms RNNoise frame of buffering.
+                if noise_reduction_output and _rnn_state_out is not None and _rnn_process_frame is not None:
+                    _nr_in = _resample_tgt_48_nr(out_tgt.cpu().unsqueeze(0)).squeeze(0).numpy()
+                    _nr_pad = (-len(_nr_in)) % _rnn_frame_size
+                    if _nr_pad:
+                        _nr_in = np.concatenate([_nr_in, np.zeros(_nr_pad, dtype=np.float32)])
+                    _nr_frames = []
+                    for _fi in range(0, len(_nr_in), _rnn_frame_size):
+                        _nr_frame_out, _ = _rnn_process_frame(
+                            _rnn_state_out, _nr_in[_fi:_fi + _rnn_frame_size]
+                        )
+                        _nr_frames.append(_nr_frame_out.astype(np.float32) / 32767.0)
+                    _nr_out_48k = np.concatenate(_nr_frames)[:len(_nr_in) - _nr_pad if _nr_pad else len(_nr_in)]
+                    _nr_out_tgt = _resample_48_tgt_nr(
+                        _torch.from_numpy(_nr_out_48k).unsqueeze(0)
+                    ).squeeze(0)
+                    # Trim/pad back to block_tgt in case resampler gives ±1 sample
+                    if _nr_out_tgt.shape[0] >= block_tgt:
+                        out_tgt = _nr_out_tgt[:block_tgt].to(infer_device)
+                    else:
+                        out_tgt = _F.pad(_nr_out_tgt, (0, block_tgt - _nr_out_tgt.shape[0])).to(infer_device)
+
                 # Resample tgt_sr → 48kHz for output device
                 out_48k = _resample_tgt_48(out_tgt.unsqueeze(0)).squeeze(0)
                 # Ensure exactly block_48k samples (resampler may give ±1)
@@ -797,6 +840,11 @@ def run_worker(
         try:
             if _rnn_state is not None and _rnn_destroy is not None:
                 _rnn_destroy(_rnn_state)
+        except Exception:
+            pass
+        try:
+            if _rnn_state_out is not None and _rnn_destroy is not None:
+                _rnn_destroy(_rnn_state_out)
         except Exception:
             pass
 

@@ -100,6 +100,7 @@ class RealtimeSession:
     silence_threshold_db: float = -45.0
     output_gain: float = 1.0
     noise_reduction: bool = True
+    noise_reduction_output: bool = False
     sola_crossfade_ms: int = 20
     formant: float = 0.0
     use_jit: bool = False
@@ -146,6 +147,7 @@ class RealtimeManager:
         silence_threshold_db: float = -45.0,
         output_gain: float = 1.0,
         noise_reduction: bool = True,
+        noise_reduction_output: bool = False,
         sola_crossfade_ms: int = 20,
         formant: float = 0.0,
         use_jit: bool = False,
@@ -232,6 +234,7 @@ class RealtimeManager:
                 silence_threshold_db=silence_threshold_db,
                 output_gain=output_gain,
                 noise_reduction=noise_reduction,
+                noise_reduction_output=noise_reduction_output,
                 sola_crossfade_ms=sola_crossfade_ms,
                 formant=formant,
                 use_jit=use_jit,
@@ -294,6 +297,7 @@ class RealtimeManager:
             silence_threshold_db=silence_threshold_db,
             output_gain=output_gain,
             noise_reduction=noise_reduction,
+            noise_reduction_output=noise_reduction_output,
             sola_crossfade_ms=sola_crossfade_ms,
             formant=formant,
             use_jit=use_jit,
@@ -425,6 +429,7 @@ class RealtimeManager:
         silence_threshold_db: Optional[float] = None,
         output_gain: Optional[float] = None,
         noise_reduction: Optional[bool] = None,
+        noise_reduction_output: Optional[bool] = None,
         sola_crossfade_ms: Optional[int] = None,
         formant: Optional[float] = None,
     ) -> None:
@@ -452,6 +457,9 @@ class RealtimeManager:
         if noise_reduction is not None:
             session.noise_reduction = noise_reduction
             msg["noise_reduction"] = noise_reduction
+        if noise_reduction_output is not None:
+            session.noise_reduction_output = noise_reduction_output
+            msg["noise_reduction_output"] = noise_reduction_output
         if sola_crossfade_ms is not None:
             session.sola_crossfade_ms = max(0, min(int(sola_crossfade_ms), 50))
             msg["sola_crossfade_ms"] = session.sola_crossfade_ms

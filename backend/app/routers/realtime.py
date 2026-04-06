@@ -46,6 +46,7 @@ class StartSessionRequest(BaseModel):
     silence_threshold_db: float = -55.0
     output_gain: float = 1.0
     noise_reduction: bool = True
+    noise_reduction_output: bool = False
     sola_crossfade_ms: int = 20
     formant: float = 0.0
     use_jit: bool = False
@@ -65,6 +66,7 @@ class UpdateParamsRequest(BaseModel):
     silence_threshold_db: Optional[float] = None
     output_gain: Optional[float] = None
     noise_reduction: Optional[bool] = None
+    noise_reduction_output: Optional[bool] = None
     sola_crossfade_ms: Optional[int] = None
     formant: Optional[float] = None
 
@@ -140,6 +142,7 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
             silence_threshold_db=request.silence_threshold_db,
             output_gain=request.output_gain,
             noise_reduction=request.noise_reduction,
+            noise_reduction_output=request.noise_reduction_output,
             sola_crossfade_ms=request.sola_crossfade_ms,
             formant=request.formant,
             use_jit=request.use_jit,
@@ -243,6 +246,7 @@ async def update_params(request: UpdateParamsRequest) -> dict:
         silence_threshold_db=request.silence_threshold_db,
         output_gain=request.output_gain,
         noise_reduction=request.noise_reduction,
+        noise_reduction_output=request.noise_reduction_output,
         sola_crossfade_ms=request.sola_crossfade_ms,
         formant=request.formant,
     )
