@@ -98,7 +98,7 @@ function HealthPill({ ok, label, loading }: { ok: boolean; label: string; loadin
 // ---------------------------------------------------------------------------
 
 const MIN_SEG_SEC = 10 * 60;  // 10 min
-const MAX_SEG_SEC = 15 * 60;  // 15 min
+const MAX_SEG_SEC = 30 * 60;  // 30 min
 
 interface WaveformProps {
   file: File;
@@ -483,7 +483,7 @@ function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField, showE
       URL.revokeObjectURL(url);
 
       if (!isFinite(dur) || dur <= 0) { setDurationError('Could not determine duration'); return; }
-      if (dur > 30 * 60)              { setDurationError(`${(dur / 60).toFixed(1)} min — max is 30 min`); return; }
+      if (dur > 60 * 60)              { setDurationError(`${(dur / 60).toFixed(1)} min — max is 60 min`); return; }
 
       setFileDuration(dur);
       const defaultEnd   = Math.min(dur, MAX_SEG_SEC);
@@ -541,7 +541,7 @@ function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField, showE
           <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
             Audio File
             <span className="ml-2 font-normal text-zinc-600 normal-case tracking-normal">
-              max 30 min · select 10–15 min segment below
+              max 60 min · select 10–30 min segment below
             </span>
           </label>
           <input
@@ -860,6 +860,7 @@ interface ProfileCardProps {
 
 function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
   const [deleting, setDeleting]           = useState(false);
+  const [exporting, setExporting]         = useState(false);
   const [showAddAudio, setShowAddAudio]   = useState(false);
   const [editField, setEditField]         = useState<'embedder' | 'vocoder' | null>(null);
   const [updating, setUpdating]           = useState(false);
@@ -930,6 +931,20 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
       setDeleting(false);
       alert(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  function handleExport() {
+    setExporting(true);
+    // Trigger browser download via a temporary anchor — no fetch() needed since
+    // the endpoint streams a file directly.
+    const a = document.createElement('a');
+    a.href = `${API}/api/profiles/${profile.id}/export`;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    // Give the browser a moment to initiate the download, then reset state.
+    setTimeout(() => setExporting(false), 1500);
   }
 
   async function handleAddAudio({ file, segStart, segEnd }: { name?: string; file: File; segStart: number; segEnd: number }) {
@@ -1072,13 +1087,25 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
         </div>
 
         {/* Delete button */}
-        <button onClick={handleDelete} disabled={deleting}
-          className="shrink-0 px-3 py-1.5 rounded-md text-[11px] font-mono uppercase tracking-wider
-                     text-red-400 border border-red-900/50 bg-red-950/20
-                     hover:bg-red-900/30 hover:border-red-800/60 transition-colors
-                     disabled:opacity-40">
-          {deleting ? '…' : 'Delete'}
-        </button>
+        <div className="shrink-0 flex items-center gap-2">
+          <button
+            onClick={handleExport}
+            disabled={exporting}
+            title="Export profile as .zip"
+            className="px-3 py-1.5 rounded-md text-[11px] font-mono uppercase tracking-wider
+                       text-zinc-400 border border-zinc-700/60 bg-zinc-800/40
+                       hover:bg-zinc-700/50 hover:text-zinc-200 transition-colors
+                       disabled:opacity-40">
+            {exporting ? '⟳' : '↑ Export'}
+          </button>
+          <button onClick={handleDelete} disabled={deleting}
+            className="px-3 py-1.5 rounded-md text-[11px] font-mono uppercase tracking-wider
+                       text-red-400 border border-red-900/50 bg-red-950/20
+                       hover:bg-red-900/30 hover:border-red-800/60 transition-colors
+                       disabled:opacity-40">
+            {deleting ? '…' : 'Delete'}
+          </button>
+        </div>
       </div>
 
       {/* ── Health error strip ────────────────────────────────────────── */}
@@ -1143,6 +1170,169 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
 }
 
 // ---------------------------------------------------------------------------
+// ImportModal — picks a .zip, handles name collision, calls /api/profiles/import
+// ---------------------------------------------------------------------------
+
+interface ImportModalProps {
+  onImported: () => void;
+  onCancel: () => void;
+}
+
+function ImportModal({ onImported, onCancel }: ImportModalProps) {
+  const [file, setFile]               = useState<File | null>(null);
+  const [nameOverride, setNameOverride] = useState('');
+  const [collisionName, setCollisionName] = useState<string | null>(null);
+  const [suggested, setSuggested]     = useState('');
+  const [importing, setImporting]     = useState(false);
+  const [error, setError]             = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!file) return;
+    setImporting(true);
+    setError(null);
+
+    const form = new FormData();
+    form.append('file', file);
+    if (nameOverride.trim()) form.append('name_override', nameOverride.trim());
+
+    try {
+      const res = await fetch(`${API}/api/profiles/import`, { method: 'POST', body: form });
+
+      if (res.status === 409) {
+        const body = await res.json();
+        const detail = body.detail ?? body;
+        setCollisionName(detail.name ?? (nameOverride || file.name));
+        setSuggested(detail.suggested ?? '');
+        setNameOverride(detail.suggested ?? '');
+        setError(`A profile named "${detail.name}" already exists. Rename it below or choose a different name.`);
+        setImporting(false);
+        return;
+      }
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ detail: res.statusText }));
+        const detail = body.detail;
+        throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      }
+
+      const result = await res.json();
+      if (result.warnings?.length) {
+        // Non-fatal — show but still proceed
+        console.warn('import warnings:', result.warnings);
+      }
+      onImported();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setImporting(false);
+    }
+  }
+
+  return (
+    <div className="rounded-xl border border-zinc-700 bg-zinc-900/80 p-5 flex flex-col gap-4">
+      <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500">Import Profile</h2>
+
+      <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+        {/* File picker */}
+        <div className="flex flex-col gap-1.5">
+          <label className="text-[11px] font-mono text-zinc-400">
+            Profile zip file
+          </label>
+          <div className="flex items-center gap-3">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".zip,application/zip"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0] ?? null;
+                setFile(f);
+                setError(null);
+                setCollisionName(null);
+                if (f && !nameOverride) {
+                  // Pre-fill name from filename stem
+                  const stem = f.name.replace(/\.rvc-profile\.zip$|\.zip$/, '').replace(/_/g, ' ');
+                  setNameOverride('');  // let manifest name take priority
+                }
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="px-3 py-1.5 rounded-md text-[11px] font-mono border transition-colors
+                         bg-zinc-800 border-zinc-700 text-zinc-300 hover:bg-zinc-700/60">
+              Choose .zip
+            </button>
+            {file && (
+              <span className="text-[11px] font-mono text-zinc-400 truncate max-w-[200px]" title={file.name}>
+                {file.name} <span className="text-zinc-600">({(file.size / 1024 / 1024).toFixed(0)} MB)</span>
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Name override — shown when collision is detected or user wants to rename */}
+        {(collisionName !== null || nameOverride) && (
+          <div className="flex flex-col gap-1.5">
+            <label className="text-[11px] font-mono text-zinc-400">
+              {collisionName ? 'Rename profile' : 'Profile name (optional)'}
+            </label>
+            <input
+              type="text"
+              value={nameOverride}
+              onChange={(e) => { setNameOverride(e.target.value); setError(null); }}
+              placeholder={suggested || 'Enter a new name…'}
+              className="w-full rounded-md bg-zinc-800 border border-zinc-700 px-3 py-1.5
+                         text-[12px] font-mono text-zinc-200 placeholder-zinc-600
+                         focus:outline-none focus:border-cyan-700"
+            />
+          </div>
+        )}
+
+        {/* Manual rename link when no collision yet */}
+        {collisionName === null && !nameOverride && (
+          <button
+            type="button"
+            onClick={() => setNameOverride(' ')}
+            className="text-[11px] font-mono text-zinc-600 hover:text-zinc-400 text-left">
+            + rename on import (optional)
+          </button>
+        )}
+
+        {error && (
+          <p className="text-[11px] font-mono text-amber-400 rounded bg-amber-950/30 border border-amber-800/40 px-3 py-2">
+            {error}
+          </p>
+        )}
+
+        <div className="flex items-center gap-3 pt-1">
+          <button
+            type="submit"
+            disabled={!file || importing}
+            className="px-4 py-1.5 rounded-lg text-[12px] font-mono uppercase tracking-wide border transition-all
+                       bg-cyan-900/40 border-cyan-600/40 text-cyan-300 hover:bg-cyan-800/40
+                       disabled:opacity-40 disabled:cursor-not-allowed">
+            {importing ? '⟳ Importing…' : '↓ Import'}
+          </button>
+          <button
+            type="button"
+            onClick={onCancel}
+            className="px-3 py-1.5 rounded-lg text-[12px] font-mono border
+                       bg-zinc-800 border-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors">
+            Cancel
+          </button>
+          <span className="text-[10px] font-mono text-zinc-600 ml-1">
+            Creates a new profile — original is unchanged
+          </span>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
 
@@ -1152,6 +1342,7 @@ export default function LibraryPage() {
   const [sessionActive, setSessionActive] = useState(false);
   const [error, setError]             = useState<string | null>(null);
   const [showUpload, setShowUpload]   = useState(false);
+  const [showImport, setShowImport]   = useState(false);
 
   async function fetchProfiles() {
     try {
@@ -1207,7 +1398,16 @@ export default function LibraryPage() {
               {profiles.length} profile{profiles.length !== 1 ? 's' : ''}
             </span>
             <button
-              onClick={() => setShowUpload((v) => !v)}
+              onClick={() => { setShowImport((v) => !v); setShowUpload(false); }}
+              className={`px-3 py-1.5 rounded-lg text-[12px] font-mono uppercase tracking-wide border transition-all ${
+                showImport
+                  ? 'bg-zinc-800 border-zinc-700 text-zinc-300'
+                  : 'bg-zinc-800/60 border-zinc-700 text-zinc-400 hover:bg-zinc-700/50 hover:text-zinc-200'
+              }`}>
+              {showImport ? '✕ Cancel' : '↓ Import'}
+            </button>
+            <button
+              onClick={() => { setShowUpload((v) => !v); setShowImport(false); }}
               className={`px-3 py-1.5 rounded-lg text-[12px] font-mono uppercase tracking-wide border transition-all ${
                 showUpload
                   ? 'bg-zinc-800 border-zinc-700 text-zinc-300'
@@ -1222,6 +1422,15 @@ export default function LibraryPage() {
           <div className="rounded-lg border border-red-800/60 bg-red-950/40 px-4 py-3 text-[13px] font-mono text-red-300">
             {error}
           </div>
+        )}
+
+        {showImport && (
+          <section>
+            <ImportModal
+              onImported={() => { setShowImport(false); fetchProfiles(); }}
+              onCancel={() => setShowImport(false)}
+            />
+          </section>
         )}
 
         {showUpload && (

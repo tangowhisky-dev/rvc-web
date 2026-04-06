@@ -2,9 +2,9 @@
 
 import { useEffect, useRef, useState } from 'react';
 import {
-  AreaChart, Area, LineChart, Line,
-  XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine,
-  ResponsiveContainer, Legend,
+  ComposedChart, Line, LineChart,
+  XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ReferenceDot,
+  ResponsiveContainer,
 } from 'recharts';
 import { TipsPanel } from '../TipsPanel';
 import { LossGuide } from '../SettingsGuide';
@@ -25,6 +25,8 @@ interface Profile {
   needs_retraining: boolean;
   embedder: string;
   vocoder: string;
+  best_epoch: number | null;
+  best_avg_gen_loss: number | null;
   audio_files: { id: string; duration: number | null }[];
 }
 
@@ -48,6 +50,10 @@ interface TrainingMsg {
   phase?: string;
   elapsed_s?: number;
   epoch?: number;
+  is_best?: boolean;
+  best_epoch?: number;
+  avg_gen?: number;
+  best_avg_gen?: number;
   losses?: {
     loss_disc?: number;
     loss_gen?: number;
@@ -121,71 +127,136 @@ function PhaseBar({ currentPhase, jobDone }: { currentPhase: string | null; jobD
 }
 
 // ---------------------------------------------------------------------------
-// Loss chart — SVG sparklines for key training signals
+// Loss chart — convergence-oriented visualization
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Generator loss components that stack to form loss_gen_all
-// (matches train.py: loss_gen + loss_fm + loss_mel + loss_kl + loss_spk)
-// ---------------------------------------------------------------------------
-const GEN_STACK = [
-  { key: 'loss_spk', label: 'Spk',  color: '#ec4899' }, // pink    — rendered bottom → up
-  { key: 'loss_kl',  label: 'KL',   color: '#f87171' }, // red
-  { key: 'loss_fm',  label: 'FM',   color: '#34d399' }, // emerald
-  { key: 'loss_gen', label: 'Gen',  color: '#a78bfa' }, // violet
-  { key: 'loss_mel', label: 'Mel',  color: '#06b6d4' }, // cyan — top (most important)
-] as const;
+// EMA smoothing — α=0.15 gives a ~6-epoch half-life.
+// Returns an array the same length as input; earlier values are less smoothed
+// but we start from the first value to avoid a biased warm-up.
+function ema(values: number[], alpha = 0.15): number[] {
+  const out: number[] = [];
+  let s = values[0];
+  for (const v of values) {
+    s = alpha * v + (1 - alpha) * s;
+    out.push(s);
+  }
+  return out;
+}
 
-// Custom tooltip: shows epoch, all component values, total gen loss, disc loss
-function ChartTooltip({ active, payload, label }: {
+// Slope of a line fit through the last `window` EMA values, normalised by
+// the mean value so it is scale-independent (units: fraction per epoch).
+function recentSlope(values: number[], window = 15): number {
+  const tail = values.slice(-window);
+  if (tail.length < 2) return 0;
+  const mean = tail.reduce((a, b) => a + b, 0) / tail.length;
+  if (mean === 0) return 0;
+  // Simple linear regression slope
+  const n = tail.length;
+  const xMean = (n - 1) / 2;
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (i - xMean) * (tail[i] - mean);
+    den += (i - xMean) ** 2;
+  }
+  return den === 0 ? 0 : (num / den) / mean;
+}
+
+// Convergence status derived from mel EMA slope and KL EMA slope.
+// Mel is the primary quality signal; KL indicates latent alignment.
+//
+// Thresholds use normalised slope (fractional change per epoch):
+//   mel 'still improving' : < -0.001  (≈ 0.02 units/epoch at mel=19)
+//   mel 'overtraining'    : >  0.005
+//   kl  'latent converging': < -0.002  (≈ 0.004 units/epoch at kl=2)
+//
+// Rationale: late-stage fine-tuning has small absolute drops that are still
+// meaningful.  The old thresholds (-0.003 mel, -0.005 kl) were calibrated for
+// early training where mel≈35 and produced false-positive "converged" once mel
+// settled below ~20 and both slopes slowed proportionally.
+function convergenceStatus(
+  melSlope: number,
+  klSlope: number,
+  epochCount: number,
+): { label: string; color: string; detail: string } {
+  // Need at least 30 epochs: EMA with α=0.15 takes ~20 epochs to wash out
+  // early transients, so the 15-epoch slope window isn't reliable before that.
+  if (epochCount < 30) {
+    return { label: 'warming up', color: '#71717a', detail: 'Not enough epochs for trend analysis.' };
+  }
+  // Rising mel = overtraining signal
+  if (melSlope > 0.005) {
+    return {
+      label: 'possible overtraining',
+      color: '#f87171',
+      detail: 'Mel loss is rising — spectral quality may be degrading. Consider stopping.',
+    };
+  }
+  // Mel still dropping meaningfully
+  if (melSlope < -0.001) {
+    return {
+      label: 'still improving',
+      color: '#34d399',
+      detail: 'Mel loss is still trending down — more training likely helps.',
+    };
+  }
+  // Mel flat, KL still dropping — latent alignment in progress
+  if (klSlope < -0.002) {
+    return {
+      label: 'latent converging',
+      color: '#60a5fa',
+      detail: 'Mel has plateaued but KL is still dropping — prior/posterior alignment continuing.',
+    };
+  }
+  // Both flat — converged
+  return {
+    label: 'converged',
+    color: '#a78bfa',
+    detail: 'Both mel and KL have plateaued. Model has extracted what it can from this data.',
+  };
+}
+
+function LossTooltip({ active, payload, label }: {
   active?: boolean;
-  payload?: Array<{ name: string; value: number; color: string; dataKey: string }>;
+  payload?: Array<{ dataKey: string; value: number; color: string }>;
   label?: number;
 }) {
   if (!active || !payload?.length) return null;
-
-  // Collect component values from stacked areas
   const vals: Record<string, number> = {};
-  for (const entry of payload) {
-    vals[entry.dataKey] = entry.value ?? 0;
-  }
-  const total = GEN_STACK.reduce((s, g) => s + (vals[g.key] ?? 0), 0);
-  const disc  = vals['loss_disc'] ?? null;
+  for (const e of payload) vals[e.dataKey] = e.value;
+
+  const rows: Array<{ key: string; label: string; color: string }> = [
+    { key: 'mel_raw',  label: 'Mel (raw)',   color: '#06b6d4' },
+    { key: 'mel_ema',  label: 'Mel (trend)', color: '#06b6d4' },
+    { key: 'gen_raw',  label: 'Gen (raw)',   color: '#a78bfa' },
+    { key: 'gen_ema',  label: 'Gen (trend)', color: '#a78bfa' },
+    { key: 'kl_raw',   label: 'KL (raw)',    color: '#f87171' },
+    { key: 'kl_ema',   label: 'KL (trend)',  color: '#f87171' },
+    { key: 'fm_raw',   label: 'FM (raw)',    color: '#34d399' },
+    { key: 'disc_raw', label: 'Disc',        color: '#f59e0b' },
+  ];
 
   return (
-    <div className="bg-zinc-900/95 border border-zinc-700 rounded-md px-3 py-2 font-mono text-[10px] shadow-xl min-w-[140px]">
-      <div className="text-zinc-400 mb-1.5">epoch {label}</div>
-      {GEN_STACK.slice().reverse().map(g => vals[g.key] != null && (
-        <div key={g.key} className="flex justify-between gap-4">
-          <span style={{ color: g.color }}>{g.label}</span>
-          <span className="text-zinc-300">{(vals[g.key] ?? 0).toFixed(3)}</span>
+    <div className="bg-zinc-900/95 border border-zinc-700 rounded-md px-3 py-2 font-mono text-[10px] shadow-xl min-w-[150px]">
+      <div className="text-zinc-400 mb-1.5 font-semibold">epoch {label}</div>
+      {rows.map(r => vals[r.key] != null ? (
+        <div key={r.key} className="flex justify-between gap-4">
+          <span style={{ color: r.color, opacity: r.key.endsWith('_raw') ? 0.55 : 1 }}>{r.label}</span>
+          <span className="text-zinc-300">{vals[r.key].toFixed(3)}</span>
         </div>
-      ))}
-      <div className="border-t border-zinc-700 mt-1 pt-1 flex justify-between gap-4">
-        <span className="text-white font-semibold">Total Gen</span>
-        <span className="text-white font-semibold">{total.toFixed(3)}</span>
-      </div>
-      {disc != null && (
-        <div className="flex justify-between gap-4 mt-0.5">
-          <span style={{ color: '#f59e0b' }}>Disc</span>
-          <span className="text-zinc-300">{disc.toFixed(3)}</span>
-        </div>
-      )}
+      ) : null)}
     </div>
   );
 }
 
-function LossChart({ points, totalEpochs: totalEpochsProp }: { points: EpochPoint[]; totalEpochs?: number }) {
-  // Which generator components are visible (all on by default)
-  const [hidden, setHidden] = useState<Set<string>>(new Set());
-
-  const toggle = (key: string) =>
-    setHidden(prev => {
-      const next = new Set(prev);
-      next.has(key) ? next.delete(key) : next.add(key);
-      return next;
-    });
-
+function LossChart({
+  points,
+  totalEpochs: totalEpochsProp,
+  bestEpoch,
+}: {
+  points: EpochPoint[];
+  totalEpochs?: number;
+  bestEpoch?: number | null;
+}) {
   if (points.length < 2) {
     return (
       <div className="h-36 flex items-center justify-center text-zinc-600 font-mono text-[11px]">
@@ -194,196 +265,234 @@ function LossChart({ points, totalEpochs: totalEpochsProp }: { points: EpochPoin
     );
   }
 
-  const totalEpochs = totalEpochsProp ?? Math.max(...points.map(p => p.epoch));
+  const totalEpochs  = totalEpochsProp ?? Math.max(...points.map(p => p.epoch));
   const currentEpoch = points[points.length - 1].epoch;
+  const first        = points[0];
+  const last         = points[points.length - 1];
 
-  // Build data array for Recharts — one object per epoch point
-  const data = points.map(p => ({
-    epoch:     p.epoch,
-    loss_mel:  hidden.has('loss_mel')  ? 0 : (p.loss_mel  ?? 0),
-    loss_gen:  hidden.has('loss_gen')  ? 0 : (p.loss_gen  ?? 0),
-    loss_fm:   hidden.has('loss_fm')   ? 0 : (p.loss_fm   ?? 0),
-    loss_kl:   hidden.has('loss_kl')   ? 0 : (p.loss_kl   ?? 0),
-    loss_spk:  hidden.has('loss_spk')  ? 0 : (p.loss_spk  ?? 0),
-    loss_disc: p.loss_disc ?? 0,
+  // Compute EMA series for mel, gen, kl, fm
+  const melRaw  = points.map(p => p.loss_mel  ?? 0);
+  const genRaw  = points.map(p => p.loss_gen  ?? 0);
+  const klRaw   = points.map(p => p.loss_kl   ?? 0);
+  const fmRaw   = points.map(p => p.loss_fm   ?? 0);
+  const discRaw = points.map(p => p.loss_disc ?? 0);
+
+  const melEma  = ema(melRaw);
+  const genEma  = ema(genRaw);
+  const klEma   = ema(klRaw);
+
+  // Convergence signal from recent EMA slope
+  const melSlope = recentSlope(melEma);
+  const klSlope  = recentSlope(klEma);
+  const status   = convergenceStatus(melSlope, klSlope, points.length);
+
+  // Per-component change from first to last EMA
+  function pctChange(raw: number[], e: number[]): string {
+    const delta = ((e[e.length - 1] - raw[0]) / Math.max(raw[0], 1e-9)) * 100;
+    return `${delta < 0 ? '↓' : '↑'}${Math.abs(delta).toFixed(0)}%`;
+  }
+  function pctColor(raw: number[], e: number[]): string {
+    return e[e.length - 1] < raw[0] ? '#34d399' : '#f87171';
+  }
+
+  // Chart data — one point per epoch, both raw and EMA values
+  const data = points.map((p, i) => ({
+    epoch:    p.epoch,
+    mel_raw:  melRaw[i],
+    mel_ema:  melEma[i],
+    gen_raw:  genRaw[i],
+    gen_ema:  genEma[i],
+    kl_raw:   klRaw[i],
+    kl_ema:   klEma[i],
+    fm_raw:   fmRaw[i],
+    disc_raw: discRaw[i],
   }));
 
-  // Latest values for the status row
-  const last  = points[points.length - 1];
-  const first = points[0];
-  const totalLast  = GEN_STACK.reduce((s, g) => s + (last[g.key as keyof EpochPoint]  as number ?? 0), 0);
-  const totalFirst = GEN_STACK.reduce((s, g) => s + (first[g.key as keyof EpochPoint] as number ?? 0), 0);
+  const axisStyle = { fontSize: 9, fontFamily: 'monospace', fill: '#52525b' };
+  const gridProps = { strokeDasharray: '3 3' as const, stroke: '#1f1f23', vertical: false };
+  const xAxisProps = {
+    dataKey: 'epoch' as const,
+    type:    'number' as const,
+    domain:  [1, totalEpochs] as [number, number],
+    tickCount: 4,
+    tick:    axisStyle,
+    tickLine: false,
+    axisLine: { stroke: '#3f3f46' },
+  };
 
-  const axisStyle = { fontSize: 9, fontFamily: 'monospace', fill: '#71717a' };
+  // Best-epoch line — show only when it's meaningfully before current
+  const showBestLine = bestEpoch != null && bestEpoch > 0 && bestEpoch < currentEpoch - 1;
 
   return (
     <div className="flex flex-col gap-3">
 
-      {/* ── Stacked area: generator components + total envelope ─────────── */}
+      {/* ── Convergence status banner ─────────────────────────────────────── */}
+      <div
+        className="flex items-start gap-2 rounded px-2.5 py-1.5 text-[10px] font-mono"
+        style={{ backgroundColor: `${status.color}14`, borderLeft: `2px solid ${status.color}` }}
+      >
+        <span style={{ color: status.color }} className="font-semibold shrink-0 mt-px">
+          {status.label}
+        </span>
+        <span className="text-zinc-500">{status.detail}</span>
+      </div>
+
+      {/* ── Primary chart: Mel (left axis) + Gen + KL (right axis) ────────── */}
       <div>
-        <div className="text-[10px] font-mono text-zinc-500 mb-1 flex items-center gap-2">
-          <span className="text-cyan-400">▲</span> Generator loss
-          <span className="text-zinc-600 ml-1">(stacked — outer edge = total)</span>
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-3 text-[10px] font-mono">
+            {/* Mel */}
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#06b6d4' }} />
+              <span style={{ color: '#06b6d4' }}>Mel</span>
+              <span className="text-zinc-400">{melEma[melEma.length - 1].toFixed(2)}</span>
+              <span style={{ color: pctColor(melRaw, melEma) }}>{pctChange(melRaw, melEma)}</span>
+            </span>
+            {/* Gen */}
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#a78bfa' }} />
+              <span style={{ color: '#a78bfa' }}>Gen</span>
+              <span className="text-zinc-400">{genEma[genEma.length - 1].toFixed(3)}</span>
+              <span style={{ color: pctColor(genRaw, genEma) }}>{pctChange(genRaw, genEma)}</span>
+            </span>
+            {/* KL */}
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#f87171' }} />
+              <span style={{ color: '#f87171' }}>KL</span>
+              <span className="text-zinc-400">{klEma[klEma.length - 1].toFixed(3)}</span>
+              <span style={{ color: pctColor(klRaw, klEma) }}>{pctChange(klRaw, klEma)}</span>
+            </span>
+          </div>
+          <span className="text-[9px] font-mono text-zinc-600">faded = raw · solid = trend</span>
         </div>
-        <ResponsiveContainer width="100%" height={160}>
-          <AreaChart data={data} margin={{ top: 4, right: 8, bottom: 0, left: 32 }}>
-            <defs>
-              {GEN_STACK.map(g => (
-                <linearGradient key={g.key} id={`grad_${g.key}`} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%"  stopColor={g.color} stopOpacity={0.35} />
-                  <stop offset="95%" stopColor={g.color} stopOpacity={0.05} />
-                </linearGradient>
-              ))}
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-            <XAxis
-              dataKey="epoch"
-              type="number"
-              domain={[1, totalEpochs]}
-              tickCount={3}
+        <ResponsiveContainer width="100%" height={170}>
+          <ComposedChart data={data} margin={{ top: 4, right: 42, bottom: 0, left: 28 }}>
+            <CartesianGrid {...gridProps} />
+            <XAxis {...xAxisProps} />
+            {/* Left axis: Mel (larger values ~10–26) */}
+            <YAxis
+              yAxisId="mel"
+              orientation="left"
               tick={axisStyle}
               tickLine={false}
-              axisLine={{ stroke: '#3f3f46' }}
+              axisLine={false}
+              tickFormatter={(v: number) => v.toFixed(0)}
+              width={26}
+              domain={['auto', 'auto']}
             />
+            {/* Right axis: Gen + KL (smaller values ~1–8) */}
             <YAxis
+              yAxisId="small"
+              orientation="right"
               tick={axisStyle}
               tickLine={false}
               axisLine={false}
               tickFormatter={(v: number) => v.toFixed(1)}
               width={30}
+              domain={[0, 'auto']}
             />
-            <Tooltip content={<ChartTooltip />} />
-            {/* Progress marker: where training currently is */}
+            <Tooltip content={<LossTooltip />} />
+
+            {/* Best-epoch marker */}
+            {showBestLine && (
+              <ReferenceLine
+                x={bestEpoch}
+                yAxisId="mel"
+                stroke="#f59e0b"
+                strokeDasharray="4 3"
+                strokeWidth={1.5}
+                label={{
+                  value: `best ${bestEpoch}`,
+                  position: 'insideTopLeft',
+                  fontSize: 8,
+                  fontFamily: 'monospace',
+                  fill: '#f59e0b',
+                  dy: -2,
+                }}
+              />
+            )}
+
+            {/* Progress marker */}
             {currentEpoch < totalEpochs && (
               <ReferenceLine
                 x={currentEpoch}
-                stroke="#52525b"
+                yAxisId="mel"
+                stroke="#3f3f46"
                 strokeDasharray="3 3"
                 strokeWidth={1}
               />
             )}
-            {/* Stack order: spk → kl → fm → gen → mel (mel on top, most visible) */}
-            {GEN_STACK.map(g => (
-              <Area
-                key={g.key}
-                type="monotone"
-                dataKey={g.key}
-                stackId="gen"
-                stroke={hidden.has(g.key) ? 'transparent' : g.color}
-                strokeWidth={hidden.has(g.key) ? 0 : 1.5}
-                fill={hidden.has(g.key) ? 'transparent' : `url(#grad_${g.key})`}
-                isAnimationActive={false}
-              />
-            ))}
-          </AreaChart>
+
+            {/* Mel — raw faded, EMA solid */}
+            <Line yAxisId="mel"   type="monotone" dataKey="mel_raw"  stroke="#06b6d4" strokeWidth={1}   dot={false} strokeOpacity={0.2} isAnimationActive={false} />
+            <Line yAxisId="mel"   type="monotone" dataKey="mel_ema"  stroke="#06b6d4" strokeWidth={2}   dot={false} isAnimationActive={false} />
+            {/* Gen — raw faded, EMA solid */}
+            <Line yAxisId="small" type="monotone" dataKey="gen_raw"  stroke="#a78bfa" strokeWidth={1}   dot={false} strokeOpacity={0.2} isAnimationActive={false} />
+            <Line yAxisId="small" type="monotone" dataKey="gen_ema"  stroke="#a78bfa" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            {/* KL — raw faded, EMA solid */}
+            <Line yAxisId="small" type="monotone" dataKey="kl_raw"   stroke="#f87171" strokeWidth={1}   dot={false} strokeOpacity={0.2} isAnimationActive={false} />
+            <Line yAxisId="small" type="monotone" dataKey="kl_ema"   stroke="#f87171" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+          </ComposedChart>
         </ResponsiveContainer>
       </div>
 
-      {/* ── Discriminator line ───────────────────────────────────────────── */}
+      {/* ── Secondary chart: FM + Disc ────────────────────────────────────── */}
       <div>
-        <div className="text-[10px] font-mono text-zinc-500 mb-1 flex items-center gap-2">
-          <span className="text-amber-400">─</span> Discriminator loss
-          <span className="text-zinc-600 ml-1">(separate scale)</span>
+        <div className="flex items-center gap-3 mb-1 text-[10px] font-mono">
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block w-3 h-0.5 rounded-full bg-emerald-400" />
+            <span className="text-emerald-400">FM</span>
+            <span className="text-zinc-400">{(fmRaw[fmRaw.length - 1] ?? 0).toFixed(2)}</span>
+            <span style={{ color: pctColor(fmRaw, ema(fmRaw)) }}>{pctChange(fmRaw, ema(fmRaw))}</span>
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block w-3 h-0.5 rounded-full bg-amber-400" />
+            <span className="text-amber-400">Disc</span>
+            <span className="text-zinc-400">{(discRaw[discRaw.length - 1] ?? 0).toFixed(3)}</span>
+            <span className="text-zinc-600 text-[9px] ml-1">≈ flat = healthy equilibrium</span>
+          </span>
         </div>
-        <ResponsiveContainer width="100%" height={60}>
-          <LineChart data={data} margin={{ top: 2, right: 8, bottom: 0, left: 32 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-            <XAxis
-              dataKey="epoch"
-              type="number"
-              domain={[1, totalEpochs]}
-              tickCount={3}
+        <ResponsiveContainer width="100%" height={70}>
+          <ComposedChart data={data} margin={{ top: 2, right: 42, bottom: 0, left: 28 }}>
+            <CartesianGrid {...gridProps} />
+            <XAxis {...xAxisProps} />
+            <YAxis
+              yAxisId="left"
+              orientation="left"
               tick={axisStyle}
               tickLine={false}
-              axisLine={{ stroke: '#3f3f46' }}
+              axisLine={false}
+              tickFormatter={(v: number) => v.toFixed(0)}
+              width={26}
             />
             <YAxis
+              yAxisId="right"
+              orientation="right"
               tick={axisStyle}
               tickLine={false}
               axisLine={false}
               tickFormatter={(v: number) => v.toFixed(1)}
               width={30}
             />
-            <Tooltip content={<ChartTooltip />} />
-            {currentEpoch < totalEpochs && (
-              <ReferenceLine x={currentEpoch} stroke="#52525b" strokeDasharray="3 3" strokeWidth={1} />
+            <Tooltip content={<LossTooltip />} />
+            {showBestLine && (
+              <ReferenceLine x={bestEpoch} yAxisId="left" stroke="#f59e0b" strokeDasharray="4 3" strokeWidth={1} strokeOpacity={0.5} />
             )}
-            <Line
-              type="monotone"
-              dataKey="loss_disc"
-              stroke="#f59e0b"
-              strokeWidth={1.5}
-              dot={false}
-              isAnimationActive={false}
-            />
-          </LineChart>
+            {currentEpoch < totalEpochs && (
+              <ReferenceLine x={currentEpoch} yAxisId="left" stroke="#3f3f46" strokeDasharray="3 3" strokeWidth={1} />
+            )}
+            <Line yAxisId="left"  type="monotone" dataKey="fm_raw"   stroke="#34d399" strokeWidth={1.5} dot={false} strokeOpacity={0.4} isAnimationActive={false} />
+            <Line yAxisId="right" type="monotone" dataKey="disc_raw" stroke="#f59e0b" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+          </ComposedChart>
         </ResponsiveContainer>
       </div>
 
-      {/* ── Clickable legend + last-value status row ─────────────────────── */}
-      <div className="flex flex-wrap gap-x-3 gap-y-1.5">
-        {/* Total gen loss summary (always shown) */}
-        <span className="flex items-center gap-1.5 font-mono text-[10px] mr-2">
-          <span className="inline-block w-3 h-px border-t-2 border-dashed border-zinc-400" />
-          <span className="text-zinc-300 font-semibold">Total</span>
-          <span className="text-zinc-200 font-semibold">{totalLast.toFixed(3)}</span>
-          {(() => {
-            const delta = ((totalLast - totalFirst) / Math.max(totalFirst, 1e-9)) * 100;
-            return (
-              <span className={delta < 0 ? 'text-emerald-400' : 'text-red-400'}>
-                {delta < 0 ? '↓' : '↑'}{Math.abs(delta).toFixed(0)}%
-              </span>
-            );
-          })()}
-        </span>
-
-        {/* Per-component toggle buttons */}
-        {GEN_STACK.slice().reverse().map(g => {
-          const lv  = last[g.key as keyof EpochPoint]  as number ?? 0;
-          const fv  = first[g.key as keyof EpochPoint] as number ?? 0;
-          const pct = fv > 0 ? ((lv - fv) / fv) * 100 : 0;
-          const off = hidden.has(g.key);
-          return (
-            <button
-              key={g.key}
-              onClick={() => toggle(g.key)}
-              className="flex items-center gap-1.5 font-mono text-[10px] rounded px-1.5 py-0.5
-                         hover:bg-zinc-800 transition-colors cursor-pointer"
-              title={off ? `Show ${g.label}` : `Hide ${g.label}`}
-            >
-              <span
-                className="inline-block w-3 h-1.5 rounded-sm transition-opacity"
-                style={{ backgroundColor: g.color, opacity: off ? 0.25 : 1 }}
-              />
-              <span style={{ color: off ? '#52525b' : g.color }}>{g.label}</span>
-              {!off && (
-                <>
-                  <span className="text-zinc-400">{lv.toFixed(3)}</span>
-                  <span className={pct < 0 ? 'text-emerald-400' : 'text-red-400'}>
-                    {pct < 0 ? '↓' : '↑'}{Math.abs(pct).toFixed(0)}%
-                  </span>
-                </>
-              )}
-            </button>
-          );
-        })}
-
-        {/* Discriminator (not toggleable — separate chart) */}
-        {(() => {
-          const lv  = last.loss_disc  ?? 0;
-          const fv  = first.loss_disc ?? 0;
-          const pct = fv > 0 ? ((lv - fv) / fv) * 100 : 0;
-          return (
-            <span className="flex items-center gap-1.5 font-mono text-[10px]">
-              <span className="inline-block w-3 h-0.5 rounded-full bg-amber-400" />
-              <span className="text-amber-400">Disc</span>
-              <span className="text-zinc-400">{lv.toFixed(3)}</span>
-              <span className={pct < 0 ? 'text-emerald-400' : 'text-red-400'}>
-                {pct < 0 ? '↓' : '↑'}{Math.abs(pct).toFixed(0)}%
-              </span>
-            </span>
-          );
-        })()}
+      {/* ── Reading guide ─────────────────────────────────────────────────── */}
+      <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-[9px] font-mono text-zinc-600 pt-1 border-t border-zinc-800/50">
+        <span><span className="text-cyan-500">Mel</span> · left axis · still dropping = room to improve</span>
+        <span><span className="text-red-400">KL</span> · right axis · near zero = latent aligned</span>
+        <span><span className="text-violet-400">Gen</span> · right axis · flat = adversarial equilibrium</span>
+        <span><span className="text-amber-400">best {bestEpoch ?? '—'}</span> · dashed amber = G_best.pth saved here</span>
       </div>
     </div>
   );
@@ -559,7 +668,12 @@ export default function TrainingPage() {
   const [batchSize, setBatchSize] = useState(8);
   const [overtrainEnabled, setOvertrainEnabled] = useState(false);
   const [overtrainThreshold, setOvertrainThreshold] = useState(50);
-  const [speakerLossWeight, setSpeakerLossWeight] = useState(0);
+  const [lossMode, setLossMode] = useState<'classic' | 'combined'>('classic');
+  const [speakerLossWeight, setSpeakerLossWeight] = useState(3);
+  const [advLoss, setAdvLoss] = useState<'lsgan' | 'tprls'>('lsgan');
+  const [klAnneal, setKlAnneal] = useState(false);
+  const [klAnnealEpochs, setKlAnnealEpochs] = useState(40);
+  const [optimizer, setOptimizer] = useState<'adamw' | 'adamspd'>('adamw');
   const [hw, setHw] = useState<HardwareInfo | null>(null);
 
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -607,6 +721,32 @@ export default function TrainingPage() {
   // -------------------------------------------------------------------------
   function attachWs(profileId: string) {
     closeWs();
+
+    // Seed chart with all historical losses before live events arrive.
+    // This ensures resumed runs show prior epochs immediately.
+    fetch(`${API}/api/training/losses/${profileId}`)
+      .then(r => r.ok ? r.json() : [])
+      .then((rows: EpochLossPoint[]) => {
+        if (!rows.length) return;
+        setEpochPoints(prev => {
+          const existingEpochs = new Set(prev.map(p => p.epoch));
+          const fresh = rows
+            .filter(r => !existingEpochs.has(r.epoch))
+            .map(r => ({
+              epoch:     r.epoch,
+              loss_mel:  r.loss_mel  ?? 0,
+              loss_gen:  r.loss_gen  ?? 0,
+              loss_disc: r.loss_disc ?? 0,
+              loss_fm:   r.loss_fm   ?? 0,
+              loss_kl:   r.loss_kl   ?? 0,
+              loss_spk:  r.loss_spk  ?? 0,
+            }));
+          if (!fresh.length) return prev;
+          return [...prev, ...fresh].sort((a, b) => a.epoch - b.epoch);
+        });
+      })
+      .catch(() => {});
+
     const ws = new WebSocket(`${WS_BASE}/ws/training/${profileId}`);
     wsRef.current = ws;
 
@@ -623,7 +763,7 @@ export default function TrainingPage() {
           if (msg.message) appendLog(`✓ ${msg.message}`);
           if (msg.epoch != null && msg.losses) {
             const l = msg.losses;
-            setEpochPoints(prev => [...prev, {
+            const point = {
               epoch:     msg.epoch!,
               loss_mel:  l.loss_mel  ?? 0,
               loss_gen:  l.loss_gen  ?? 0,
@@ -631,7 +771,20 @@ export default function TrainingPage() {
               loss_fm:   l.loss_fm   ?? 0,
               loss_kl:   l.loss_kl   ?? 0,
               loss_spk:  l.loss_spk  ?? 0,
-            }]);
+            };
+            // Upsert by epoch — live event replaces any history row for same epoch
+            setEpochPoints(prev => {
+              const without = prev.filter(p => p.epoch !== point.epoch);
+              return [...without, point].sort((a, b) => a.epoch - b.epoch);
+            });
+          }
+          // Keep best_epoch marker in sync during live training
+          if (msg.is_best && msg.best_epoch != null) {
+            setProfiles(prev => prev.map(p =>
+              p.id === profileId
+                ? { ...p, best_epoch: msg.best_epoch!, best_avg_gen_loss: msg.best_avg_gen ?? p.best_avg_gen_loss }
+                : p
+            ));
           }
         } else if (msg.type === 'done') {
           setCurrentPhase('done');
@@ -642,12 +795,20 @@ export default function TrainingPage() {
           fetch(`${API}/api/profiles`).then(r => r.ok ? r.json() : null).then(d => { if (d) setProfiles(d); }).catch(() => {});
           closeWs();
         } else if (msg.type === 'error') {
-          setJobState('failed');
-          jobStateRef.current = 'failed';
           const t = msg.message ?? 'Unknown error';
-          setErrorMsg(t);
-          appendLog(`ERROR: ${t}`);
-          closeWs();
+          // User-cancel is not a terminal failure — the pipeline continues to
+          // save the checkpoint and build the index. Keep the WS open and stay
+          // in 'running' state so subsequent log/done messages are received.
+          const isCancel = t.toLowerCase().includes('cancelled');
+          if (isCancel) {
+            appendLog(`⚠ ${t}`);
+          } else {
+            setJobState('failed');
+            jobStateRef.current = 'failed';
+            setErrorMsg(t);
+            appendLog(`ERROR: ${t}`);
+            closeWs();
+          }
         }
       } catch { /* malformed JSON */ }
     };
@@ -695,12 +856,15 @@ export default function TrainingPage() {
           const hwData: HardwareInfo = await hwRes.json();
           if (!cancelled) {
             setHw(hwData);
+            // Only apply hardware recommendation when no job is running —
+            // on reconnect, the running job's batch size is restored below.
             setBatchSize(hwData.sweet_spot_batch_size);
           }
         }
 
         // Check every profile for a running job; pick the first one found.
         let resumedId: string | null = null;
+        let resumedStatus: { total_epoch?: number; batch_size?: number } = {};
         for (const p of data) {
           try {
             const sRes = await fetch(`${API}/api/training/status/${p.id}`);
@@ -711,6 +875,7 @@ export default function TrainingPage() {
                 (s.phase === 'train' || s.phase === 'preprocess' || s.phase === 'extract_f0' || s.phase === 'extract_feature' || s.phase === 'index')
               ) {
                 resumedId = p.id;
+                resumedStatus = { total_epoch: s.total_epoch, batch_size: s.batch_size };
                 break;
               }
             }
@@ -724,6 +889,10 @@ export default function TrainingPage() {
           setSelectedId(resumedId);
           setJobState('running');
           jobStateRef.current = 'running';
+          // Restore the exact epochs + batch size from the running job so the
+          // UI shows the correct values instead of defaults/hardware suggestions.
+          if (resumedStatus.total_epoch != null) setEpochs(resumedStatus.total_epoch);
+          if (resumedStatus.batch_size   != null) setBatchSize(resumedStatus.batch_size);
           appendLog(`(reconnected — training for profile ${data.find(p => p.id === resumedId)?.name ?? resumedId} already in progress)`);
           attachWs(resumedId);
         } else if (data.length) {
@@ -765,7 +934,7 @@ export default function TrainingPage() {
       const res = await fetch(`${API}/api/training/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainEnabled ? overtrainThreshold : 0, c_spk: speakerLossWeight }),
+        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainEnabled ? overtrainThreshold : 0, c_spk: lossMode === 'classic' ? 0 : speakerLossWeight, loss_mode: lossMode, adv_loss: advLoss, kl_anneal: klAnneal, kl_anneal_epochs: klAnnealEpochs, optimizer }),
       });
 
       if (res.status === 409) {
@@ -802,10 +971,10 @@ export default function TrainingPage() {
         body: JSON.stringify({ profile_id: selectedId }),
       });
     } catch { /* best-effort */ }
-    closeWs();
-    setJobState('idle');
-    jobStateRef.current = 'idle';
-    appendLog('(training cancelled)');
+    // Do NOT close the WS here — the pipeline continues (index build +
+    // artifact save) and will send log messages and a final 'done' event.
+    // The 'done' handler will close the WS and set state to 'done'.
+    appendLog('(cancel requested — waiting for checkpoint save and index build…)');
   }
 
   const isRunning = jobState === 'running';
@@ -893,9 +1062,9 @@ export default function TrainingPage() {
                   <span className="text-cyan-400">⟳</span> Epochs
                 </label>
                 <input
-                  type="number" value={epochs} min={1} max={200}
+                  type="number" value={epochs} min={1} max={1000}
                   disabled={isRunning}
-                  onChange={(e) => setEpochs(Math.max(1, Math.min(200, Number(e.target.value))))}
+                  onChange={(e) => setEpochs(Math.max(1, Math.min(1000, Number(e.target.value))))}
                   className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
                              font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
                              disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
@@ -980,30 +1149,179 @@ export default function TrainingPage() {
                   </span>
                 </div>
 
-                {/* Speaker Loss Weight */}
-                <div className="flex flex-col gap-2 min-w-[180px]">
-                  <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
-                    <span className="text-pink-400">🎤</span> Speaker Loss Weight (c_spk)
-                  </label>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="range" value={speakerLossWeight} min={0} max={3} step={0.5}
-                      disabled={isRunning}
-                      onChange={(e) => setSpeakerLossWeight(Number(e.target.value))}
-                      className="flex-1 accent-pink-600"
-                    />
-                    <span className="text-[13px] font-mono text-pink-300 w-8 text-right">
-                      {speakerLossWeight === 0 ? 'off' : speakerLossWeight.toFixed(1)}
-                    </span>
-                  </div>
-                  <span className="text-[10px] font-mono text-zinc-600">
-                    {speakerLossWeight === 0
-                      ? 'disabled — no speaker identity loss'
-                      : `ECAPA-TDNN cosine loss · recommended: 2.0–3.0 for voice cloning`}
-                  </span>
+              </div>
+
+              {/* Loss Mode — full-width below the two columns */}
+              <div className="flex flex-col gap-2 pt-3 border-t border-zinc-800/60">
+                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+                  Training Objective
+                </label>
+                <div className="flex flex-col gap-1.5">
+                  {([
+                    {
+                      value: 'classic' as const,
+                      label: 'Classic',
+                      color: 'text-cyan-400',
+                      dot: 'bg-cyan-500',
+                      desc: 'Mel + KL + adversarial + feature matching. Standard RVC training — best for most use cases.',
+                    },
+                    {
+                      value: 'combined' as const,
+                      label: 'Combined',
+                      color: 'text-violet-400',
+                      dot: 'bg-violet-500',
+                      desc: 'Classic + ECAPA speaker identity loss. Adds explicit speaker similarity pressure on top of standard training.',
+                    },
+                  ] as const).map(opt => {
+                    const active = lossMode === opt.value;
+                    return (
+                      <button
+                        key={opt.value}
+                        disabled={isRunning}
+                        onClick={() => setLossMode(opt.value)}
+                        className={`flex items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-colors border
+                          ${active
+                            ? 'border-zinc-600 bg-zinc-800/80'
+                            : 'border-zinc-800 bg-zinc-900/40 hover:bg-zinc-800/40'
+                          } ${isRunning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                      >
+                        {/* Radio dot */}
+                        <span className="mt-0.5 w-3.5 h-3.5 rounded-full border-2 shrink-0 flex items-center justify-center
+                          border-zinc-500"
+                          style={{ borderColor: active ? undefined : undefined }}
+                        >
+                          {active && <span className={`w-1.5 h-1.5 rounded-full ${opt.dot}`} />}
+                        </span>
+                        <span className="flex flex-col gap-0.5">
+                          <span className={`text-[12px] font-mono font-semibold ${active ? opt.color : 'text-zinc-400'}`}>
+                            {opt.label}
+                          </span>
+                          <span className="text-[10px] font-mono text-zinc-500 leading-relaxed">
+                            {opt.desc}
+                          </span>
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
 
+                {/* c_spk slider — only visible for combined */}
+                {lossMode === 'combined' && (
+                  <div className="flex items-center gap-3 mt-1 pl-1">
+                    <span className="text-[10px] font-mono text-zinc-500 shrink-0 w-20">
+                      c_spk weight
+                    </span>
+                    <input
+                      type="range"
+                      min={1} max={5} step={0.5}
+                      value={speakerLossWeight}
+                      disabled={isRunning}
+                      onChange={e => setSpeakerLossWeight(Number(e.target.value))}
+                      className="flex-1 accent-pink-500"
+                    />
+                    <span className="text-[12px] font-mono text-pink-300 w-6 text-right">
+                      {speakerLossWeight.toFixed(1)}
+                    </span>
+                    <span className="text-[10px] font-mono text-zinc-600 shrink-0">
+                      recommended 2–3
+                    </span>
+                  </div>
+                )}
               </div>
+
+              {/* Adversarial Loss */}
+              <div className="flex flex-col gap-2 pt-3 border-t border-zinc-800/60">
+                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+                  Adversarial Loss
+                </label>
+                <div className="flex gap-2">
+                  {([
+                    { value: 'lsgan' as const, label: 'LSGAN', color: 'text-sky-400', desc: 'Least-squares GAN — original RVC. Stable baseline, can stall if discriminator dominates early.' },
+                    { value: 'tprls' as const, label: 'TPRLS', color: 'text-amber-400', desc: 'Truncated Paired Relative LS — median-centering reduces mode collapse. Better when training from scratch or at low batch size.' },
+                  ] as const).map(opt => {
+                    const active = advLoss === opt.value;
+                    return (
+                      <button
+                        key={opt.value}
+                        disabled={isRunning}
+                        onClick={() => setAdvLoss(opt.value)}
+                        className={`flex-1 flex flex-col gap-1 rounded-lg px-3 py-2.5 text-left transition-colors border
+                          ${active ? 'border-zinc-600 bg-zinc-800/80' : 'border-zinc-800 bg-zinc-900/40 hover:bg-zinc-800/40'}
+                          ${isRunning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                      >
+                        <span className={`text-[12px] font-mono font-semibold ${active ? opt.color : 'text-zinc-400'}`}>{opt.label}</span>
+                        <span className="text-[10px] font-mono text-zinc-500 leading-relaxed">{opt.desc}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* KL Annealing */}
+              <div className="flex flex-col gap-2 pt-3 border-t border-zinc-800/60">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+                    KL Annealing
+                  </label>
+                  <button
+                    disabled={isRunning}
+                    onClick={() => setKlAnneal(v => !v)}
+                    className={`relative w-9 h-5 rounded-full transition-colors shrink-0
+                      ${klAnneal ? 'bg-emerald-600' : 'bg-zinc-700'}
+                      ${isRunning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform
+                      ${klAnneal ? 'translate-x-4' : 'translate-x-0'}`} />
+                  </button>
+                </div>
+                <span className="text-[10px] font-mono text-zinc-500 leading-relaxed">
+                  Ramps KL weight 0→1 over N epochs then repeats. Prevents posterior collapse in early training.
+                </span>
+                {klAnneal && (
+                  <div className="flex items-center gap-3 mt-0.5">
+                    <span className="text-[10px] font-mono text-zinc-500 shrink-0 w-20">cycle epochs</span>
+                    <input
+                      type="range"
+                      min={10} max={100} step={5}
+                      value={klAnnealEpochs}
+                      disabled={isRunning}
+                      onChange={e => setKlAnnealEpochs(Number(e.target.value))}
+                      className="flex-1 accent-emerald-500"
+                    />
+                    <span className="text-[12px] font-mono text-emerald-300 w-8 text-right">{klAnnealEpochs}</span>
+                    <span className="text-[10px] font-mono text-zinc-600 shrink-0">recommended 30–50</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Optimizer */}
+              <div className="flex flex-col gap-2 pt-3 border-t border-zinc-800/60">
+                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+                  Optimizer
+                </label>
+                <div className="flex gap-2">
+                  {([
+                    { value: 'adamw' as const, label: 'AdamW', color: 'text-sky-400', desc: 'Standard adaptive optimizer. Best default for most fine-tuning runs.' },
+                    { value: 'adamspd' as const, label: 'AdamSPD', color: 'text-violet-400', desc: 'Adam + Selective Projection Decay. Pulls weights toward pretrain anchor when gradient would increase drift. Reduces catastrophic forgetting on short runs.' },
+                  ] as const).map(opt => {
+                    const active = optimizer === opt.value;
+                    return (
+                      <button
+                        key={opt.value}
+                        disabled={isRunning}
+                        onClick={() => setOptimizer(opt.value)}
+                        className={`flex-1 flex flex-col gap-1 rounded-lg px-3 py-2.5 text-left transition-colors border
+                          ${active ? 'border-zinc-600 bg-zinc-800/80' : 'border-zinc-800 bg-zinc-900/40 hover:bg-zinc-800/40'}
+                          ${isRunning ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                      >
+                        <span className={`text-[12px] font-mono font-semibold ${active ? opt.color : 'text-zinc-400'}`}>{opt.label}</span>
+                        <span className="text-[10px] font-mono text-zinc-500 leading-relaxed">{opt.desc}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
             </div>
 
             {/* Actions */}
@@ -1051,9 +1369,20 @@ export default function TrainingPage() {
             <div className="bg-zinc-950 rounded-lg p-3 border border-zinc-800">
               <LossChart
                 points={epochPoints}
-                totalEpochs={isRunning
-                  ? Math.max(epochPoints.length > 0 ? epochPoints[epochPoints.length - 1].epoch : 0, epochs)
-                  : undefined}
+                totalEpochs={(() => {
+                  const sel = profiles.find(p => p.id === selectedId);
+                  const priorEpochs = sel?.total_epochs_trained ?? 0;
+                  // When running: domain extends to absolute target (prior + new)
+                  // When idle: domain = max epoch actually recorded
+                  if (isRunning) {
+                    return Math.max(
+                      epochPoints.length > 0 ? epochPoints[epochPoints.length - 1].epoch : 0,
+                      priorEpochs + epochs,
+                    );
+                  }
+                  return undefined; // LossChart falls back to max(points.epoch)
+                })()}
+                bestEpoch={profiles.find(p => p.id === selectedId)?.best_epoch ?? null}
               />
             </div>
           </section>

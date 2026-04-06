@@ -68,17 +68,21 @@ _WINDOW = 160              # HuBERT/RMVPE hop size in samples at 16kHz
 _BLOCK_48K = 9600          # 200ms output block at 48kHz (matches offline; better gate hold coverage)
 _EXTRA_TIME = 2.0          # seconds of historical context fed to the model
 _ZC = _SR_48K // 100       # zero-crossing unit = 10ms at 48kHz = 480 samples
-_SOLA_BUF_48K = 2 * _ZC   # 20ms SOLA crossfade buffer
-_SOLA_SEARCH_48K = _ZC     # 10ms search window for best alignment offset
+_SOLA_BUF_MS_DEFAULT = 20  # ms — default SOLA crossfade buffer length (configurable at runtime)
+_SOLA_SEARCH_48K = _ZC     # 10ms search window for best alignment offset (fixed)
 
 
 def _compute_block_params(block_48k: int = _BLOCK_48K, extra_time: float = _EXTRA_TIME,
-                          tgt_sr: int = _SR_48K) -> dict:
+                          tgt_sr: int = _SR_48K,
+                          sola_buf_ms: int = _SOLA_BUF_MS_DEFAULT) -> dict:
     """Compute all buffer sizes needed by the audio loop.
 
     All SOLA sizes are computed in tgt_sr space (matching the offline pipeline).
     rtrvc.infer() returns samples at tgt_sr, so return_length_frames must be
     derived from tgt_sr-space block sizes — not 48kHz sizes.
+
+    sola_buf_ms: SOLA crossfade buffer in milliseconds (0 = SOLA disabled).
+                 Configurable at session start and hot-updated at runtime.
     """
     block_16k = int(block_48k * _SR_16K / _SR_48K)
 
@@ -88,11 +92,15 @@ def _compute_block_params(block_48k: int = _BLOCK_48K, extra_time: float = _EXTR
     total_16k_samples = extra_16k + f0_extractor_frame
     p_len = total_16k_samples // _WINDOW
 
+    # Derive 48k sola_buf from the ms parameter (clamped to valid range)
+    sola_buf_ms_clamped = max(0, min(sola_buf_ms, 50))
+    sola_buf_48k = int(sola_buf_ms_clamped * _SR_48K / 1000)  # 0 or 480/960/1440/1920/2400
+
     # Convert 48k block/SOLA sizes to tgt_sr space — this is what rtrvc.infer()
     # actually produces. Using 48k here caused the SR mismatch bug.
-    block_tgt       = int(block_48k       * tgt_sr / _SR_48K)
-    sola_buf_tgt    = int(_SOLA_BUF_48K   * tgt_sr / _SR_48K)
-    sola_search_tgt = int(_SOLA_SEARCH_48K * tgt_sr / _SR_48K)
+    block_tgt       = int(block_48k  * tgt_sr / _SR_48K)
+    sola_buf_tgt    = int(sola_buf_48k         * tgt_sr / _SR_48K)
+    sola_search_tgt = int(_SOLA_SEARCH_48K     * tgt_sr / _SR_48K)
 
     # return_length in 16kHz frames: how many tgt_sr samples do we need?
     # rtrvc output = return_length * _WINDOW * (tgt_sr / _SR_16K)
@@ -118,7 +126,7 @@ def _compute_block_params(block_48k: int = _BLOCK_48K, extra_time: float = _EXTR
         "return_length_frames": return_length_frames,
         "skip_head_frames":     skip_head_frames,
         # keep 48k versions for stream_out blocksize and waveform emit
-        "sola_buf_48k":         _SOLA_BUF_48K,
+        "sola_buf_48k":         sola_buf_48k,
         "sola_search_48k":      _SOLA_SEARCH_48K,
     }
 
@@ -223,6 +231,8 @@ def run_worker(
     protect: float,
     silence_threshold_db: float = -55.0,
     output_gain: float = 1.0,
+    noise_reduction: bool = True,
+    sola_crossfade_ms: int = _SOLA_BUF_MS_DEFAULT,
     save_path: str | None = None,
     model_path: str | None = None,
     index_path: str | None = None,
@@ -333,7 +343,8 @@ def run_worker(
         # tgt_sr is model-specific (32kHz for our 32k models).
         # ALL SOLA buffer sizes must be in tgt_sr space to match rtrvc.infer() output.
         tgt_sr = rvc.tgt_sr
-        block_params = _compute_block_params(_BLOCK_48K, tgt_sr=tgt_sr)
+        block_params = _compute_block_params(_BLOCK_48K, tgt_sr=tgt_sr,
+                                             sola_buf_ms=sola_crossfade_ms)
 
         # ------------------------------------------------------------------
         # Patch rvc._get_f0: pad pitch/pitchf at head to match p_len.
@@ -373,6 +384,28 @@ def run_worker(
             protect,
         )
         del _silence_warmup
+
+        # ── pyrnnoise setup ───────────────────────────────────────────────
+        # Initialised unconditionally so the state is always ready; the flag
+        # noise_reduction controls whether it runs each block.
+        _rnn_state = None
+        _rnn_process_frame = None
+        _rnn_destroy = None
+        _rnn_frame_size = 480   # Xiph RNNoise fixed frame size at 48kHz
+        try:
+            from pyrnnoise.rnnoise import (
+                create as _rnn_create,
+                destroy as _rnn_destroy,
+                process_mono_frame as _rnn_process_frame,
+                FRAME_SIZE as _rnn_frame_size,
+            )
+            _rnn_state = _rnn_create()
+        except Exception as _rnn_err:
+            # pyrnnoise unavailable — noise_reduction will be silently disabled
+            noise_reduction = False
+            logging.getLogger("rvc_web.worker").warning(
+                "pyrnnoise unavailable — noise reduction disabled: %s", _rnn_err
+            )
 
         import sounddevice as sd
         from torchaudio.transforms import Resample as _Resample
@@ -490,8 +523,11 @@ def run_worker(
         #     it would cause a pop/click when speech resumes.
         # ------------------------------------------------------------------
         sola_buf  = _torch.zeros(sola_buf_tgt, dtype=_torch.float32, device=infer_device)
-        fade_in   = _torch.sin(0.5 * np.pi * _torch.linspace(
-                        0., 1., sola_buf_tgt, device=infer_device)) ** 2
+        if sola_buf_tgt > 0:
+            fade_in   = _torch.sin(0.5 * np.pi * _torch.linspace(
+                            0., 1., sola_buf_tgt, device=infer_device)) ** 2
+        else:
+            fade_in   = _torch.zeros(0, device=infer_device)
         fade_out  = 1.0 - fade_in
 
         # Minimum inference output needed to run SOLA
@@ -519,6 +555,29 @@ def run_worker(
                             _rms_window.extend([0.0] * _RMS_WIN)
                         if "output_gain" in msg:
                             output_gain = float(msg["output_gain"])
+                        if "noise_reduction" in msg:
+                            noise_reduction = bool(msg["noise_reduction"])
+                        if "sola_crossfade_ms" in msg:
+                            _new_ms = int(msg["sola_crossfade_ms"])
+                            _new_ms = max(0, min(_new_ms, 50))
+                            _new_buf_48k = int(_new_ms * _SR_48K / 1000)
+                            _new_buf_tgt = int(_new_buf_48k * tgt_sr / _SR_48K)
+                            if _new_buf_tgt != sola_buf_tgt:
+                                # Resize SOLA state tensors in-place
+                                # Reset sola_buf to zeros on resize to avoid
+                                # a click from mismatched-length crossfade
+                                sola_buf_tgt    = _new_buf_tgt
+                                sola_search_tgt = block_params["sola_search_tgt"]
+                                sola_buf  = _torch.zeros(sola_buf_tgt, dtype=_torch.float32,
+                                                          device=infer_device)
+                                if sola_buf_tgt > 0:
+                                    fade_in  = _torch.sin(0.5 * np.pi * _torch.linspace(
+                                                  0., 1., sola_buf_tgt, device=infer_device)) ** 2
+                                    fade_out = 1.0 - fade_in
+                                else:
+                                    fade_in  = _torch.zeros(0, device=infer_device)
+                                    fade_out = _torch.zeros(0, device=infer_device)
+                                _min_infer_len = block_tgt + sola_buf_tgt + sola_search_tgt
             except Exception:
                 pass
 
@@ -533,6 +592,26 @@ def run_worker(
 
             x_in   = data.squeeze()
             x_in_t = _torch.from_numpy(x_in).to(infer_device)
+
+            # ── pyrnnoise denoising (input at 48kHz, in-place on x_in_t) ─
+            # Process before resampling so the denoiser always operates at its
+            # native 48kHz.  The GRU state persists across blocks for continuity.
+            # We work on CPU numpy (RNNoise C API), then move back to infer_device.
+            if noise_reduction and _rnn_state is not None and _rnn_process_frame is not None:
+                _rnn_pcm = x_in_t.cpu().numpy()  # float32 [-1,1], length=block_native_in
+                # Pad to multiple of _rnn_frame_size if needed
+                _rnn_pad = (-len(_rnn_pcm)) % _rnn_frame_size
+                if _rnn_pad:
+                    _rnn_pcm = np.concatenate([_rnn_pcm, np.zeros(_rnn_pad, dtype=np.float32)])
+                _rnn_out_frames = []
+                for _fi in range(0, len(_rnn_pcm), _rnn_frame_size):
+                    _rnn_frame_out, _ = _rnn_process_frame(
+                        _rnn_state, _rnn_pcm[_fi:_fi + _rnn_frame_size]
+                    )
+                    _rnn_out_frames.append(_rnn_frame_out.astype(np.float32) / 32767.0)
+                _rnn_denoised = np.concatenate(_rnn_out_frames)[:len(x_in)]
+                x_in_t = _torch.from_numpy(_rnn_denoised).to(infer_device)
+
             x_16k_t = _resample_in_16(x_in_t.unsqueeze(0)).squeeze(0)
 
             # ── update rolling 16k buffer (circular shift) ────────────────
@@ -607,27 +686,29 @@ def run_worker(
                 pad = _min_infer_len - infer_wav.shape[0]
                 infer_wav = _F.pad(infer_wav, (0, pad))
 
-            search_len = sola_buf_tgt + sola_search_tgt
-            conv_input = infer_wav[None, None, :search_len]
-            cor_nom = _F.conv1d(conv_input, sola_buf[None, None, :])
-            cor_den = _torch.sqrt(
-                _F.conv1d(conv_input ** 2,
-                           _torch.ones(1, 1, sola_buf_tgt, device=infer_device))
-                + 1e-8
-            )
-            sola_offset = int(_torch.argmax(cor_nom[0, 0] / cor_den[0, 0]).item())
-            infer_wav = infer_wav[sola_offset:]
-            infer_wav[:sola_buf_tgt] = (infer_wav[:sola_buf_tgt] * fade_in
-                                        + sola_buf * fade_out)
-            # Update sola_buf from tail of this block
-            tail_end = block_tgt + sola_buf_tgt
-            if infer_wav.shape[0] >= tail_end:
-                sola_buf[:] = infer_wav[block_tgt:tail_end]
-            else:
-                available = infer_wav.shape[0] - block_tgt
-                if available > 0:
-                    sola_buf[:available] = infer_wav[block_tgt:]
-                sola_buf[max(0, available):] = 0.0
+            if sola_buf_tgt > 0:
+                search_len = sola_buf_tgt + sola_search_tgt
+                conv_input = infer_wav[None, None, :search_len]
+                cor_nom = _F.conv1d(conv_input, sola_buf[None, None, :])
+                cor_den = _torch.sqrt(
+                    _F.conv1d(conv_input ** 2,
+                               _torch.ones(1, 1, sola_buf_tgt, device=infer_device))
+                    + 1e-8
+                )
+                sola_offset = int(_torch.argmax(cor_nom[0, 0] / cor_den[0, 0]).item())
+                infer_wav = infer_wav[sola_offset:]
+                infer_wav[:sola_buf_tgt] = (infer_wav[:sola_buf_tgt] * fade_in
+                                            + sola_buf * fade_out)
+                # Update sola_buf from tail of this block
+                tail_end = block_tgt + sola_buf_tgt
+                if infer_wav.shape[0] >= tail_end:
+                    sola_buf[:] = infer_wav[block_tgt:tail_end]
+                else:
+                    available = infer_wav.shape[0] - block_tgt
+                    if available > 0:
+                        sola_buf[:available] = infer_wav[block_tgt:]
+                    sola_buf[max(0, available):] = 0.0
+            # sola_buf_tgt == 0: SOLA disabled — pass infer_wav straight through
 
             if _gate_gain == 0.0:
                 # Gate closed — output silence; sola_buf already updated above
@@ -705,6 +786,13 @@ def run_worker(
             audio_in_save_q.put(_SAVE_SENTINEL)
             if save_in_t is not None:
                 save_in_t.join(timeout=30)
+
+        # Release pyrnnoise GRU state
+        try:
+            if _rnn_state is not None and _rnn_destroy is not None:
+                _rnn_destroy(_rnn_state)
+        except Exception:
+            pass
 
         try:
             stream_in.stop(); stream_in.close()   # noqa: F821

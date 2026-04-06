@@ -108,6 +108,19 @@ _MIGRATIONS: list[tuple[str, str]] = [
     # Epoch number and avg-generator-loss of the best epoch, for display.
     ("best_epoch", "INTEGER"),
     ("best_avg_gen_loss", "REAL"),
+    # Adversarial loss type: "lsgan" (default, original RVC) or "tprls"
+    # (Truncated Paired Relative Least Squares — more stable when discriminator
+    # dominates early training).  Not locked — can be changed between runs.
+    ("adv_loss", "TEXT NOT NULL DEFAULT 'lsgan'"),
+    # Cyclic KL annealing: ramps kl_beta 0→1 over kl_anneal_epochs then repeats,
+    # preventing posterior collapse in the first N epochs of each cycle.
+    # 0 = disabled (kl_beta = 1.0 always).
+    ("kl_anneal", "INTEGER NOT NULL DEFAULT 0"),
+    ("kl_anneal_epochs", "INTEGER NOT NULL DEFAULT 40"),
+    # Optimizer: "adamw" (default) or "adamspd" (Adam with Selective Projection
+    # Decay — applies stiffness penalty toward pretrain anchor weights to limit
+    # catastrophic forgetting).  Not locked — can be changed between runs.
+    ("optimizer", "TEXT NOT NULL DEFAULT 'adamw'"),
 ]
 
 # Migrations for epoch_losses table

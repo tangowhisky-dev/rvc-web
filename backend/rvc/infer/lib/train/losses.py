@@ -28,6 +28,7 @@ def feature_loss(fmap_r, fmap_g):
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    """LSGAN discriminator loss: MSE toward 1 (real) and 0 (fake)."""
     loss = 0
     r_losses = []
     g_losses = []
@@ -44,6 +45,7 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
 
 
 def generator_loss(disc_outputs):
+    """LSGAN generator loss: MSE toward 1 (fool discriminator)."""
     loss = 0
     gen_losses = []
     for dg in disc_outputs:
@@ -53,6 +55,52 @@ def generator_loss(disc_outputs):
         loss += l
 
     return loss, gen_losses
+
+
+def discriminator_tprls_loss(disc_real_outputs, disc_generated_outputs):
+    """TPRLS discriminator loss (Truncated Paired Relative Least Squares).
+
+    More robust than LSGAN when the discriminator dominates early training.
+    Uses median-centering to reduce mode-collapse risk.
+    Reference: codename-rvc-fork-4/rvc/train/losses.py
+    """
+    loss = 0
+    tau = 0.04
+    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+        dr = dr.float()
+        dg = dg.float()
+        m_DG = torch.median(dr - dg)
+        diff = (dr - dg) - m_DG
+        mask = dr < (dg + m_DG)
+        masked = diff[mask]
+        L_rel = (
+            torch.mean(masked ** 2)
+            if masked.numel() > 0
+            else torch.tensor(0.0, device=dr.device)
+        )
+        loss += tau - F.relu(tau - L_rel)
+    return loss
+
+
+def generator_tprls_loss(disc_real_outputs, disc_generated_outputs):
+    """TPRLS generator loss — paired with discriminator_tprls_loss."""
+    loss = 0
+    tau = 0.04
+    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+        dr = dr.float()
+        dg = dg.float()
+        diff = dg - dr
+        m_DG = torch.median(diff)
+        rel = diff - m_DG
+        mask = diff < m_DG
+        masked = rel[mask]
+        L_rel = (
+            torch.mean(masked ** 2)
+            if masked.numel() > 0
+            else torch.tensor(0.0, device=dg.device)
+        )
+        loss += tau - F.relu(tau - L_rel)
+    return loss
 
 
 def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):

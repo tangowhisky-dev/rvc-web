@@ -77,7 +77,7 @@ printt(" ".join(sys.argv))
 def _default_embedder_path() -> str:
     project_root = os.environ.get("PROJECT_ROOT", "")
     if project_root:
-        candidate = os.path.join(project_root, "assets", "embedders", "spin-v2")
+        candidate = os.path.join(project_root, "assets", "spin-v2")
         if os.path.isdir(candidate):
             return candidate
         # Legacy fairseq hubert fallback
@@ -85,7 +85,7 @@ def _default_embedder_path() -> str:
     # Relative fallback when PROJECT_ROOT is not set (shouldn't happen in prod)
     return os.path.join(
         os.path.dirname(__file__),
-        "..", "..", "..", "..", "..", "assets", "embedders", "spin-v2",
+        "..", "..", "..", "..", "..", "assets", "spin-v2",
     )
 
 if embedder_path is None:
@@ -167,7 +167,7 @@ else:
         printt(
             "Error: Extracting is shut down because %s does not exist" % embedder_path
         )
-        exit(0)
+        exit(1)
     try:
         import fairseq
         from fairseq.data.dictionary import Dictionary

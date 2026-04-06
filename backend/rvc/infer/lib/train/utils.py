@@ -70,7 +70,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
 
 def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path):
     logger.info(
-        "Saving model and optimizer state at epoch {} to {}".format(
+        "Saving model & optimizer state at epoch {} to {}".format(
             iteration, checkpoint_path
         )
     )
@@ -288,6 +288,14 @@ def get_hparams(init=True):
         "-emb", "--embedder", type=str, default="spin-v2",
         help="Feature embedder: spin-v2, spin, contentvec, or hubert",
     )
+    parser.add_argument(
+        "-pid", "--profile_id", type=str, default="",
+        help="Profile UUID for direct DB writes (best_epoch, epoch_losses)",
+    )
+    parser.add_argument(
+        "-db", "--db_path", type=str, default="",
+        help="Absolute path to rvc.db for direct DB writes",
+    )
 
     args = parser.parse_args()
     # If the caller passes an absolute path, use it directly and derive the
@@ -323,6 +331,8 @@ def get_hparams(init=True):
     hparams.author = args.author
     hparams.vocoder = args.vocoder
     hparams.embedder = args.embedder
+    hparams.profile_id = args.profile_id
+    hparams.db_path = args.db_path
     return hparams
 
 
