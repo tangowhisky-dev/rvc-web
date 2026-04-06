@@ -171,7 +171,12 @@ class SineGenerator(nn.Module):
             noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
             noise = noise_amp * torch.randn_like(sine_waves)
             sine_waves = sine_waves * uv + noise
-        return self.merge(sine_waves)
+        # Cast to the model's dtype before entering the learnable merge layer.
+        # sine_waves is always float32 (generated from float32 f0 cache) but
+        # the Linear weight is fp16 when the model runs in half precision.
+        # NSF-HiFi-GAN handles this with an explicit .to(x.dtype); we do the
+        # same here.
+        return self.merge(sine_waves.to(self.merge[0].weight.dtype))
 
 
 # ---------------------------------------------------------------------------
