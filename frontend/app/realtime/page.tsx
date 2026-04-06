@@ -35,6 +35,7 @@ interface SessionParams {
   silence_threshold_db: number;
   output_gain: number;
   noise_reduction: boolean;
+  noise_reduction_output: boolean;
   sola_crossfade_ms: number;
 }
 
@@ -46,7 +47,7 @@ type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 const WS_BASE = (API ?? 'http://localhost:8000').replace('http://', 'ws://').replace('https://', 'wss://');
-const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.50, protect: 0.33, silence_threshold_db: -55, output_gain: 1.0, noise_reduction: true, sola_crossfade_ms: 20 };
+const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.50, protect: 0.33, silence_threshold_db: -55, output_gain: 1.0, noise_reduction: true, noise_reduction_output: false, sola_crossfade_ms: 20 };
 
 // ---------------------------------------------------------------------------
 // Utility: find default device by name fragment
@@ -936,6 +937,31 @@ export default function RealtimePage() {
                   <span
                     className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
                       params.noise_reduction ? 'translate-x-6' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+
+              {/* Output Noise Reduction toggle */}
+              <div className="flex-1 flex items-center justify-between px-1 py-2 rounded-lg bg-zinc-900/60 border border-zinc-800">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">Output NR</span>
+                  <span className="text-[11px] text-zinc-500">
+                    {params.noise_reduction_output
+                      ? 'RNNoise on output — vocoder noise floor suppressed (+~10ms)'
+                      : 'Disabled — raw model output to speakers'}
+                  </span>
+                </div>
+                <button
+                  onClick={() => handleParamChange('noise_reduction_output', !params.noise_reduction_output)}
+                  className={`ml-3 shrink-0 relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
+                    params.noise_reduction_output ? 'bg-cyan-500' : 'bg-zinc-700'
+                  }`}
+                  aria-label="Toggle output noise reduction"
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                      params.noise_reduction_output ? 'translate-x-6' : 'translate-x-1'
                     }`}
                   />
                 </button>
