@@ -278,15 +278,18 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         pass
     elif torch.cuda.is_available():
-        net_g = DDP(net_g, device_ids=[rank])
-        net_d = DDP(net_d, device_ids=[rank])
+        # gradient_as_bucket_view=True: DDP uses the allreduce bucket itself as the
+        # gradient tensor, so stride mismatches from weight_norm's backward hook
+        # (which recomputes weight via a normalisation op) never occur.
+        net_g = DDP(net_g, device_ids=[rank], gradient_as_bucket_view=True)
+        net_d = DDP(net_d, device_ids=[rank], gradient_as_bucket_view=True)
     elif _use_mps:
         # Skip DDP on MPS — allgather/allreduce collectives aren't implemented for MPS.
         # Single-device MPS training doesn't need distributed gradient sync at all.
         pass  # net_g and net_d stay as plain modules on MPS device
     else:
-        net_g = DDP(net_g)
-        net_d = DDP(net_d)
+        net_g = DDP(net_g, gradient_as_bucket_view=True)
+        net_d = DDP(net_d, gradient_as_bucket_view=True)
 
     try:  # 如果能加载自动resume
         _, _, _, epoch_str = utils.load_checkpoint(
