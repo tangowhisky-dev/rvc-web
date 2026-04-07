@@ -9,7 +9,7 @@
 #                per speaker, e.g.:
 #                  my_data/alice/recording.mp3
 #                Any audio format (wav, mp3, flac, m4a, …) is accepted.
-#                Long files (>15s) are automatically split into 8s WAV chunks
+#                Long files (>15s) are automatically split into 4s WAV chunks
 #                before training. Originals are moved to _originals/ subfolders.
 #   -o DIR       Output directory (checkpoints saved here)
 #   -r           Resume from checkpoint_latest.pt.gz in output dir
@@ -72,9 +72,9 @@ if [[ ! -f "$TRAINER_DIR/assets/pretrained/122_checkpoint_03000000.pt" ]]; then
     python3 "$SCRIPT_DIR/download_assets.py"
 fi
 
-# ---- preprocess: split long files into 8s chunks ----
+# ---- preprocess: split long files into 4s chunks ----
 if [[ -z "$SKIP_PREPROCESS" ]]; then
-    echo "Preprocessing: splitting long audio files into 8s chunks..."
+    echo "Preprocessing: splitting long audio files into 4s chunks..."
     python3 "$SCRIPT_DIR/preprocess.py" --data-dir "$DATA_DIR"
     echo ""
 fi

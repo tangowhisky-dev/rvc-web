@@ -54,3 +54,8 @@ test_*.py
 /models
 /assets
 /logs
+/my_data
+/output
+/beatrice/assets
+/temp
+/temp
