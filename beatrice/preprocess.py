@@ -12,8 +12,8 @@ Usage:
 
 Options:
     -d DIR            Data directory (required). Must contain one subdir per speaker.
-    --chunk-duration  Chunk length in seconds (default: 8.0)
-    --max-duration    Files longer than this are split (default: 15.0)
+    --chunk-duration  Chunk length in seconds (default: 4.0, matches trainer wav_length)
+    --max-duration    Files longer than this are split (default: 4.0)
     --sample-rate     Output sample rate in Hz (default: 24000, matches trainer)
     --dry-run         Print what would happen without changing any files
 """
@@ -33,10 +33,10 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-d", "--data-dir", required=True, type=Path,
                    help="Data directory with one subdir per speaker")
-    p.add_argument("--chunk-duration", type=float, default=8.0,
-                   help="Chunk length in seconds (default: 8.0)")
-    p.add_argument("--max-duration", type=float, default=15.0,
-                   help="Files longer than this are split (default: 15.0)")
+    p.add_argument("--chunk-duration", type=float, default=4.0,
+                   help="Chunk length in seconds (default: 4.0, matches trainer wav_length)")
+    p.add_argument("--max-duration", type=float, default=4.0,
+                   help="Files longer than this are split (default: 4.0)")
     p.add_argument("--sample-rate", type=int, default=24000,
                    help="Output sample rate (default: 24000)")
     p.add_argument("--dry-run", action="store_true",
