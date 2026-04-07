@@ -167,7 +167,9 @@ def main():
         description="Download Beatrice 2 pretrained assets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--trainer-dir", default="beatrice/trainer",
+    # Default: trainer/ sibling to this script — works from any cwd
+    _default_trainer = Path(__file__).parent / "trainer"
+    parser.add_argument("--trainer-dir", default=_default_trainer,
                         type=Path, help="Path to beatrice/trainer directory")
     parser.add_argument("--full", action="store_true",
                         help="Download all 1000 IR files (use git lfs pull for full noise set)")
@@ -175,7 +177,7 @@ def main():
                         help="Re-download even if files already exist")
     args = parser.parse_args()
 
-    trainer_dir = args.trainer_dir.resolve()
+    trainer_dir = Path(args.trainer_dir).resolve()
     if not (trainer_dir / "beatrice_trainer/__main__.py").exists():
         print(f"Error: beatrice_trainer/__main__.py not found in {trainer_dir}", file=sys.stderr)
         sys.exit(1)
