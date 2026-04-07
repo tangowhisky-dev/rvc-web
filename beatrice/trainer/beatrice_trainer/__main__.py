@@ -3978,15 +3978,20 @@ def prepare_training():
                 wav = get_resampler(sr, h.in_sample_rate, device)(wav)
             wav = wav[:, None, :]  # [C, 1, T]
             # Yield fixed-length chunks so attention stays O(chunk²) not O(file²).
-            # Pad last chunk to multiple of 160 (PhoneExtractor hop requirement).
+            # Drop the last partial chunk rather than padding: padding injects silence
+            # into the tail receptive field, producing zero-contaminated activations
+            # that degrade k-means codebook quality. Dropping at most 159 samples
+            # (~10ms) per file is negligible.
             T = wav.shape[-1]
             for start in range(0, T, _VQ_CHUNK_SAMPLES):
                 chunk = wav[:, :, start:start + _VQ_CHUNK_SAMPLES]
-                if chunk.shape[-1] == 0:
-                    continue
+                # Truncate to nearest multiple of 160 (FeatureExtractor stride).
+                # A sub-160 chunk produces 0 frames; skip it entirely.
                 rem = chunk.shape[-1] % 160
                 if rem != 0:
-                    chunk = torch.nn.functional.pad(chunk, (0, 160 - rem))
+                    chunk = chunk[..., :chunk.shape[-1] - rem]
+                if chunk.shape[-1] == 0:
+                    continue
                 yield chunk
 
     if resume:
