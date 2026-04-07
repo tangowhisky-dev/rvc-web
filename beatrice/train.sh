@@ -9,14 +9,17 @@
 #                per speaker, e.g.:
 #                  my_data/alice/recording.mp3
 #                Any audio format (wav, mp3, flac, m4a, …) is accepted.
+#                Long files (>15s) are automatically split into 8s WAV chunks
+#                before training. Originals are moved to _originals/ subfolders.
 #   -o DIR       Output directory (checkpoints saved here)
 #   -r           Resume from checkpoint_latest.pt.gz in output dir
 #   -c FILE      Path to custom config JSON
 #   -n INT       Number of training steps (default: 10000)
-#   -b INT       Batch size (default: 8; try 4 if OOM)
+#   -b INT       Batch size (default: 16 for CUDA; try 8 if OOM)
+#   --skip-preprocess  Skip the preprocessing step (data already chunked)
 #
 # Examples:
-#   ./beatrice/train.sh -d my_data/ -o output/beatrice_alice/ -n 2000 -b 8
+#   ./beatrice/train.sh -d my_data/ -o output/beatrice_alice/ -n 10000 -b 16
 #   ./beatrice/train.sh -d my_data/ -o output/beatrice_alice/ -r          # resume
 
 set -euo pipefail
@@ -30,6 +33,7 @@ RESUME=""
 CONFIG=""
 N_STEPS=""
 BATCH_SIZE=""
+SKIP_PREPROCESS=""
 
 # ---- parse args ----
 while [[ $# -gt 0 ]]; do
@@ -40,6 +44,7 @@ while [[ $# -gt 0 ]]; do
         -c) CONFIG="$2"; shift 2;;
         -n) N_STEPS="$2"; shift 2;;
         -b) BATCH_SIZE="$2"; shift 2;;
+        --skip-preprocess) SKIP_PREPROCESS="1"; shift;;
         --device) shift 2;;  # ignored — trainer auto-detects
         -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
         *) echo "Unknown argument: $1"; exit 1;;
@@ -65,6 +70,13 @@ fi
 if [[ ! -f "$TRAINER_DIR/assets/pretrained/122_checkpoint_03000000.pt" ]]; then
     echo "Pretrained assets not found. Downloading..."
     python3 "$SCRIPT_DIR/download_assets.py"
+fi
+
+# ---- preprocess: split long files into 8s chunks ----
+if [[ -z "$SKIP_PREPROCESS" ]]; then
+    echo "Preprocessing: splitting long audio files into 8s chunks..."
+    python3 "$SCRIPT_DIR/preprocess.py" --data-dir "$DATA_DIR"
+    echo ""
 fi
 
 # ---- build config override if -n or -b set ----
@@ -103,7 +115,7 @@ echo "Beatrice 2 fine-tuning"
 echo "  data:   $DATA_DIR"
 echo "  output: $OUT_DIR"
 echo "  steps:  ${N_STEPS:-10000 (default)}"
-echo "  batch:  ${BATCH_SIZE:-8 (default)}"
+echo "  batch:  ${BATCH_SIZE:-16 (default)}"
 echo "============================================================"
 
 cd "$TRAINER_DIR"

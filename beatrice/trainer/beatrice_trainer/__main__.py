@@ -9,7 +9,6 @@ import json
 import math
 import os
 import shutil
-import sys
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
@@ -29,7 +28,6 @@ import torchaudio
 from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, weight_norm
 from torch.utils.tensorboard import SummaryWriter
-from torchcodec.decoders import AudioDecoder as _AudioDecoder
 from tqdm.auto import tqdm
 
 # torchaudio >= 2.1 removed list_audio_backends; with torchcodec installed,
@@ -2313,11 +2311,11 @@ class ConverterNetwork(nn.Module):
             if self.training and self.phone_noise_ratio != 0.0:
                 phone *= (1.0 - self.phone_noise_ratio) / phone.square().mean(
                     1, keepdim=True
-                ).add_(torch.finfo(torch.float).eps).sqrt_()
+                ).sqrt_()
                 noise = torch.randn_like(phone)
                 noise *= (
                     self.phone_noise_ratio
-                    / noise.square().mean(1, keepdim=True).add_(torch.finfo(torch.float).eps).sqrt_()
+                    / noise.square().mean(1, keepdim=True).sqrt_()
                 )
                 phone += noise
             # F.rms_norm は PyTorch >= 2.4 が必要
@@ -3430,7 +3428,7 @@ def augment_audio(
 class WavDataset(torch.utils.data.Dataset):
     def __init__(
         self,
-        audio_files: list[tuple[Path, int, int, int]],
+        audio_files: list[tuple[Path, int]],
         in_sample_rate: int = 16000,
         out_sample_rate: int = 24000,
         wav_length: int = 4 * 24000,  # 4s
@@ -3480,10 +3478,8 @@ class WavDataset(torch.utils.data.Dataset):
         self.out_hop_length = out_sample_rate // 100  # 10ms 刻み
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-        file, speaker_id, frame_offset, num_frames = self.audio_files[index]
-        clean_wav, sample_rate = torchaudio.load(
-            file, frame_offset=frame_offset, num_frames=num_frames
-        )
+        file, speaker_id = self.audio_files[index]
+        clean_wav, sample_rate = torchaudio.load(file)
         if clean_wav.size(0) != 1:
             ch = torch.randint(0, clean_wav.size(0), ())
             clean_wav = clean_wav[ch : ch + 1]
@@ -3533,12 +3529,7 @@ class WavDataset(torch.utils.data.Dataset):
 
         # 音量をランダマイズする
         amplitude = torch.rand(()).item() * 0.899 + 0.1
-        wav_max = clean_wav.abs().max()
-        if wav_max < 1e-6:
-            # Silent chunk (padding region or actual silence) — skip by
-            # returning zeros; collate will reject it via voiced.numel() != 0
-            return None
-        factor = amplitude / wav_max
+        factor = amplitude / clean_wav.abs().max()
         clean_wav *= factor
         noisy_wav_16k *= factor
         while noisy_wav_16k.abs().max() >= 1.0:
@@ -3560,10 +3551,7 @@ class WavDataset(torch.utils.data.Dataset):
         slice_starts = []
         speaker_ids = []
         formant_shifts = []
-        for item in batch:
-            if item is None:
-                continue  # silent chunk — skip
-            clean_wav, noisy_wav, speaker_id, formant_shift = item
+        for clean_wav, noisy_wav, speaker_id, formant_shift in batch:
             # 発声部分をランダムに 1 箇所選ぶ
             (voiced,) = clean_wav.nonzero(as_tuple=True)
             assert voiced.numel() != 0
@@ -3588,11 +3576,6 @@ class WavDataset(torch.utils.data.Dataset):
             slice_starts.append(slice_start)
             speaker_ids.append(speaker_id)
             formant_shifts.append(formant_shift)
-        if not clean_wavs:
-            raise RuntimeError(
-                "collate: entire batch was silent — all chunks had max amplitude < 1e-6. "
-                "Check that your audio files contain actual speech."
-            )
         clean_wavs = torch.stack(clean_wavs)
         noisy_wavs = torch.stack(noisy_wavs)
         slice_starts = torch.tensor(slice_starts)
@@ -3741,7 +3724,7 @@ def prepare_training():
     def get_training_filelist(in_wav_dataset_dir: Path):
         min_data_per_speaker = 1
         speakers: list[str] = []
-        training_filelist: list[tuple[Path, int, int, int]] = []
+        training_filelist: list[tuple[Path, int]] = []
         speaker_audio_files: list[list[Path]] = []
         for speaker_dir in sorted(in_wav_dataset_dir.iterdir()):
             if not speaker_dir.is_dir():
@@ -3757,24 +3740,7 @@ def prepare_training():
             if len(candidates) >= min_data_per_speaker:
                 speaker_id = len(speakers)
                 speakers.append(speaker_dir.name)
-                # Pre-segment each file into wav_length windows at the native
-                # sample rate.  This ensures __getitem__ loads only one window
-                # at a time — long files (e.g. 18-min mp3s) would otherwise
-                # cause the whole-file FFT in convolve() to OOM the worker.
-                for file in candidates:
-                    meta = _AudioDecoder(str(file)).metadata
-                    native_sr = meta.sample_rate
-                    total_frames = int(meta.duration_seconds * native_sr)
-                    # wav_length is in out_sample_rate samples; convert to native
-                    window_frames = int(
-                        h.wav_length * native_sr / h.out_sample_rate
-                    )
-                    if window_frames <= 0 or window_frames > total_frames:
-                        # File shorter than one window — use whole file
-                        training_filelist.append((file, speaker_id, 0, total_frames))
-                    else:
-                        for offset in range(0, total_frames - window_frames + 1, window_frames):
-                            training_filelist.append((file, speaker_id, offset, window_frames))
+                training_filelist.extend([(file, speaker_id) for file in candidates])
                 speaker_audio_files.append(candidates)
         return speakers, training_filelist, speaker_audio_files
 
@@ -3845,23 +3811,11 @@ def prepare_training():
     )
     _is_cuda = torch.cuda.is_available()
     _n_files = len(training_filelist)
-    # DataLoader multiprocessing pickling constraint:
-    # WavDataset is defined in __main__.py. When run as `python3 -m beatrice_trainer`,
-    # __name__ == '__main__' so pickle records WavDataset as '__main__.WavDataset'.
-    # On macOS/Windows the default start method is 'spawn' — spawned workers
-    # run a fresh interpreter, import __main__ as a built-in (not __main__.py),
-    # and can't find WavDataset -> AttributeError.
-    # On Linux the default is 'fork' which copies the parent address space, so
-    # no re-import is needed and pickling works fine.
-    # Solution: use num_workers>0 only on Linux (fork), fall back to 0 elsewhere.
-    # num_workers=0 runs the DataLoader in the main process — no pickling at all.
-    # With 4s pre-segmented chunks, I/O and augmentation are fast enough that
-    # single-process loading doesn't bottleneck training on MPS/CPU/Windows.
-    _linux = sys.platform == "linux"
-    _num_workers = min(h.num_workers, os.cpu_count(), max(1, _n_files)) if _linux else 0
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
-        num_workers=_num_workers,
+        # Cap workers at file count — more workers than files causes StopIteration
+        # before the first batch on small datasets. Also cap at cpu_count.
+        num_workers=min(h.num_workers, os.cpu_count(), max(1, _n_files)),
         collate_fn=training_dataset.collate,
         shuffle=True,
         sampler=None,
@@ -3869,7 +3823,7 @@ def prepare_training():
         # pin_memory only works on CUDA; MPS uses unified memory
         pin_memory=_is_cuda,
         drop_last=True,
-        persistent_workers=_num_workers > 0,
+        persistent_workers=True,
     )
 
     print("Computing mean F0s of target speakers...", end="")
@@ -4023,15 +3977,17 @@ def prepare_training():
             if sr != h.in_sample_rate:
                 wav = get_resampler(sr, h.in_sample_rate, device)(wav)
             wav = wav[:, None, :]  # [C, 1, T]
-            # Yield exact _VQ_CHUNK_SAMPLES chunks only.  _VQ_CHUNK_SAMPLES is
-            # h.wav_length (96000) which is already a multiple of 160, so every
-            # yielded chunk satisfies the FeatureExtractor stride requirement with
-            # no padding or truncation needed.  The last partial chunk (< 96000
-            # samples) is silently dropped — it represents at most ~6s of tail
-            # audio per file, negligible for codebook statistics.
+            # Yield fixed-length chunks so attention stays O(chunk²) not O(file²).
+            # Pad last chunk to multiple of 160 (PhoneExtractor hop requirement).
             T = wav.shape[-1]
-            for start in range(0, T - _VQ_CHUNK_SAMPLES + 1, _VQ_CHUNK_SAMPLES):
-                yield wav[:, :, start:start + _VQ_CHUNK_SAMPLES]
+            for start in range(0, T, _VQ_CHUNK_SAMPLES):
+                chunk = wav[:, :, start:start + _VQ_CHUNK_SAMPLES]
+                if chunk.shape[-1] == 0:
+                    continue
+                rem = chunk.shape[-1] % 160
+                if rem != 0:
+                    chunk = torch.nn.functional.pad(chunk, (0, 160 - rem))
+                yield chunk
 
     if resume:
         net_g.enable_hook()
