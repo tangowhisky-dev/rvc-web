@@ -3811,6 +3811,15 @@ def prepare_training():
     )
     _is_cuda = torch.cuda.is_available()
     _n_files = len(training_filelist)
+    # macOS (and Windows) default to the 'spawn' multiprocessing start method.
+    # Spawned workers re-import __main__ as a built-in and can't unpickle
+    # WavDataset (defined in __main__.py) — AttributeError at startup.
+    # Fix: use 'fork' on non-CUDA platforms. Fork copies the parent address
+    # space directly — no re-import, no pickling of the dataset class needed.
+    # Workers only do CPU work (torchaudio.load, augmentation) so fork is safe.
+    # CUDA is left as platform default (None) because CUDA contexts are not
+    # fork-safe; Linux + CUDA already defaults to 'spawn' intentionally.
+    _mp_context = None if _is_cuda else "fork"
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
         # Cap workers at file count — more workers than files causes StopIteration
@@ -3824,6 +3833,7 @@ def prepare_training():
         pin_memory=_is_cuda,
         drop_last=True,
         persistent_workers=True,
+        multiprocessing_context=_mp_context,
     )
 
     print("Computing mean F0s of target speakers...", end="")
