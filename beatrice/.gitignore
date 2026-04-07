@@ -1,0 +1,14 @@
+# Pretrained model weights (large binary files — download via download_assets.py)
+trainer/assets/pretrained/
+trainer/assets/noise/
+trainer/assets/ir/
+trainer/assets/test/
+
+# Training outputs (checkpoints, paraphernalia dirs)
+output/
+runs/
+**/checkpoint_*.pt
+**/checkpoint_*.pt.gz
+
+# Trainer's own git repo internals
+trainer/.git/
