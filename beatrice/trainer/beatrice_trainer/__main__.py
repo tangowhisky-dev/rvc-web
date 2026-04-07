@@ -3728,6 +3728,7 @@ def prepare_training():
                 if (
                     not wav_file.is_file()
                     or wav_file.suffix.lower() not in AUDIO_FILE_SUFFIXES
+                    or "_originals" in wav_file.parts
                 ):
                     continue
                 candidates.append(wav_file)
