@@ -1,12 +1,17 @@
 """Offline (file-based) voice conversion router.
 
 Endpoints:
-  POST  /api/offline/convert   — convert an uploaded audio file, stream SSE progress
-  GET   /api/offline/result/{job_id}  — download the converted file
-  GET   /api/offline/profiles  — list trained profiles available for inference
+  POST  /api/offline/convert            — convert an uploaded audio file, stream SSE progress
+  GET   /api/offline/result/{job_id}    — download the converted file
+  GET   /api/offline/input/{job_id}     — download the original input file
+  POST  /api/offline/analyze/{job_id}   — run ECAPA analysis on input+output temp files
+  GET   /api/offline/profiles           — list trained profiles available for inference
 
-Uses the same RVC pipeline as the realtime worker (rtrvc.RVC) so inference
-quality is identical and can be used to diagnose cloning quality.
+Input and output files are saved to {PROJECT_ROOT}/temp/ as:
+  temp/{job_id}_input.{ext}
+  temp/{job_id}_output.{ext}
+
+These are swept on startup and shutdown via start.sh / stop.sh.
 """
 
 import asyncio
@@ -14,7 +19,6 @@ import io
 import logging
 import os
 import sys
-import tempfile
 import time
 import uuid
 from typing import Optional
@@ -43,6 +47,31 @@ _AUDIO_MIME = {
 
 # Formats soundfile can write natively (no ffmpeg needed)
 _SF_WRITE_EXTS = {".wav", ".flac", ".ogg", ".aiff", ".aif"}
+
+
+# ---------------------------------------------------------------------------
+# Temp directory helpers
+# ---------------------------------------------------------------------------
+
+def _temp_dir() -> str:
+    """Return {PROJECT_ROOT}/temp/, creating it if needed."""
+    root = os.environ.get("PROJECT_ROOT", "")
+    if not root:
+        root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..")
+        )
+    d = os.path.join(root, "temp")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _input_path(job_id: str, ext: str) -> str:
+    return os.path.join(_temp_dir(), f"{job_id}_input{ext}")
+
+
+def _output_path(job_id: str, ext: str) -> str:
+    return os.path.join(_temp_dir(), f"{job_id}_output{ext}")
+
 
 
 def _write_audio(path: str, audio: np.ndarray, sr: int, ext: str) -> None:
@@ -89,7 +118,7 @@ router = APIRouter(prefix="/api/offline", tags=["offline"])
 # In-memory job store (results held until downloaded or server restart)
 # ---------------------------------------------------------------------------
 
-_jobs: dict[str, dict] = {}  # job_id → {status, result_path, error, sample_rate, fmt}
+_jobs: dict[str, dict] = {}  # job_id → {status, input_path, result_path, error, sample_rate, fmt}
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +518,13 @@ async def convert_audio(
         audio_16k = audio_mono
 
     job_id = uuid.uuid4().hex
-    _jobs[job_id] = {"status": "running"}
+
+    # Save input to temp/ for later analysis
+    in_path = _input_path(job_id, orig_ext)
+    with open(in_path, "wb") as _f:
+        _f.write(audio_bytes)
+
+    _jobs[job_id] = {"status": "running", "input_path": in_path}
 
     import json as _json
 
@@ -515,21 +550,19 @@ async def convert_audio(
                     sola_crossfade_ms=sola_crossfade_ms,
                 )
                 # Write result to temp file preserving original format
-                tmp = tempfile.NamedTemporaryFile(
-                    suffix=orig_ext, delete=False, prefix=f"rvc_offline_{job_id}_"
-                )
-                tmp.close()
-                _write_audio(tmp.name, result_audio, tgt_sr, orig_ext)
+                out_path = _output_path(job_id, orig_ext)
+                _write_audio(out_path, result_audio, tgt_sr, orig_ext)
                 _jobs[job_id] = {
                     "status": "done",
-                    "result_path": tmp.name,
+                    "input_path": in_path,
+                    "result_path": out_path,
                     "sample_rate": tgt_sr,
                     "orig_filename": orig_filename,
                 }
                 loop.call_soon_threadsafe(progress_queue.put_nowait, "done")
             except Exception as exc:
                 logger.exception("offline inference failed")
-                _jobs[job_id] = {"status": "error", "error": str(exc)}
+                _jobs[job_id] = {"status": "error", "error": str(exc), "input_path": in_path}
                 loop.call_soon_threadsafe(progress_queue.put_nowait, f"error:{exc}")
 
         # Run inference in thread pool (it's CPU/GPU intensive, blocks event loop)
@@ -595,90 +628,65 @@ async def download_result(job_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Temp audio upload (for analysis)
+# Input audio streaming (for waveform on analysis page)
 # ---------------------------------------------------------------------------
 
+@router.get("/input/{job_id}")
+async def stream_input(job_id: str):
+    """Stream the original input audio for a completed job."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
 
-@router.post("/upload-temp")
-async def upload_temp_audio(file: UploadFile = File(...)):
-    """Upload audio to a temp file and return its path (for analysis)."""
-    ext = os.path.splitext(file.filename or "")[1].lower() or ".wav"
-    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False, prefix="rvc_analysis_")
-    tmp.close()
-    content = await file.read()
-    with open(tmp.name, "wb") as f:
-        f.write(content)
-    return {"path": tmp.name}
+    in_path = job.get("input_path")
+    if not in_path or not os.path.exists(in_path):
+        raise HTTPException(status_code=404, detail="Input file not found or expired")
+
+    ext = os.path.splitext(in_path)[1].lower() or ".wav"
+    mime = _AUDIO_MIME.get(ext, "audio/wav")
+    return FileResponse(in_path, media_type=mime, headers={"Cache-Control": "no-cache"})
 
 
 # ---------------------------------------------------------------------------
-# Voice conversion analysis
+# ECAPA analysis on already-converted job
 # ---------------------------------------------------------------------------
 
-
-class AnalysisRequest(BaseModel):
-    profile_id: str
-    input_audio_path: str
-    output_audio_path: str
+class _AnalyzeJobResponse(dict):
+    pass
 
 
-class AnalysisResponse(BaseModel):
-    profile_input_similarity: float
-    profile_output_similarity: float
-    input_output_similarity: float
-    improvement: float
-    improvement_pct: float
-    quality_input: str
-    quality_output: str
-    summary: str
-    profile_emb: list[float]
-    input_emb: list[float]
-    output_emb: list[float]
+@router.post("/analyze/{job_id}")
+async def analyze_job(job_id: str):
+    """Run ECAPA-TDNN speaker-embedding comparison on a completed job.
 
+    Both input and output files are already on disk in temp/ — no upload needed.
+    Returns CompareResponse-shaped JSON.
+    """
+    from backend.app.voice_analysis import analyze_pair
 
-@router.post("/analyze", response_model=AnalysisResponse)
-async def analyze_conversion(req: AnalysisRequest):
-    """Compare speaker embeddings of profile, input, and output audio."""
-    from backend.app.voice_analysis import analyze_conversion
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "done":
+        raise HTTPException(status_code=400, detail=f"Job not done (status: {job['status']})")
 
-    # Resolve profile embedding path
-    profile_emb_path = None
-    pdir = None
+    in_path = job.get("input_path")
+    out_path = job.get("result_path")
 
-    async with get_db() as db:
-        cursor = await db.execute(
-            "SELECT profile_dir FROM profiles WHERE id = ?",
-            (req.profile_id,),
-        )
-        row = await cursor.fetchone()
-        if row:
-            pdir = row["profile_dir"]
+    if not in_path or not os.path.exists(in_path):
+        raise HTTPException(status_code=404, detail="Input temp file not found or expired")
+    if not out_path or not os.path.exists(out_path):
+        raise HTTPException(status_code=404, detail="Output temp file not found or expired")
 
-    if not pdir or not os.path.isdir(pdir):
-        raise HTTPException(status_code=404, detail="Profile directory not found")
-
-    # Use existing profile_embedding.pt if available
-    profile_emb_path = os.path.join(pdir, "profile_embedding.pt")
-    if not os.path.exists(profile_emb_path):
-        # Fall back to using the audio directory
-        profile_emb_path = pdir
-
-    # Use the device already detected by start.sh and exported as RVC_DEVICE.
-    # Avoids duplicating device-detection logic and stays consistent with the
-    # inference pipeline.
-    import os as _os
-    device = _os.environ.get("RVC_DEVICE", "cpu")
+    device = os.environ.get("RVC_DEVICE", "cpu")
 
     try:
-        result = analyze_conversion(
-            profile_emb_path=profile_emb_path,
-            input_audio_path=req.input_audio_path,
-            output_audio_path=req.output_audio_path,
-            device=device,
-        )
-        return AnalysisResponse(**result)
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Analysis failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
+        result = analyze_pair(path_a=in_path, path_b=out_path, device=device)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Analysis failed for job %s: %s", job_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {exc}") from exc
+
+    return result
+

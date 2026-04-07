@@ -161,3 +161,11 @@ if command -v pgrep >/dev/null 2>&1; then
 fi
 
 echo "[stop] Done."
+
+# ---------------------------------------------------------------------------
+# 6. Sweep temp/ on shutdown — clear all temp audio files
+# ---------------------------------------------------------------------------
+if [ -d "temp" ]; then
+  echo "[stop] Sweeping temp/..."
+  find temp/ -maxdepth 1 -type f -delete 2>/dev/null || true
+fi

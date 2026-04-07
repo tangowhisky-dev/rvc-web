@@ -145,6 +145,13 @@ kill_dangling
 mkdir -p .pids logs data/profiles
 
 # ---------------------------------------------------------------------------
+# 5b. Sweep temp/ — delete files older than 1 hour
+# ---------------------------------------------------------------------------
+mkdir -p temp
+echo "[start] Sweeping temp/ (files older than 1h)..."
+find temp/ -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
 # 6. PROJECT_ROOT — single source of truth for all path resolution
 # ---------------------------------------------------------------------------
 export PROJECT_ROOT="$(pwd)"

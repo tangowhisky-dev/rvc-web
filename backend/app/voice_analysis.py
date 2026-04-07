@@ -10,6 +10,7 @@ Returns cosine similarities and a human-readable quality summary.
 
 import os
 import logging
+from typing import Optional
 
 import numpy as np
 import torch
@@ -31,7 +32,7 @@ def _get_encoder(device: str = "cpu"):
         return _encoder
 
     # Add backend/rvc to sys.path so 'infer' package resolves
-    _pkg_dir = os.path.join(os.path.dirname(__file__), "..", "..", "rvc")
+    _pkg_dir = os.path.join(os.path.dirname(__file__), "..", "rvc")
     if _pkg_dir not in __import__("sys").path:
         __import__("sys").path.insert(0, _pkg_dir)
 
@@ -249,4 +250,129 @@ def analyze_conversion(
         "profile_emb": profile_emb.tolist(),
         "input_emb": input_emb.tolist(),
         "output_emb": output_emb.tolist(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# analyze_pair — generic two-file comparison (used by /api/analysis/compare)
+# ---------------------------------------------------------------------------
+
+def _audio_duration(path: str) -> float:
+    """Return duration in seconds without loading the full file into RAM."""
+    import soundfile as _sf
+    info = _sf.info(path)
+    return info.duration
+
+
+def analyze_pair(
+    path_a: str,
+    path_b: str,
+    profile_emb_path: Optional[str] = None,
+    device: str = "cpu",
+) -> dict:
+    """Compare two audio files using ECAPA-TDNN embeddings.
+
+    path_a  — first audio file (e.g. source / input)
+    path_b  — second audio file (e.g. converted / output)
+    profile_emb_path — optional profile_embedding.pt or profile dir
+
+    Returns a dict matching CompareResponse schema.
+    """
+    import os as _os
+
+    encoder = _get_encoder(device)
+
+    audio_a = _load_audio(path_a)
+    audio_b = _load_audio(path_b)
+
+    emb_a = _extract_embedding(audio_a, 16000, encoder)
+    emb_b = _extract_embedding(audio_b, 16000, encoder)
+
+    dur_a = _audio_duration(path_a)
+    dur_b = _audio_duration(path_b)
+
+    # a ↔ b similarity
+    sim_ab = float(np.clip(np.dot(emb_a, emb_b), 0.0, 1.0))
+
+    # Profile comparisons (optional)
+    emb_profile = None
+    sim_pa = sim_pb = improvement = improvement_pct = None
+    q_pa = q_pb = None
+
+    if profile_emb_path:
+        if _os.path.isfile(profile_emb_path) and profile_emb_path.endswith(".pt"):
+            prof_data = torch.load(profile_emb_path, map_location="cpu", weights_only=False)
+            profile_emb_t = prof_data["profile_embedding"]
+            emb_profile = (
+                profile_emb_t.cpu().numpy()
+                if isinstance(profile_emb_t, torch.Tensor)
+                else np.array(profile_emb_t)
+            )
+        else:
+            import glob as _glob
+            wav_files = sorted(_glob.glob(_os.path.join(profile_emb_path, "*.wav")))
+            if not wav_files:
+                wav_files = sorted(_glob.glob(_os.path.join(profile_emb_path, "audio", "*.wav")))
+            if wav_files:
+                embs = [_extract_embedding(_load_audio(p), 16000, encoder) for p in wav_files]
+                emb_profile = np.mean(embs, axis=0)
+                emb_profile /= np.linalg.norm(emb_profile) + 1e-10
+
+        if emb_profile is not None:
+            sim_pa = float(np.clip(np.dot(emb_profile, emb_a), 0.0, 1.0))
+            sim_pb = float(np.clip(np.dot(emb_profile, emb_b), 0.0, 1.0))
+            improvement = round(sim_pb - sim_pa, 4)
+            improvement_pct = round(
+                (improvement / sim_pa * 100) if sim_pa > 0.01 else 0.0, 1
+            )
+            q_pa = quality_label(sim_pa)
+            q_pb = quality_label(sim_pb)
+
+    # Summary
+    if emb_profile is not None and sim_pa is not None and sim_pb is not None:
+        if improvement > 0.1:
+            summary = (
+                f"✅ Strong conversion — output is {sim_pb:.0%} similar to target "
+                f"(up from {sim_pa:.0%}, +{improvement_pct:.0f}%)."
+            )
+        elif improvement > 0.0:
+            summary = (
+                f"👍 Good conversion — output is {sim_pb:.0%} similar to target "
+                f"(source was {sim_pa:.0%})."
+            )
+        elif improvement > -0.1:
+            summary = (
+                f"⚠️ Moderate conversion — output {sim_pb:.0%} vs source {sim_pa:.0%}. "
+                f"Voice character hasn't changed significantly."
+            )
+        else:
+            summary = (
+                f"❌ Weak conversion — output ({sim_pb:.0%}) is less similar to target "
+                f"than source ({sim_pa:.0%}). Try adjusting index_rate or retraining."
+            )
+    else:
+        pct = round(sim_ab * 100)
+        if pct > 85:
+            summary = f"🔊 Files are very similar speakers ({pct}% similarity)."
+        elif pct > 65:
+            summary = f"🔊 Files share moderate speaker characteristics ({pct}% similarity)."
+        else:
+            summary = f"🔊 Files are from different speakers ({pct}% similarity)."
+
+    return {
+        "ab_similarity": round(sim_ab, 4),
+        "profile_a_similarity": round(sim_pa, 4) if sim_pa is not None else None,
+        "profile_b_similarity": round(sim_pb, 4) if sim_pb is not None else None,
+        "improvement": improvement,
+        "improvement_pct": improvement_pct,
+        "quality_a": quality_label(sim_ab),   # quality of a↔b match
+        "quality_b": quality_label(sim_ab),
+        "quality_profile_a": q_pa,
+        "quality_profile_b": q_pb,
+        "summary": summary,
+        "emb_a": emb_a.tolist(),
+        "emb_b": emb_b.tolist(),
+        "emb_profile": emb_profile.tolist() if emb_profile is not None else None,
+        "duration_a": round(dur_a, 2),
+        "duration_b": round(dur_b, 2),
     }

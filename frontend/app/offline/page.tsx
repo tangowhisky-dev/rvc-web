@@ -1,29 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { TipsPanel } from '../TipsPanel';
 import { ProfilePicker } from '../ProfilePicker';
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip as RechartsTooltip,
-  ResponsiveContainer,
-  RadarChart,
-  PolarGrid,
-  PolarAngleAxis,
-  PolarRadiusAxis,
-  Radar,
-  Legend,
-  ScatterChart,
-  Scatter,
-  LineChart,
-  Line,
-  ReferenceLine,
-  ZAxis,
-} from 'recharts';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
@@ -43,20 +23,6 @@ interface Profile {
   best_model_path?: string | null;
   best_epoch?: number | null;
   best_avg_gen_loss?: number | null;
-}
-
-interface VoiceAnalysis {
-  profile_input_similarity: number;
-  profile_output_similarity: number;
-  input_output_similarity: number;
-  improvement: number;
-  improvement_pct: number;
-  quality_input: string;
-  quality_output: string;
-  summary: string;
-  profile_emb: number[];
-  input_emb: number[];
-  output_emb: number[];
 }
 
 // ---------------------------------------------------------------------------
@@ -380,337 +346,6 @@ function ParamSlider({
 // VoiceAnalysisPanel — speaker embedding comparison with charts
 // ---------------------------------------------------------------------------
 
-function qualityColor(quality: string): string {
-  switch (quality) {
-    case 'Excellent': return '#10b981';
-    case 'Good':      return '#22c55e';
-    case 'Normal':    return '#f59e0b';
-    case 'Bad':       return '#ef4444';
-    case 'Very Poor': return '#dc2626';
-    default:          return '#6b7280';
-  }
-}
-
-function VoiceAnalysisPanel({
-  analysis,
-  loading,
-  profileName,
-}: {
-  analysis: VoiceAnalysis | null;
-  loading: boolean;
-  profileName: string;
-}) {
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-6 text-[12px] font-mono text-zinc-400">
-        <div className="flex items-center gap-2">
-          <div className="w-4 h-4 border-2 border-cyan-500 border-t-transparent rounded-full animate-spin" />
-          Analyzing speaker embeddings…
-        </div>
-      </div>
-    );
-  }
-
-  if (!analysis) {
-    return (
-      <div className="text-[11px] font-mono text-zinc-500 py-2 text-center">
-        Enable this option before conversion to see analysis results.
-      </div>
-    );
-  }
-
-  // Bar chart data — only Profile↔Input and Profile↔Output
-  const barData = [
-    { name: 'Profile ↔ Input', value: Math.round(analysis.profile_input_similarity * 100), fill: '#f59e0b' },
-    { name: 'Profile ↔ Output', value: Math.round(analysis.profile_output_similarity * 100), fill: '#22c55e' },
-  ];
-
-  // Diverging bar chart data — difference (Profile - Output) per dimension
-  const diffData = analysis.profile_emb.map((val, i) => ({
-    dim: i + 1,
-    diff: val - analysis.output_emb[i],
-    absDiff: Math.abs(val - analysis.output_emb[i]),
-  }));
-  const dimCount = analysis.profile_emb.length;
-
-  // Scatter plot data — all 192 dimensions, colored by similarity
-  const scatterData = analysis.profile_emb.map((val, i) => {
-    const outputVal = analysis.output_emb[i];
-    const diff = Math.abs(val - outputVal);
-    return {
-      x: val,
-      y: outputVal,
-      dim: i + 1,
-      diff,
-    };
-  });
-
-  // Compute min/max for reference line and axis domain
-  const allVals = [...analysis.profile_emb, ...analysis.output_emb];
-  const scatterMin = Math.min(...allVals) - 0.05;
-  const scatterMax = Math.max(...allVals) + 0.05;
-  const scatterRange = scatterMax - scatterMin;
-
-  // Color function: green for similar, red for different
-  // Use a tighter threshold so differences are more visible
-  const diffToColor = (diff: number) => {
-    const t = Math.min(diff / (scatterRange * 0.3), 1); // normalize relative to data range
-    const r = Math.round(34 + t * (239 - 34));
-    const g = Math.round(197 + t * (68 - 197));
-    const b = Math.round(94 + t * (68 - 94));
-    return `rgb(${r}, ${g}, ${b})`;
-  };
-
-  // Custom dot shape for scatter
-  const ColoredDot = ({ cx, cy, payload }: any) => {
-    const color = diffToColor(payload.diff);
-    return (
-      <circle
-        cx={cx}
-        cy={cy}
-        r={4}
-        fill={color}
-        fillOpacity={0.8}
-        stroke={color}
-        strokeWidth={1}
-      />
-    );
-  };
-
-  // Line chart data — all 192 dimensions
-  const lineData = analysis.profile_emb.map((val, i) => ({
-    dim: i + 1,
-    Profile: val,
-    Output: analysis.output_emb[i],
-  }));
-
-  const outputQualityColor = qualityColor(analysis.quality_output);
-
-  return (
-    <div className="flex flex-col gap-5 pt-2">
-      {/* Quality badge + summary */}
-      <div className="flex items-start gap-4">
-        <div
-          className="px-3 py-1.5 rounded-lg text-[11px] font-mono font-bold uppercase tracking-wider"
-          style={{
-            backgroundColor: `${outputQualityColor}20`,
-            color: outputQualityColor,
-            border: `1px solid ${outputQualityColor}40`,
-          }}
-        >
-          {analysis.quality_output}
-        </div>
-        <p className="text-[11px] font-mono text-zinc-300 leading-relaxed flex-1">
-          {analysis.summary}
-        </p>
-      </div>
-
-      {/* Similarity bars */}
-      <div>
-        <h3 className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-3">
-          Speaker Similarity
-        </h3>
-        <ResponsiveContainer width="100%" height={140}>
-          <BarChart data={barData} layout="vertical" margin={{ left: 15, right: 20, top: 10, bottom: 10 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-            <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 10, fill: '#71717a' }} />
-            <YAxis
-              type="category"
-              dataKey="name"
-              tick={{ fontSize: 10, fill: '#a1a1aa' }}
-              width={120}
-            />
-            <RechartsTooltip
-              formatter={(value) => `${value}%`}
-              contentStyle={{
-                color: '#e5e7eb',
-                backgroundColor: '#18181b',
-                border: '1px solid #3f3f46',
-                borderRadius: '6px',
-                fontSize: '11px',
-                fontFamily: 'monospace',
-              }}
-            />
-            <Bar dataKey="value" radius={[0, 4, 4, 0]} barSize={20} />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-
-      {/* Diverging bar chart — difference per dimension */}
-      <div>
-        <h3 className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-3">
-          Embedding Differences by Dimension
-        </h3>
-        <p className="text-[10px] font-mono text-zinc-600 mb-2">
-          Shows how much each dimension differs. Bars above zero = Profile higher, below zero = Output higher. Closer to zero = more similar.
-        </p>
-        <ResponsiveContainer width="100%" height={200}>
-          <BarChart data={diffData} margin={{ top: 10, right: 20, bottom: 30, left: 70 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-            <XAxis
-              dataKey="dim"
-              type="number"
-              domain={[1, dimCount]}
-              tick={{ fontSize: 9, fill: '#71717a' }}
-              label={{ value: 'Dimension Index', position: 'bottom', offset: 0, fontSize: 10, fill: '#a1a1aa' }}
-            />
-            <YAxis
-              tick={{ fontSize: 9, fill: '#71717a' }}
-              tickFormatter={(v: number) => v.toFixed(3)}
-              label={{ value: 'Difference', angle: -90, position: 'insideLeft', offset: 0, 
-                style: { textAnchor: 'middle', dominantBaseline: 'central' },
-                fontSize: 10, fill: '#a1a1aa' }}
-            />
-            <RechartsTooltip
-              contentStyle={{
-                color: '#e5e7eb',
-                backgroundColor: '#18181b',
-                border: '1px solid #3f3f46',
-                borderRadius: '6px',
-                fontSize: '11px',
-                fontFamily: 'monospace',
-              }}
-              formatter={(value: any) => (typeof value === 'number' ? value.toFixed(4) : value)}
-            />
-            <Bar dataKey="diff" fill="#a78bfa" fillOpacity={0.7} barSize={2} />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-
-      {/* Scatter plot — Profile vs Output embeddings */}
-      <div>
-        <h3 className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-3">
-          Embedding Scatter (Profile vs Output)
-        </h3>
-        <p className="text-[10px] font-mono text-zinc-600 mb-2">
-          Points near the diagonal line indicate similar dimensions. Color shows how close each dimension matches.
-        </p>
-        <ResponsiveContainer width="100%" height={400}>
-          <ScatterChart margin={{ top: 10, right: 20, bottom: 40, left: 70 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-              <XAxis
-                type="number"
-                dataKey="x"
-                name="Profile"
-                domain={[scatterMin, scatterMax]}
-                tick={{ fontSize: 9, fill: '#71717a' }}
-                tickFormatter={(v: number) => v.toFixed(3)}
-                label={{ value: 'Profile Embedding', position: 'bottom', offset: 0, fontSize: 10, fill: '#a1a1aa' }}
-              />
-              <YAxis
-                type="number"
-                dataKey="y"
-                name="Output"
-                domain={[scatterMin, scatterMax]}
-                tick={{ fontSize: 9, fill: '#71717a' }}
-                tickFormatter={(v: number) => v.toFixed(3)}
-                label={{ value: 'Output Embedding', angle: -90, position: 'insideLeft', 
-                  style: { textAnchor: 'middle', dominantBaseline: 'central' },
-                  offset: 0, fontSize: 10, fill: '#a1a1aa' }}
-              />
-              <ZAxis range={[4, 4]} />
-              <RechartsTooltip
-                cursor={{ strokeDasharray: '3 3' }}
-                formatter={(value, name) => {
-                  if (name === 'x') return [`Profile: ${(value as number).toFixed(4)}`, 'Profile'];
-                  if (name === 'y') return [`Output: ${(value as number).toFixed(4)}`, 'Output'];
-                  if (name === 'diff') return [`Difference: ${(value as number).toFixed(4)}`, 'Diff'];
-                  return [value, name];
-                }}
-                labelFormatter={(label) => `Dimension ${label}`}
-                contentStyle={{
-                  color: '#e5e7eb',
-                  backgroundColor: '#18181b',
-                  border: '1px solid #3f3f46',
-                  borderRadius: '6px',
-                  fontSize: '11px',
-                  fontFamily: 'monospace',
-                }}
-                labelStyle={{ color: '#c9c9cb' }}
-                itemStyle={{ color: '#c9c9cb' }}
-              />
-              {/* Diagonal reference line — y = x */}
-              <ReferenceLine
-                segment={[
-                  { x: scatterMin, y: scatterMin },
-                  { x: scatterMax, y: scatterMax },
-                ]}
-                stroke="#484a40"
-                strokeWidth={2}
-                strokeDasharray="6 4"
-              />
-              <Scatter
-                name="Dimensions"
-                data={scatterData}
-                shape={<ColoredDot />}
-              />
-            </ScatterChart>
-          </ResponsiveContainer>
-      </div>
-
-      {/* Line chart — all dimensions comparison */}
-      <div>
-        <h3 className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-3">
-          Embedding Values by Dimension (All {dimCount})
-        </h3>
-        <p className="text-[10px] font-mono text-zinc-600 mb-2">
-          Compare embedding values across all 192 dimensions. Matching lines indicate similar speaker characteristics.
-        </p>
-        <ResponsiveContainer width="100%" height={220}>
-          <LineChart data={lineData} margin={{ top: 30, right: 20, bottom: 30, left: 70 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-            <XAxis
-              dataKey="dim"
-              type="number"
-              domain={[1, dimCount]}
-              tick={{ fontSize: 9, fill: '#71717a' }}
-              label={{ value: 'Dimension Index', position: 'bottom', offset: 0, fontSize: 10, fill: '#a1a1aa' }}
-            />
-            <YAxis
-              tick={{ fontSize: 9, fill: '#71717a' }}
-              label={{ value: 'Embedding Value', angle: -90, position: 'insideLeft', 
-                style: { textAnchor: 'middle', dominantBaseline: 'central' },
-                offset: 0, fontSize: 10, fill: '#a1a1aa' }}
-            />
-            <RechartsTooltip
-              contentStyle={{
-                color: '#e5e7eb',
-                backgroundColor: '#18181b',
-                border: '1px solid #3f3f46',
-                borderRadius: '6px',
-                fontSize: '11px',
-                fontFamily: 'monospace',
-              }}
-            />
-            <Line
-              type="monotone"
-              dataKey="Profile"
-              stroke="#f59e0b"
-              strokeWidth={1.5}
-              dot={false}
-              isAnimationActive={false}
-            />
-            <Line
-              type="monotone"
-              dataKey="Output"
-              stroke="#a78bfa"
-              strokeWidth={1.5}
-              dot={false}
-              isAnimationActive={false}
-            />
-            <Legend
-              align="center"
-              verticalAlign="top"
-              height={20}
-              wrapperStyle={{ fontSize: '10px', fontFamily: 'monospace', color: '#a1a1aa' }}
-            />
-          </LineChart>
-        </ResponsiveContainer>
-      </div>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
@@ -743,10 +378,8 @@ export default function OfflinePage() {
   const [outputFilename, setOutputFilename] = useState('');
   const abortRef = useRef<AbortController | null>(null);
 
-  // Post-conversion analysis
-  const [analyzeEnabled, setAnalyzeEnabled] = useState(false);
-  const [analysis, setAnalysis]           = useState<VoiceAnalysis | null>(null);
-  const [analysisLoading, setAnalysisLoading] = useState(false);
+  // Post-conversion analysis — navigate to analysis page with context
+  const router = useRouter();
   const outputFilePathRef = useRef<string | null>(null);
 
   // Load profiles — use shared /api/profiles, filter to inference-ready only
@@ -781,12 +414,6 @@ export default function OfflinePage() {
     a.onloadedmetadata = () => setOutputDuration(a.duration);
   }, [outputUrl]);
 
-  // Run analysis when output is ready and enabled, OR when analysis is enabled after output is ready
-  useEffect(() => {
-    if (!outputUrl || !profileId || !analyzeEnabled || !outputFilePathRef.current) return;
-    runAnalysis();
-  }, [outputUrl, analyzeEnabled]);
-
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -796,7 +423,6 @@ export default function OfflinePage() {
     setJobError(null);
     setProgress(0);
     setJobId(null);
-    setAnalysis(null);
     outputFilePathRef.current = null;
   }
 
@@ -905,59 +531,9 @@ export default function OfflinePage() {
     a.click();
   }
 
-  async function runAnalysis() {
-    if (!profileId || !outputFilePathRef.current || !inputFile) return;
-    setAnalysisLoading(true);
-    try {
-      // Upload input file to temp location
-      const inputForm = new FormData();
-      inputForm.append('file', inputFile);
-      const uploadRes = await fetch(`${API}/api/offline/upload-temp`, {
-        method: 'POST',
-        body: inputForm,
-      });
-      if (!uploadRes.ok) {
-        const errText = await uploadRes.text().catch(() => '');
-        throw new Error(`Upload failed: ${uploadRes.status} ${errText}`);
-      }
-      const uploadData = await uploadRes.json();
-      const inputPath = uploadData.path;
-
-      // Run analysis
-      const res = await fetch(`${API}/api/offline/analyze`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          profile_id: profileId,
-          input_audio_path: inputPath,
-          output_audio_path: outputFilePathRef.current,
-        }),
-      });
-      if (!res.ok) {
-        const errBody = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(errBody.detail || `Analysis failed: ${res.status}`);
-      }
-      const data = await res.json();
-      setAnalysis(data);
-    } catch (err: any) {
-      console.error('Analysis error:', err);
-      // Set a minimal error state so user sees something
-      setAnalysis({
-        profile_input_similarity: 0,
-        profile_output_similarity: 0,
-        input_output_similarity: 0,
-        improvement: 0,
-        improvement_pct: 0,
-        quality_input: 'Bad',
-        quality_output: 'Bad',
-        summary: `Analysis failed: ${err.message || 'Unknown error'}. Make sure the backend is running and ECAPA model is available.`,
-        profile_emb: new Array(192).fill(0),
-        input_emb: new Array(192).fill(0),
-        output_emb: new Array(192).fill(0),
-      });
-    } finally {
-      setAnalysisLoading(false);
-    }
+  function goToAnalysis() {
+    if (!jobId) return;
+    router.push(`/analysis?from=offline&job_id=${jobId}`);
   }
 
   const selectedProfile = profiles.find(p => p.id === profileId);
@@ -1083,23 +659,6 @@ export default function OfflinePage() {
           </div>
 
           {/* Post-conversion analysis toggle */}
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center gap-3 py-1">
-              <input
-                type="checkbox"
-                id="analyze"
-                checked={analyzeEnabled}
-                onChange={e => { setAnalyzeEnabled(e.target.checked); if (!e.target.checked) setAnalysis(null); }}
-                className="w-4 h-4 rounded border-zinc-600 bg-zinc-800 text-cyan-500 focus:ring-cyan-500/30"
-              />
-              <label htmlFor="analyze" className="text-[12px] font-mono text-zinc-300 cursor-pointer select-none">
-                Post-Conversion Analysis
-              </label>
-              <span className="text-[10px] font-mono text-zinc-500">
-                Compare speaker embeddings to verify voice conversion quality
-              </span>
-            </div>
-          </div>
         </section>
 
         {/* Input audio */}
@@ -1219,18 +778,19 @@ export default function OfflinePage() {
           </section>
         )}
 
-        {/* Post-conversion analysis results */}
-        {analyzeEnabled && outputUrl && (
-          <section className="flex flex-col gap-3 p-4 rounded-xl border border-zinc-800 bg-zinc-900/50">
-            <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
-              Voice Conversion Analysis
-            </label>
-            <VoiceAnalysisPanel
-              analysis={analysis}
-              loading={analysisLoading}
-              profileName={selectedProfile?.name ?? 'Profile'}
-            />
-          </section>
+        {/* Run Analysis button — appears after conversion completes */}
+        {outputUrl && jobStatus === 'done' && (
+          <div className="flex justify-end">
+            <button
+              onClick={goToAnalysis}
+              className="flex items-center gap-2 px-5 py-2.5 rounded-lg text-[12px] font-mono font-semibold
+                bg-violet-700/40 border border-violet-600/50 text-violet-300
+                hover:bg-violet-700/60 hover:border-violet-500/70 hover:text-violet-200 transition-all"
+            >
+              <span>Run Analysis</span>
+              <span className="text-[14px]">→</span>
+            </button>
+          </div>
         )}
 
         {/* Tips */}

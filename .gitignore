@@ -54,3 +54,4 @@ test_*.py
 /models
 /assets
 /logs
+/temp
