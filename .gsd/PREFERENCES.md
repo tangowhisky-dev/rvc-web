@@ -1,13 +1,11 @@
 ---
 version: 1
-always_use_skills: []
-prefer_skills: []
-avoid_skills: []
-skill_rules: []
-custom_instructions: []
-models: {}
-skill_discovery: {}
-auto_supervisor: {}
+cmux:
+  enabled: true
+  notifications: true
+  sidebar: true
+  splits: false
+  browser: false
 ---
 
 # GSD Skill Preferences
