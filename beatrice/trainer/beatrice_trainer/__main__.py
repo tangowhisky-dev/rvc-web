@@ -3955,10 +3955,10 @@ def prepare_training():
         grad_balancer.load_state_dict(checkpoint["grad_balancer"])
         grad_scaler.load_state_dict(checkpoint["grad_scaler"])
 
-    # Maximum chunk length for codebook building: 10 seconds at in_sample_rate.
-    # PhoneExtractor has O(seq²) self-attention — feeding full long files causes
-    # an exponential memory blow-up on MPS/CPU (e.g. 18min → 90GB attn buffer).
-    _VQ_CHUNK_SAMPLES = h.in_sample_rate * 10  # 160 000 samples @ 16kHz
+    # Chunk length for codebook building matches the training wav_length (6s).
+    # Upstream assumes pre-segmented utterances (~5-15s); wav_length=96000 at
+    # 16kHz = 6s is the natural window size the model was designed around.
+    _VQ_CHUNK_SAMPLES = h.wav_length  # 96000 @ 16kHz = 6s
 
     def wav_iterator(files):
         for file in files:
