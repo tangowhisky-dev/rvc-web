@@ -9,6 +9,7 @@ import json
 import math
 import os
 import shutil
+import sys
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
@@ -3831,18 +3832,23 @@ def prepare_training():
     )
     _is_cuda = torch.cuda.is_available()
     _n_files = len(training_filelist)
-    # macOS uses 'spawn' as the default multiprocessing start method, which
-    # re-imports __main__ as a built-in and can't unpickle classes defined in
-    # __main__.py (WavDataset, collate_fn, etc.).  Use 'fork' on non-CUDA
-    # platforms (macOS/CPU) — workers do pure CPU work so fork is safe.
-    # Linux already defaults to 'fork'; CUDA contexts aren't fork-safe so
-    # leave start method as-is (None = platform default) on CUDA.
-    _mp_context = None if _is_cuda else "fork"
+    # DataLoader multiprocessing pickling constraint:
+    # WavDataset is defined in __main__.py. When run as `python3 -m beatrice_trainer`,
+    # __name__ == '__main__' so pickle records WavDataset as '__main__.WavDataset'.
+    # On macOS/Windows the default start method is 'spawn' — spawned workers
+    # run a fresh interpreter, import __main__ as a built-in (not __main__.py),
+    # and can't find WavDataset -> AttributeError.
+    # On Linux the default is 'fork' which copies the parent address space, so
+    # no re-import is needed and pickling works fine.
+    # Solution: use num_workers>0 only on Linux (fork), fall back to 0 elsewhere.
+    # num_workers=0 runs the DataLoader in the main process — no pickling at all.
+    # With 4s pre-segmented chunks, I/O and augmentation are fast enough that
+    # single-process loading doesn't bottleneck training on MPS/CPU/Windows.
+    _linux = sys.platform == "linux"
+    _num_workers = min(h.num_workers, os.cpu_count(), max(1, _n_files)) if _linux else 0
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
-        # Cap workers at segment count — more workers than segments causes
-        # StopIteration before the first batch on small datasets.
-        num_workers=min(h.num_workers, os.cpu_count(), max(1, _n_files)),
+        num_workers=_num_workers,
         collate_fn=training_dataset.collate,
         shuffle=True,
         sampler=None,
@@ -3850,8 +3856,7 @@ def prepare_training():
         # pin_memory only works on CUDA; MPS uses unified memory
         pin_memory=_is_cuda,
         drop_last=True,
-        persistent_workers=True,
-        multiprocessing_context=_mp_context,
+        persistent_workers=_num_workers > 0,
     )
 
     print("Computing mean F0s of target speakers...", end="")
