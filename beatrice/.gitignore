@@ -12,3 +12,6 @@ runs/
 
 # Trainer's own git repo internals
 trainer/.git/
+
+# SpeechMOS quality metric weights (~392MB, downloaded at first eval run)
+# Lives in rvc-web/assets/SpeechMOS/ — excluded from git

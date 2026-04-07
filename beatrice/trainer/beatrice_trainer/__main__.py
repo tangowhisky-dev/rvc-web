@@ -3116,6 +3116,11 @@ class GradBalancer:
 class QualityTester(nn.Module):
     def __init__(self):
         super().__init__()
+        # Store SpeechMOS weights alongside other project assets instead of
+        # the default ~/.cache/torch/hub/ which scatters files across the system.
+        _hub_dir = repo_root().parent / "assets" / "SpeechMOS"
+        _hub_dir.mkdir(parents=True, exist_ok=True)
+        torch.hub.set_dir(str(_hub_dir))
         self.utmos = torch.hub.load(
             "tarepan/SpeechMOS:v1.0.0", "utmos22_strong", trust_repo=True
         ).eval()
@@ -3176,7 +3181,7 @@ def compute_mean_f0(
     sum_log_f0 = 0.0
     n_frames = 0
     for file in files:
-        wav, sr = torchaudio.load(file, backend="soundfile")
+        wav, sr = torchaudio.load(file)
         if method == "dio":
             f0, _ = pyworld.dio(wav.ravel().numpy().astype(np.float64), sr)
         elif method == "harvest":
@@ -3310,7 +3315,7 @@ def get_noise(
     while current_length < n_samples:
         idx_files = torch.randint(0, len(files), ())
         file = files[idx_files]
-        wav, sr = torchaudio.load(file, backend="soundfile")
+        wav, sr = torchaudio.load(file)
         assert wav.size(0) == 1
         augmented_sample_rate = int(
             round(
@@ -3386,7 +3391,7 @@ def augment_audio(
     # clean, noise にリバーブをかける
     if torch.rand(()) < reverb_probability:
         ir_file = ir_files[torch.randint(0, len(ir_files), ())]
-        ir, sr = torchaudio.load(ir_file, backend="soundfile")
+        ir, sr = torchaudio.load(ir_file)
         assert ir.size() == (2, sr), ir.size()
         assert sr == sample_rate, (sr, sample_rate)
         signals = convolve(signals, ir)
@@ -3474,7 +3479,7 @@ class WavDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
         file, speaker_id = self.audio_files[index]
-        clean_wav, sample_rate = torchaudio.load(file, backend="soundfile")
+        clean_wav, sample_rate = torchaudio.load(file)
         if clean_wav.size(0) != 1:
             ch = torch.randint(0, clean_wav.size(0), ())
             clean_wav = clean_wav[ch : ch + 1]
@@ -3804,14 +3809,19 @@ def prepare_training():
         augmentation_lpf_probability=h.augmentation_lpf_probability,
         augmentation_lpf_cutoff_freq_candidates=h.augmentation_lpf_cutoff_freq_candidates,
     )
+    _is_cuda = torch.cuda.is_available()
+    _n_files = len(training_filelist)
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
-        num_workers=min(h.num_workers, os.cpu_count()),
+        # Cap workers at file count — more workers than files causes StopIteration
+        # before the first batch on small datasets. Also cap at cpu_count.
+        num_workers=min(h.num_workers, os.cpu_count(), max(1, _n_files)),
         collate_fn=training_dataset.collate,
         shuffle=True,
         sampler=None,
         batch_size=h.batch_size,
-        pin_memory=True,
+        # pin_memory only works on CUDA; MPS uses unified memory
+        pin_memory=_is_cuda,
         drop_last=True,
         persistent_workers=True,
     )
@@ -3962,17 +3972,22 @@ def prepare_training():
 
     def wav_iterator(files):
         for file in files:
-            wav, sr = torchaudio.load(file, backend="soundfile")
+            wav, sr = torchaudio.load(file)
             wav = wav.to(device)
             if sr != h.in_sample_rate:
                 wav = get_resampler(sr, h.in_sample_rate, device)(wav)
             wav = wav[:, None, :]  # [C, 1, T]
-            # Yield fixed-length chunks so attention stays O(chunk²) not O(file²)
+            # Yield fixed-length chunks so attention stays O(chunk²) not O(file²).
+            # Pad last chunk to multiple of 160 (PhoneExtractor hop requirement).
             T = wav.shape[-1]
             for start in range(0, T, _VQ_CHUNK_SAMPLES):
                 chunk = wav[:, :, start:start + _VQ_CHUNK_SAMPLES]
-                if chunk.shape[-1] > 0:
-                    yield chunk
+                if chunk.shape[-1] == 0:
+                    continue
+                rem = chunk.shape[-1] % 160
+                if rem != 0:
+                    chunk = torch.nn.functional.pad(chunk, (0, 160 - rem))
+                yield chunk
 
     if resume:
         net_g.enable_hook()
@@ -4342,7 +4357,7 @@ if __name__ == "__main__" and writer is not None:
                     for i, ((file, target_ids), pitch_shift_semitones) in enumerate(
                         zip(test_filelist, test_pitch_shifts)
                     ):
-                        source_wav, sr = torchaudio.load(file, backend="soundfile")
+                        source_wav, sr = torchaudio.load(file)
                         source_wav = source_wav.to(device)
                         if sr != h.in_sample_rate:
                             source_wav = get_resampler(sr, h.in_sample_rate, device)(
