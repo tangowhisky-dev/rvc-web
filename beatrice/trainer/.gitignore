@@ -1,0 +1,11 @@
+# Large binary assets — downloaded via beatrice/download_assets.py
+assets/pretrained/
+assets/ir/
+assets/noise/
+assets/test/
+assets/images/
+
+# Upstream repo metadata (not needed — we vendor only the patched source)
+.gitattributes
+pyproject.toml
+uv.lock
