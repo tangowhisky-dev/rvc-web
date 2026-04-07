@@ -119,6 +119,7 @@ echo "  batch:  ${BATCH_SIZE:-16 (default)}"
 echo "============================================================"
 
 cd "$TRAINER_DIR"
+export BEATRICE_TRAINER_ROOT="$TRAINER_DIR"
 python3 -m beatrice_trainer \
     --data_dir "$DATA_DIR" \
     --out_dir  "$OUT_DIR" \
