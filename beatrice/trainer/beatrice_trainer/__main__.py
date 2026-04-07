@@ -3955,13 +3955,24 @@ def prepare_training():
         grad_balancer.load_state_dict(checkpoint["grad_balancer"])
         grad_scaler.load_state_dict(checkpoint["grad_scaler"])
 
+    # Maximum chunk length for codebook building: 10 seconds at in_sample_rate.
+    # PhoneExtractor has O(seq²) self-attention — feeding full long files causes
+    # an exponential memory blow-up on MPS/CPU (e.g. 18min → 90GB attn buffer).
+    _VQ_CHUNK_SAMPLES = h.in_sample_rate * 10  # 160 000 samples @ 16kHz
+
     def wav_iterator(files):
         for file in files:
             wav, sr = torchaudio.load(file, backend="soundfile")
             wav = wav.to(device)
             if sr != h.in_sample_rate:
                 wav = get_resampler(sr, h.in_sample_rate, device)(wav)
-            yield wav[:, None, :]
+            wav = wav[:, None, :]  # [C, 1, T]
+            # Yield fixed-length chunks so attention stays O(chunk²) not O(file²)
+            T = wav.shape[-1]
+            for start in range(0, T, _VQ_CHUNK_SAMPLES):
+                chunk = wav[:, :, start:start + _VQ_CHUNK_SAMPLES]
+                if chunk.shape[-1] > 0:
+                    yield chunk
 
     if resume:
         net_g.enable_hook()
