@@ -2313,11 +2313,11 @@ class ConverterNetwork(nn.Module):
             if self.training and self.phone_noise_ratio != 0.0:
                 phone *= (1.0 - self.phone_noise_ratio) / phone.square().mean(
                     1, keepdim=True
-                ).sqrt_()
+                ).add_(torch.finfo(torch.float).eps).sqrt_()
                 noise = torch.randn_like(phone)
                 noise *= (
                     self.phone_noise_ratio
-                    / noise.square().mean(1, keepdim=True).sqrt_()
+                    / noise.square().mean(1, keepdim=True).add_(torch.finfo(torch.float).eps).sqrt_()
                 )
                 phone += noise
             # F.rms_norm は PyTorch >= 2.4 が必要
@@ -3533,7 +3533,12 @@ class WavDataset(torch.utils.data.Dataset):
 
         # 音量をランダマイズする
         amplitude = torch.rand(()).item() * 0.899 + 0.1
-        factor = amplitude / clean_wav.abs().max()
+        wav_max = clean_wav.abs().max()
+        if wav_max < 1e-6:
+            # Silent chunk (padding region or actual silence) — skip by
+            # returning zeros; collate will reject it via voiced.numel() != 0
+            return None
+        factor = amplitude / wav_max
         clean_wav *= factor
         noisy_wav_16k *= factor
         while noisy_wav_16k.abs().max() >= 1.0:
@@ -3555,7 +3560,10 @@ class WavDataset(torch.utils.data.Dataset):
         slice_starts = []
         speaker_ids = []
         formant_shifts = []
-        for clean_wav, noisy_wav, speaker_id, formant_shift in batch:
+        for item in batch:
+            if item is None:
+                continue  # silent chunk — skip
+            clean_wav, noisy_wav, speaker_id, formant_shift = item
             # 発声部分をランダムに 1 箇所選ぶ
             (voiced,) = clean_wav.nonzero(as_tuple=True)
             assert voiced.numel() != 0
@@ -3580,6 +3588,11 @@ class WavDataset(torch.utils.data.Dataset):
             slice_starts.append(slice_start)
             speaker_ids.append(speaker_id)
             formant_shifts.append(formant_shift)
+        if not clean_wavs:
+            raise RuntimeError(
+                "collate: entire batch was silent — all chunks had max amplitude < 1e-6. "
+                "Check that your audio files contain actual speech."
+            )
         clean_wavs = torch.stack(clean_wavs)
         noisy_wavs = torch.stack(noisy_wavs)
         slice_starts = torch.tensor(slice_starts)
