@@ -28,6 +28,7 @@ import torchaudio
 from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, weight_norm
 from torch.utils.tensorboard import SummaryWriter
+from torchcodec.decoders import AudioDecoder as _AudioDecoder
 from tqdm.auto import tqdm
 
 # torchaudio >= 2.1 removed list_audio_backends; with torchcodec installed,
@@ -3428,7 +3429,7 @@ def augment_audio(
 class WavDataset(torch.utils.data.Dataset):
     def __init__(
         self,
-        audio_files: list[tuple[Path, int]],
+        audio_files: list[tuple[Path, int, int, int]],
         in_sample_rate: int = 16000,
         out_sample_rate: int = 24000,
         wav_length: int = 4 * 24000,  # 4s
@@ -3478,8 +3479,10 @@ class WavDataset(torch.utils.data.Dataset):
         self.out_hop_length = out_sample_rate // 100  # 10ms 刻み
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-        file, speaker_id = self.audio_files[index]
-        clean_wav, sample_rate = torchaudio.load(file)
+        file, speaker_id, frame_offset, num_frames = self.audio_files[index]
+        clean_wav, sample_rate = torchaudio.load(
+            file, frame_offset=frame_offset, num_frames=num_frames
+        )
         if clean_wav.size(0) != 1:
             ch = torch.randint(0, clean_wav.size(0), ())
             clean_wav = clean_wav[ch : ch + 1]
@@ -3724,7 +3727,7 @@ def prepare_training():
     def get_training_filelist(in_wav_dataset_dir: Path):
         min_data_per_speaker = 1
         speakers: list[str] = []
-        training_filelist: list[tuple[Path, int]] = []
+        training_filelist: list[tuple[Path, int, int, int]] = []
         speaker_audio_files: list[list[Path]] = []
         for speaker_dir in sorted(in_wav_dataset_dir.iterdir()):
             if not speaker_dir.is_dir():
@@ -3740,7 +3743,24 @@ def prepare_training():
             if len(candidates) >= min_data_per_speaker:
                 speaker_id = len(speakers)
                 speakers.append(speaker_dir.name)
-                training_filelist.extend([(file, speaker_id) for file in candidates])
+                # Pre-segment each file into wav_length windows at the native
+                # sample rate.  This ensures __getitem__ loads only one window
+                # at a time — long files (e.g. 18-min mp3s) would otherwise
+                # cause the whole-file FFT in convolve() to OOM the worker.
+                for file in candidates:
+                    meta = _AudioDecoder(str(file)).metadata
+                    native_sr = meta.sample_rate
+                    total_frames = int(meta.duration_seconds * native_sr)
+                    # wav_length is in out_sample_rate samples; convert to native
+                    window_frames = int(
+                        h.wav_length * native_sr / h.out_sample_rate
+                    )
+                    if window_frames <= 0 or window_frames > total_frames:
+                        # File shorter than one window — use whole file
+                        training_filelist.append((file, speaker_id, 0, total_frames))
+                    else:
+                        for offset in range(0, total_frames - window_frames + 1, window_frames):
+                            training_filelist.append((file, speaker_id, offset, window_frames))
                 speaker_audio_files.append(candidates)
         return speakers, training_filelist, speaker_audio_files
 
