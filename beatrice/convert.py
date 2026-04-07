@@ -103,10 +103,10 @@ def load_model(model_dir: Path, device: torch.device):
     n_speakers = w.shape[0] if w is not None else 1
     print(f"  speakers: {n_speakers},  steps: {ckpt.get('iteration', '?')}")
 
-    phone_extractor = mod.PhoneExtractor().eval().requires_grad_(False)
+    phone_extractor = mod.PhoneExtractor().eval().requires_grad_(False).to(device)
     phone_extractor.load_state_dict(ckpt["phone_extractor"], strict=False)
 
-    pitch_estimator = mod.PitchEstimator().eval().requires_grad_(False)
+    pitch_estimator = mod.PitchEstimator().eval().requires_grad_(False).to(device)
     pitch_estimator.load_state_dict(ckpt["pitch_estimator"])
 
     net_g = mod.ConverterNetwork(
@@ -155,19 +155,39 @@ def convert(
 
     print(f"  {sr} Hz → {in_sr} Hz, {wav.shape[1] / in_sr:.2f}s")
 
+    # Process in chunks to avoid OOM on long files.
+    # Chunk size must be % 160 == 0 (feature extractor hop length).
+    # 6s @ 16kHz = 96000 samples matches wav_length used in training.
+    chunk_samples = 96000  # 6s @ 16kHz, % 160 == 0
+    # Output length ratio: out_sr / in_sr = 24000 / 16000 = 1.5
+    out_ratio = out_sr / in_sr
+
+    t_id = torch.tensor([speaker_id], dtype=torch.long, device=device)
+    f_shift = torch.tensor([float(formant_shift_semitones)], dtype=torch.float, device=device)
+    p_shift = torch.tensor([float(pitch_shift_semitones)], dtype=torch.float, device=device)
+
+    T = wav.shape[1]
+    chunks = []
     with torch.inference_mode():
-        t_id = torch.tensor([speaker_id], dtype=torch.long, device=device)
-        f_shift = torch.tensor([float(formant_shift_semitones)], dtype=torch.float, device=device)
-        p_shift = torch.tensor([float(pitch_shift_semitones)], dtype=torch.float, device=device)
+        for start in range(0, T, chunk_samples):
+            chunk = wav[:, start:start + chunk_samples]  # [1, N]
+            # Pad last chunk to multiple of 160
+            rem = chunk.shape[1] % 160
+            if rem != 0:
+                chunk = torch.nn.functional.pad(chunk, (0, 160 - rem))
+            out = net_g(
+                chunk.unsqueeze(0),  # [1, 1, N]
+                t_id,
+                f_shift,
+                pitch_shift_semitone=p_shift,
+            )  # [1, 1, T_out] or [1, T_out]
+            chunks.append(out.squeeze(0).squeeze(0).cpu().float())
 
-        y_hat = net_g(
-            wav.unsqueeze(0),   # [1, 1, T]
-            t_id,
-            f_shift,
-            pitch_shift_semitone=p_shift,
-        )  # [1, T_out] or [B, T_out]
+    y_hat = torch.cat(chunks, dim=0)
 
-    y_hat = y_hat.squeeze(0).squeeze(0).cpu().float()  # [T_out]
+    # Trim to expected output length
+    expected_samples = int(T * out_ratio)
+    y_hat = y_hat[:expected_samples]
 
     # Normalise to prevent clipping
     peak = y_hat.abs().max()
