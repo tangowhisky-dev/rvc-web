@@ -3977,22 +3977,15 @@ def prepare_training():
             if sr != h.in_sample_rate:
                 wav = get_resampler(sr, h.in_sample_rate, device)(wav)
             wav = wav[:, None, :]  # [C, 1, T]
-            # Yield fixed-length chunks so attention stays O(chunk²) not O(file²).
-            # Drop the last partial chunk rather than padding: padding injects silence
-            # into the tail receptive field, producing zero-contaminated activations
-            # that degrade k-means codebook quality. Dropping at most 159 samples
-            # (~10ms) per file is negligible.
+            # Yield exact _VQ_CHUNK_SAMPLES chunks only.  _VQ_CHUNK_SAMPLES is
+            # h.wav_length (96000) which is already a multiple of 160, so every
+            # yielded chunk satisfies the FeatureExtractor stride requirement with
+            # no padding or truncation needed.  The last partial chunk (< 96000
+            # samples) is silently dropped — it represents at most ~6s of tail
+            # audio per file, negligible for codebook statistics.
             T = wav.shape[-1]
-            for start in range(0, T, _VQ_CHUNK_SAMPLES):
-                chunk = wav[:, :, start:start + _VQ_CHUNK_SAMPLES]
-                # Truncate to nearest multiple of 160 (FeatureExtractor stride).
-                # A sub-160 chunk produces 0 frames; skip it entirely.
-                rem = chunk.shape[-1] % 160
-                if rem != 0:
-                    chunk = chunk[..., :chunk.shape[-1] - rem]
-                if chunk.shape[-1] == 0:
-                    continue
-                yield chunk
+            for start in range(0, T - _VQ_CHUNK_SAMPLES + 1, _VQ_CHUNK_SAMPLES):
+                yield wav[:, :, start:start + _VQ_CHUNK_SAMPLES]
 
     if resume:
         net_g.enable_hook()
