@@ -59,8 +59,11 @@ def repo_root() -> Path:
     assert d.is_absolute(), d
     for d in d.parents:
         if (d / ".git").is_dir():
-            return d
-    raise RuntimeError("Repository root is not found.")
+            # Skip outer repos that don't own our assets (vendored scenario)
+            if (d / "assets" / "default_config.json").is_file():
+                return d
+    # Fallback: directory containing this file's package = beatrice/trainer/
+    return Path(__file__).parent.parent
 
 
 # ハイパーパラメータ
