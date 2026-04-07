@@ -3831,10 +3831,17 @@ def prepare_training():
     )
     _is_cuda = torch.cuda.is_available()
     _n_files = len(training_filelist)
+    # macOS uses 'spawn' as the default multiprocessing start method, which
+    # re-imports __main__ as a built-in and can't unpickle classes defined in
+    # __main__.py (WavDataset, collate_fn, etc.).  Use 'fork' on non-CUDA
+    # platforms (macOS/CPU) — workers do pure CPU work so fork is safe.
+    # Linux already defaults to 'fork'; CUDA contexts aren't fork-safe so
+    # leave start method as-is (None = platform default) on CUDA.
+    _mp_context = None if _is_cuda else "fork"
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
-        # Cap workers at file count — more workers than files causes StopIteration
-        # before the first batch on small datasets. Also cap at cpu_count.
+        # Cap workers at segment count — more workers than segments causes
+        # StopIteration before the first batch on small datasets.
         num_workers=min(h.num_workers, os.cpu_count(), max(1, _n_files)),
         collate_fn=training_dataset.collate,
         shuffle=True,
@@ -3844,6 +3851,7 @@ def prepare_training():
         pin_memory=_is_cuda,
         drop_last=True,
         persistent_workers=True,
+        multiprocessing_context=_mp_context,
     )
 
     print("Computing mean F0s of target speakers...", end="")
