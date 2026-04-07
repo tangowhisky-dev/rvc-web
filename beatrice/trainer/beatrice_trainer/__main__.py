@@ -4493,8 +4493,21 @@ if __name__ == "__main__" and writer is not None:
                     paraphernalia_dir / "embedding_setter.bin"
                 )
                 del net_g_fp16
+                _noimage_src = repo_root() / "assets/images/noimage.png"
+                if not _noimage_src.exists():
+                    _noimage_src.parent.mkdir(parents=True, exist_ok=True)
+                    # Create a minimal 1x1 white PNG (no external deps needed)
+                    import struct, zlib
+                    def _make_1x1_png():
+                        def chunk(name, data):
+                            c = struct.pack(">I", len(data)) + name + data
+                            return c + struct.pack(">I", zlib.crc32(name + data) & 0xFFFFFFFF)
+                        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+                        idat = zlib.compress(b"\x00\xFF\xFF\xFF")
+                        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+                    _noimage_src.write_bytes(_make_1x1_png())
                 shutil.copy(
-                    repo_root() / "assets/images/noimage.png", paraphernalia_dir
+                    _noimage_src, paraphernalia_dir
                 )
                 with open(
                     paraphernalia_dir / f"beatrice_paraphernalia_{name}.toml",
