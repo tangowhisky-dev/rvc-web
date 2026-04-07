@@ -45,6 +45,10 @@ if not hasattr(torch.amp, "GradScaler"):
 
     torch.amp.GradScaler = GradScaler
 
+# AMP device string used in autocast() calls throughout the file.
+# Must be "cuda" for CUDA, "cpu" for MPS/CPU (MPS fp16 AMP is unstable).
+_AMP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 # モジュールのバージョンではない
 PARAPHERNALIA_VERSION = "2.0.0-rc.0"
@@ -1286,7 +1290,7 @@ class PitchEstimator(nn.Module):
 
         # [batch_size, input_instfreq_channels, length],
         # [batch_size, input_corr_channels, length]
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(_AMP_DEVICE, enabled=False):
             instfreq_features, corr_diff, energy = extract_pitch_features(
                 wav.squeeze(1),
                 hop_length=160,
@@ -1418,7 +1422,7 @@ def overlap_add(
     normalized_freq = pitch / sr
     # 初期位相 [2π rad] をランダムに設定
     normalized_freq[:, 0] = torch.rand(batch_size, device=pitch.device)
-    with torch.amp.autocast("cuda", enabled=False):
+    with torch.amp.autocast(_AMP_DEVICE, enabled=False):
         phase = (normalized_freq.double().cumsum_(1) % 1.0).float()
     # 重ねる箇所を求める
     # [n_pitchmarks], [n_pitchmarks]
@@ -2008,7 +2012,7 @@ class Vocoder(nn.Module):
         post_filter[:, 0, :] += 1.0
         # [batch_size, length, 512]
         post_filter = post_filter.transpose(1, 2)
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(_AMP_DEVICE, enabled=False):
             periodic_signal = periodic_signal.float()
             aperiodic_signal = aperiodic_signal.float()
             post_filter = post_filter.float()
@@ -2100,7 +2104,7 @@ def compute_loudness(
     n_taps = chunk_length + 1
 
     results = []
-    with torch.amp.autocast("cuda", enabled=False):
+    with torch.amp.autocast(_AMP_DEVICE, enabled=False):
         if not hasattr(compute_loudness, "filter"):
             compute_loudness.filter = {}
         if sr not in compute_loudness.filter:
@@ -2277,7 +2281,7 @@ class ConverterNetwork(nn.Module):
         if key in cache:
             return cache[key]
         resampler = torchaudio.transforms.Resample(orig_freq, new_freq).to(
-            device, non_blocking=True
+            device, non_blocking=device.type == "cuda"
         )
         cache[key] = resampler
         return resampler
@@ -2372,7 +2376,7 @@ class ConverterNetwork(nn.Module):
                     shift.append(shift_i)
                     shift_ratio[i] = shift_ratio_i
                     # [1, 1, wav_length / shift_ratio]
-                    with torch.amp.autocast("cuda", enabled=False):
+                    with torch.amp.autocast(_AMP_DEVICE, enabled=False):
                         shifted_x_i = self._get_resampler(
                             shift_numer_i, shift_denom_i, x.device
                         )(x[i])[None]
@@ -2551,7 +2555,7 @@ class ConverterNetwork(nn.Module):
         )
         y_hat_all = y_hat_all.detach().where(y_all == 0.0, y_hat_all)
 
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(_AMP_DEVICE, enabled=False):
             periodic_signal = intermediates["periodic_signal"].float()
             aperiodic_signal = intermediates["aperiodic_signal"].float()
             noise_excitation = intermediates["noise_excitation"].float()
@@ -2896,7 +2900,7 @@ class DiscriminatorR(nn.Module):
         x = F.pad(
             x, ((n_fft - hop_length) // 2, (n_fft - hop_length) // 2), mode="reflect"
         ).squeeze(1)
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(_AMP_DEVICE, enabled=False):
             mag = torch.stft(
                 x.float(),
                 n_fft=n_fft,
@@ -2968,7 +2972,7 @@ class MultiPeriodDiscriminator(nn.Module):
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = self(y, y_hat, flg_san_train=self.san)
         stats = {}
         assert len(y_d_gs) == len(y_d_rs) == len(self.discriminators)
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(_AMP_DEVICE, enabled=False):
             # discriminator loss
             d_loss = 0.0
             for dr, dg, name in zip(y_d_rs, y_d_gs, self.discriminator_names):
@@ -3804,6 +3808,10 @@ def prepare_training():
         augmentation_lpf_probability=h.augmentation_lpf_probability,
         augmentation_lpf_cutoff_freq_candidates=h.augmentation_lpf_cutoff_freq_candidates,
     )
+    _is_cuda = torch.cuda.is_available()
+    # macOS/Windows default to 'spawn' which can't unpickle WavDataset from
+    # __main__. Use 'fork' on non-CUDA platforms (workers do CPU-only work).
+    _mp_context = None if _is_cuda else "fork"
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
         num_workers=min(h.num_workers, os.cpu_count()),
@@ -3811,9 +3819,10 @@ def prepare_training():
         shuffle=True,
         sampler=None,
         batch_size=h.batch_size,
-        pin_memory=True,
+        pin_memory=_is_cuda,
         drop_last=True,
         persistent_workers=True,
+        multiprocessing_context=_mp_context,
     )
 
     print("Computing mean F0s of target speakers...", end="")
@@ -4122,7 +4131,7 @@ if __name__ == "__main__" and writer is not None:
                 slice_starts,
                 speaker_ids,
                 formant_shift_semitone,
-            ) = map(lambda x: x.to(device, non_blocking=True), batch)
+            ) = map(lambda x: x.to(device, non_blocking=_is_cuda), batch)
 
             # === 2. 学習 ===
             with torch.amp.autocast(_amp_device, enabled=_use_amp):
@@ -4328,6 +4337,8 @@ if __name__ == "__main__" and writer is not None:
                 net_g.eval()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                elif torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
 
                 dict_qualities_all = defaultdict(list)
                 n_added_wavs = 0
@@ -4418,6 +4429,8 @@ if __name__ == "__main__" and writer is not None:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                elif torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
 
             # === 5. 保存 ===
             if (iteration + 1) % h.save_interval == 0 or iteration + 1 in {
