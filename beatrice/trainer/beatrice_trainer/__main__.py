@@ -4105,6 +4105,8 @@ def prepare_training():
         dict_scalars,
         quality_tester,
         writer,
+        _amp_device,
+        _use_amp,
     )
 
 
@@ -4134,6 +4136,8 @@ if __name__ == "__main__":
         dict_scalars,
         quality_tester,
         writer,
+        _amp_device,
+        _use_amp,
     ) = prepare_training()
 
 if __name__ == "__main__" and writer is not None:
