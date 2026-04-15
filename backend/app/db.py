@@ -72,6 +72,22 @@ CREATE TABLE IF NOT EXISTS epoch_losses (
 )
 """
 
+_CREATE_BEATRICE_STEPS = """
+CREATE TABLE IF NOT EXISTS beatrice_steps (
+    id          TEXT PRIMARY KEY,
+    profile_id  TEXT NOT NULL,
+    step        INTEGER NOT NULL,
+    loss_g      REAL,
+    loss_d      REAL,
+    loss_mel    REAL,
+    loss_ap     REAL,
+    loss_loud   REAL,
+    loss_adv    REAL,
+    loss_fm     REAL,
+    trained_at  TEXT NOT NULL
+)
+"""
+
 # Columns added after the initial schema was shipped.
 # Each entry: (column_name, column_definition)
 # init_db() runs ALTER TABLE for any that are missing.
@@ -121,6 +137,9 @@ _MIGRATIONS: list[tuple[str, str]] = [
     # Decay — applies stiffness penalty toward pretrain anchor weights to limit
     # catastrophic forgetting).  Not locked — can be changed between runs.
     ("optimizer", "TEXT NOT NULL DEFAULT 'adamw'"),
+    # Engine / pipeline used by this profile: "rvc" (default) or "beatrice2".
+    # Locked at profile creation — cannot be changed after the first training run.
+    ("pipeline", "TEXT NOT NULL DEFAULT 'rvc'"),
 ]
 
 # Migrations for epoch_losses table
@@ -151,6 +170,7 @@ async def init_db() -> None:
         await db.execute(_CREATE_PROFILES)
         await db.execute(_CREATE_AUDIO_FILES)
         await db.execute(_CREATE_EPOCH_LOSSES)
+        await db.execute(_CREATE_BEATRICE_STEPS)
         await db.commit()
 
         # Column-level migrations on profiles (idempotent)

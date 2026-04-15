@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-beatrice/download_assets.py — download pretrained Beatrice 2 base models and
-augmentation data from HuggingFace.
+backend/beatrice2/download_assets.py — download pretrained Beatrice 2 base models and
+augmentation data from HuggingFace into assets/beatrice2/.
 
-Usage:
-    python3 beatrice/download_assets.py [--trainer-dir beatrice/trainer]
-    python3 beatrice/download_assets.py --full        # also get all 1000 IR/noise files
-    python3 beatrice/download_assets.py --force       # re-download everything
+Usage (from rvc-web/ root):
+    python3 -m backend.beatrice2.download_assets
+    python3 -m backend.beatrice2.download_assets --full        # all 1000 IR/noise files
+    python3 -m backend.beatrice2.download_assets --force       # re-download everything
 
 By default downloads:
   - 3 pretrained model checkpoints (~175 MB)  [required]
@@ -14,8 +14,8 @@ By default downloads:
   - 20 impulse response files (IR)            [required — trainer asserts dir non-empty]
   - 20 background noise files                 [required — trainer asserts dir non-empty]
 
-The trainer randomly samples from IR/noise for data augmentation.
-20 files of each is sufficient for training; --full grabs all 1000 of each.
+All files are placed under {PROJECT_ROOT}/assets/beatrice2/ which mirrors the
+HF repo layout (assets/pretrained/, assets/ir/, assets/noise/, assets/test/).
 """
 
 import argparse
@@ -116,8 +116,27 @@ def _download(url: str, dest: Path, skip_404: bool = False) -> bool:
         raise RuntimeError(f"Failed to download {url}: {e}") from e
 
 
-def download_assets(trainer_dir: Path, full: bool = False, force: bool = False):
-    print(f"Trainer directory: {trainer_dir}")
+def _project_root() -> Path:
+    """Return rvc-web/ project root."""
+    env = os.environ.get("PROJECT_ROOT")
+    if env:
+        return Path(env)
+    # Fallback: two levels up from this file (backend/beatrice2/ → rvc-web/)
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _default_assets_dir() -> Path:
+    return _project_root() / "assets" / "beatrice2"
+
+
+def download_assets(assets_dir: Path, full: bool = False, force: bool = False):
+    """Download all required Beatrice 2 assets into *assets_dir*.
+
+    The HF repo layout mirrors our target layout exactly:
+      assets/pretrained/*, assets/ir/*, assets/noise/*, assets/test/*
+    so each rel_path is appended directly to assets_dir.
+    """
+    print(f"Assets directory: {assets_dir}")
 
     ir_files = IR_FULL if full else IR_SUBSET
     noise_files = NOISE_FULL if full else NOISE_SUBSET
@@ -129,7 +148,10 @@ def download_assets(trainer_dir: Path, full: bool = False, force: bool = False):
 
     skipped = 0
     for rel_path in all_assets:
-        dest = trainer_dir / rel_path
+        # rel_path starts with "assets/" — strip that prefix so files land
+        # directly under assets_dir (e.g. assets_dir/pretrained/...)
+        stripped = rel_path[len("assets/"):]
+        dest = assets_dir / stripped
         if dest.exists() and not force:
             skipped += 1
             continue
@@ -142,8 +164,8 @@ def download_assets(trainer_dir: Path, full: bool = False, force: bool = False):
     print("All assets ready.")
 
     # Verify dirs are non-empty (trainer asserts this)
-    ir_dir = trainer_dir / "assets/ir"
-    noise_dir = trainer_dir / "assets/noise"
+    ir_dir = assets_dir / "ir"
+    noise_dir = assets_dir / "noise"
     n_ir = len(list(ir_dir.glob("*.flac"))) if ir_dir.exists() else 0
     n_noise = len(list(noise_dir.glob("*.flac"))) if noise_dir.exists() else 0
     print(f"  IR files:    {n_ir}")
@@ -151,38 +173,32 @@ def download_assets(trainer_dir: Path, full: bool = False, force: bool = False):
 
     if n_ir == 0 or n_noise == 0:
         print("\nWarning: IR or noise dir is empty — training will fail.")
-        print("Try: cd beatrice/trainer && git lfs pull")
     else:
-        print("\nReady to train. See beatrice/README.md for usage.")
+        print("\nReady to train.")
 
     if not full:
         print()
         print("Tip: using a 20-file subset of IR/noise (sufficient for training).")
-        print("For the full 1000-file augmentation set, run:")
-        print("  cd beatrice/trainer && git lfs pull")
+        print("For the full 1000-file augmentation set, re-run with --full.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download Beatrice 2 pretrained assets",
+        description="Download Beatrice 2 pretrained assets into assets/beatrice2/",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # Default: trainer/ sibling to this script — works from any cwd
-    _default_trainer = Path(__file__).parent / "trainer"
-    parser.add_argument("--trainer-dir", default=_default_trainer,
-                        type=Path, help="Path to beatrice/trainer directory")
+    parser.add_argument(
+        "--assets-dir", default=None, type=Path,
+        help="Destination directory (default: {PROJECT_ROOT}/assets/beatrice2/)",
+    )
     parser.add_argument("--full", action="store_true",
-                        help="Download all 1000 IR files (use git lfs pull for full noise set)")
+                        help="Download all 1000 IR/noise files (default: 20-file subset)")
     parser.add_argument("--force", action="store_true",
                         help="Re-download even if files already exist")
     args = parser.parse_args()
 
-    trainer_dir = Path(args.trainer_dir).resolve()
-    if not (trainer_dir / "beatrice_trainer/__main__.py").exists():
-        print(f"Error: beatrice_trainer/__main__.py not found in {trainer_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    download_assets(trainer_dir, full=args.full, force=args.force)
+    assets_dir = Path(args.assets_dir).resolve() if args.assets_dir else _default_assets_dir()
+    download_assets(assets_dir, full=args.full, force=args.force)
 
 
 if __name__ == "__main__":

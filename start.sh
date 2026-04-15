@@ -155,6 +155,7 @@ find temp/ -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null || true
 # 6. PROJECT_ROOT — single source of truth for all path resolution
 # ---------------------------------------------------------------------------
 export PROJECT_ROOT="$(pwd)"
+export BEATRICE_TRAINER_ROOT="$(pwd)"
 echo "[start] PROJECT_ROOT=$PROJECT_ROOT"
 
 # ---------------------------------------------------------------------------

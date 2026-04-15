@@ -45,22 +45,6 @@ if not hasattr(torch.amp, "GradScaler"):
 
     torch.amp.GradScaler = GradScaler
 
-# Suppress MPS FFT kernel resize warning: PyTorch MPS backend unconditionally
-# allocates an empty [] output buffer for all FFT ops and resizes it at runtime.
-# This fires on every torch.fft.* / torch.stft call on MPS regardless of input
-# contiguity. It's an unfixed PyTorch bug (present through 2.11); not actionable
-# from user code. Suppress to avoid log spam.
-if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    warnings.filterwarnings(
-        "ignore",
-        message="An output with one or more elements was resized",
-        category=UserWarning,
-    )
-
-# AMP device string used in autocast() calls throughout the file.
-# Must be "cuda" for CUDA, "cpu" for MPS/CPU (MPS fp16 AMP is unstable).
-_AMP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 
 # モジュールのバージョンではない
 PARAPHERNALIA_VERSION = "2.0.0-rc.0"
@@ -98,7 +82,7 @@ dict_default_hparams = {
     "grad_weight_fm": 150.0,
     "grad_balancer_ema_decay": 0.995,
     "use_amp": True,
-    "num_workers": 16,
+    "num_workers": 32,
     "n_steps": 10000,
     "warmup_steps": 5000,
     "evaluation_interval": 2000,
@@ -111,7 +95,7 @@ dict_default_hparams = {
     "vq_topk": 4,
     "training_time_vq": "none",  # "none", "self" or "random"
     "floor_noise_level": 1e-3,
-    "record_metrics": False,
+    "record_metrics": True,
     # augmentation
     "augmentation_snr_candidates": [20.0, 25.0, 30.0, 35.0, 40.0, 45.0],
     "augmentation_formant_shift_probability": 0.5,
@@ -121,12 +105,12 @@ dict_default_hparams = {
     "augmentation_lpf_probability": 0.2,
     "augmentation_lpf_cutoff_freq_candidates": [2000.0, 3000.0, 4000.0, 6000.0],
     # data
-    "phone_extractor_file": "assets/pretrained/122_checkpoint_03000000.pt",
-    "pitch_estimator_file": "assets/pretrained/104_3_checkpoint_00300000.pt",
-    "in_ir_wav_dir": "assets/ir",
-    "in_noise_wav_dir": "assets/noise",
-    "in_test_wav_dir": "assets/test",
-    "pretrained_file": "assets/pretrained/151_checkpoint_libritts_r_200_02750000.pt.gz",  # None も可
+    "phone_extractor_file": "assets/beatrice2/pretrained/122_checkpoint_03000000.pt",
+    "pitch_estimator_file": "assets/beatrice2/pretrained/104_3_checkpoint_00300000.pt",
+    "in_ir_wav_dir": "assets/beatrice2/ir",
+    "in_noise_wav_dir": "assets/beatrice2/noise",
+    "in_test_wav_dir": "assets/beatrice2/test",
+    "pretrained_file": "assets/beatrice2/pretrained/151_checkpoint_libritts_r_200_02750000.pt.gz",  # None も可
     # model
     "pitch_bins": 448,  # 変更不可
     "hidden_channels": 256,  # ファインチューン時変更不可、変更した場合は推論側の対応必要
@@ -1198,7 +1182,7 @@ def extract_pitch_features(
 
     # フレームにする
     # [..., win_length, n_frames]
-    y_frames = y.unfold(-1, win_length, hop_length).transpose_(-2, -1).contiguous()
+    y_frames = y.unfold(-1, win_length, hop_length).transpose_(-2, -1)
 
     # 複素スペクトログラム
     # Complex[..., (win_length // 2 + 1), n_frames]
@@ -1224,9 +1208,12 @@ def extract_pitch_features(
     )
 
     # 自己相関
-    flipped_y_frames = y_frames.flip((-2,)).contiguous()
+    # 元々これに 2.0 / corr_win_length を掛けて使おうと思っていたが、
+    # この値は振幅の 2 乗に比例していて、NN に入力するために良い感じに分散を
+    # 標準化する方法が思いつかなかったのでやめた
+    flipped_y_frames = y_frames.flip((-2,))
     a = torch.fft.rfft(flipped_y_frames, n=win_length, dim=-2)
-    b = torch.fft.rfft(y_frames[..., -corr_win_length:, :].contiguous(), n=win_length, dim=-2)
+    b = torch.fft.rfft(y_frames[..., -corr_win_length:, :], n=win_length, dim=-2)
     # [..., max_corr_period, n_frames]
     corr = torch.fft.irfft(a * b, n=win_length, dim=-2)[..., corr_win_length:, :]
 
@@ -1299,7 +1286,7 @@ class PitchEstimator(nn.Module):
 
         # [batch_size, input_instfreq_channels, length],
         # [batch_size, input_corr_channels, length]
-        with torch.amp.autocast(_AMP_DEVICE, enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             instfreq_features, corr_diff, energy = extract_pitch_features(
                 wav.squeeze(1),
                 hop_length=160,
@@ -1431,21 +1418,21 @@ def overlap_add(
     normalized_freq = pitch / sr
     # 初期位相 [2π rad] をランダムに設定
     normalized_freq[:, 0] = torch.rand(batch_size, device=pitch.device)
-    with torch.amp.autocast(_AMP_DEVICE, enabled=False):
-        _use_double = pitch.device.type == "cuda" or pitch.device.type == "cpu"
-        phase = (normalized_freq.double().cumsum_(1) % 1.0).float() if _use_double else (normalized_freq.float().cumsum_(1) % 1.0)
+    with torch.amp.autocast("cuda", enabled=False):
+        phase = (normalized_freq.double().cumsum_(1) % 1.0).float()
     # 重ねる箇所を求める
+    # [n_pitchmarks], [n_pitchmarks]
     indices0, indices1 = torch.nonzero(phase[:, :-1] > phase[:, 1:], as_tuple=True)
+    # 重ねる箇所の小数部分 (位相の遅れ) を求める
     numer = 1.0 - phase[indices0, indices1]
-    denom = numer + phase[indices0, indices1 + 1]
-    # Guard against zero denominator: on MPS float32 cumsum, phase can land
-    # exactly on a wrap boundary giving numer=0 and next_phase=0, so denom=0.
-    # On CUDA float64 cumsum this doesn't occur (higher precision avoids exact 0).
-    # Clamp to a small epsilon — fractional_part will be 0.0, meaning no
-    # sub-sample delay, which is correct behaviour for an exact-boundary pitchmark.
-    fractional_part = numer / denom.clamp(min=1e-7)
+    # [n_pitchmarks]
+    fractional_part = numer / (numer + phase[indices0, indices1 + 1])
+    # 重ねる値を求める
+    # Complex[n_pitchmarks, ir_length / 2 + 1]
     ir_amp = ir_amp[indices0, :, indices1 // hop_length]
     ir_phase = ir_phase[indices0, :, indices1 // hop_length]
+    # 位相遅れの量 [rad]
+    # [n_pitchmarks, ir_length / 2 + 1]
     delay_phase = (
         torch.arange(ir_length // 2 + 1, device=pitch.device, dtype=torch.float32)[
             None, :
@@ -1453,7 +1440,9 @@ def overlap_add(
         * (-math.tau / ir_length)
         * fractional_part[:, None]
     )
+    # Complex[n_pitchmarks, ir_length / 2 + 1]
     spec = torch.polar(ir_amp, ir_phase + delay_phase)
+    # [n_pitchmarks, ir_length]
     ir = torch.fft.irfft(spec, n=ir_length, dim=1)
     ir *= window
 
@@ -1537,7 +1526,7 @@ def interp(x: torch.Tensor, y: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
     assert (x.max(-1).values == x[..., -1]).all()
     assert (xi.min(-1).values >= x[..., 0]).all()
     assert (xi.max(-1).values <= x[..., -1]).all()
-    delta_x = (x[..., -1].float() - x[..., 0].float()) / (x.size(-1) - 1.0)
+    delta_x = (x[..., -1].double() - x[..., 0].double()) / (x.size(-1) - 1.0)
     delta_x = delta_x.to(x.dtype)
     xi = (xi - x[..., :1]).div_(delta_x[..., None])
     xi_base = xi.floor()
@@ -1983,11 +1972,7 @@ class Vocoder(nn.Module):
         # [batch_size, 512, length]
         ir = self.ir_generator_post(ir)
         ir *= self.ir_scale
-        # Clamp before exp to prevent overflow: exp(x) overflows fp32 for x > ~88.
-        # Large ir values are physically meaningless (extreme amplitude ratios);
-        # clamping at 10 (exp(10)≈22000) is safe — no legitimate IR has amplitude
-        # ratios beyond this range at initialisation or during stable training.
-        ir_amp = ir[:, : ir.size(1) // 2 + 1, :].clamp(max=10.0).exp()
+        ir_amp = ir[:, : ir.size(1) // 2 + 1, :].exp()
         ir_phase = F.pad(ir[:, ir.size(1) // 2 + 1 :, :], (0, 0, 1, 1))
         ir_phase[:, 1::2, :] += math.pi
         # TODO: 直流成分が正の値しか取れないのを修正する
@@ -2006,6 +1991,7 @@ class Vocoder(nn.Module):
             delay=0,
             sr=self.out_sample_rate,
         )
+
         aperiodicity = self.aperiodicity_generator(x)
         aperiodicity = F.silu(aperiodicity, inplace=True)
         # [batch_size, hop_length, length]
@@ -2022,7 +2008,7 @@ class Vocoder(nn.Module):
         post_filter[:, 0, :] += 1.0
         # [batch_size, length, 512]
         post_filter = post_filter.transpose(1, 2)
-        with torch.amp.autocast(_AMP_DEVICE, enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             periodic_signal = periodic_signal.float()
             aperiodic_signal = aperiodic_signal.float()
             post_filter = post_filter.float()
@@ -2114,11 +2100,11 @@ def compute_loudness(
     n_taps = chunk_length + 1
 
     results = []
-    with torch.amp.autocast(_AMP_DEVICE, enabled=False):
+    with torch.amp.autocast("cuda", enabled=False):
         if not hasattr(compute_loudness, "filter"):
             compute_loudness.filter = {}
         if sr not in compute_loudness.filter:
-            ir = torch.zeros(n_taps, device=x.device, dtype=torch.float)
+            ir = torch.zeros(n_taps, device=x.device, dtype=torch.double)
             ir[0] = 0.5
             ir = torchaudio.functional.treble_biquad(
                 ir, sr, 4.0, 1500.0, 1.0 / math.sqrt(2)
@@ -2291,7 +2277,7 @@ class ConverterNetwork(nn.Module):
         if key in cache:
             return cache[key]
         resampler = torchaudio.transforms.Resample(orig_freq, new_freq).to(
-            device, non_blocking=device.type == "cuda"
+            device, non_blocking=True
         )
         cache[key] = resampler
         return resampler
@@ -2386,7 +2372,7 @@ class ConverterNetwork(nn.Module):
                     shift.append(shift_i)
                     shift_ratio[i] = shift_ratio_i
                     # [1, 1, wav_length / shift_ratio]
-                    with torch.amp.autocast(_AMP_DEVICE, enabled=False):
+                    with torch.amp.autocast("cuda", enabled=False):
                         shifted_x_i = self._get_resampler(
                             shift_numer_i, shift_denom_i, x.device
                         )(x[i])[None]
@@ -2517,25 +2503,6 @@ class ConverterNetwork(nn.Module):
 
         # [batch_size, hidden_channels, segment_length] -> [batch_size, 1, segment_length * 240]
         y_g_hat, stats = self.vocoder(x, pitch, speaker_embedding)
-        if not y_g_hat.isfinite().all():
-            _bad = (~y_g_hat.isfinite()).sum().item()
-            _x_ok = x.isfinite().all().item()
-            _p_ok = pitch.isfinite().all().item()
-            _se_ok = speaker_embedding.isfinite().all().item()
-            _emb_report = ""
-            if not _x_ok or not _se_ok:
-                for _pname, _param in self.named_parameters():
-                    if not _param.isfinite().all():
-                        _n_bad = (~_param.isfinite()).sum().item()
-                        _emb_report += f"\n  BAD param: {_pname} — {_n_bad}/{_param.numel()} non-finite"
-                        if len(_emb_report) > 800:
-                            _emb_report += "\n  (truncated)"
-                            break
-            raise RuntimeError(
-                f"NaN/Inf in y_g_hat from vocoder: {_bad}/{y_g_hat.numel()} bad. "
-                f"inputs: x_ok={_x_ok} pitch_ok={_p_ok} speaker_emb_ok={_se_ok}"
-                + (_emb_report or "")
-            )
         stats["pitch"] = pitch
         if return_stats:
             return y_g_hat, stats
@@ -2582,15 +2549,9 @@ class ConverterNetwork(nn.Module):
             formant_shift_semitone,
             return_stats=True,
         )
-        if not y_hat_all.isfinite().all():
-            raise RuntimeError(
-                f"NaN/Inf in y_hat_all immediately after self(): "
-                f"{(~y_hat_all.isfinite()).sum().item()} of {y_hat_all.numel()} bad"
-            )
-        _y_hat_detached = y_hat_all.detach() if torch.cuda.is_available() else y_hat_all.detach().clone()
-        y_hat_all = _y_hat_detached.where(y_all == 0.0, y_hat_all)
+        y_hat_all = y_hat_all.detach().where(y_all == 0.0, y_hat_all)
 
-        with torch.amp.autocast(_AMP_DEVICE, enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             periodic_signal = intermediates["periodic_signal"].float()
             aperiodic_signal = intermediates["aperiodic_signal"].float()
             noise_excitation = intermediates["noise_excitation"].float()
@@ -2935,7 +2896,7 @@ class DiscriminatorR(nn.Module):
         x = F.pad(
             x, ((n_fft - hop_length) // 2, (n_fft - hop_length) // 2), mode="reflect"
         ).squeeze(1)
-        with torch.amp.autocast(_AMP_DEVICE, enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             mag = torch.stft(
                 x.float(),
                 n_fft=n_fft,
@@ -3007,7 +2968,7 @@ class MultiPeriodDiscriminator(nn.Module):
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = self(y, y_hat, flg_san_train=self.san)
         stats = {}
         assert len(y_d_gs) == len(y_d_rs) == len(self.discriminators)
-        with torch.amp.autocast(_AMP_DEVICE, enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             # discriminator loss
             d_loss = 0.0
             for dr, dg, name in zip(y_d_rs, y_d_gs, self.discriminator_names):
@@ -3643,11 +3604,6 @@ AUDIO_FILE_SUFFIXES = {
 def get_compressed_optimizer_state_dict(
     optimizer: torch.optim.Optimizer,
 ) -> dict:
-    # On MPS, skip bfloat16 compression — Adam state may contain values that
-    # produce NaN when cast to bfloat16 due to reduced mantissa precision.
-    # bfloat16 has the same dynamic range as fp32 but only 7 mantissa bits,
-    # which can cause precision loss that manifests as NaN after the cast.
-    _compress = torch.cuda.is_available()
     state_dict = {}
     for k0, v0 in optimizer.state_dict().items():
         if k0 != "state":
@@ -3658,15 +3614,8 @@ def get_compressed_optimizer_state_dict(
             state_dict[k0][k1] = {}
             for k2, v2 in v1.items():
                 if isinstance(v2, torch.Tensor):
-                    state_dict[k0][k1][k2] = v2.bfloat16() if _compress else v2
-                    if not state_dict[k0][k1][k2].isfinite().all():
-                        n_bad = (~state_dict[k0][k1][k2].isfinite()).sum().item()
-                        raise AssertionError(
-                            f"NaN/Inf in optimizer state[{k1}][{k2}]: "
-                            f"{n_bad}/{state_dict[k0][k1][k2].numel()} bad values. "
-                            f"fp32 min={v2.min().item():.4g} max={v2.max().item():.4g} "
-                            f"fp32_finite={v2.isfinite().all().item()}"
-                        )
+                    state_dict[k0][k1][k2] = v2.bfloat16()
+                    assert state_dict[k0][k1][k2].isfinite().all()
                 else:
                     state_dict[k0][k1][k2] = v2
     return state_dict
@@ -3855,10 +3804,6 @@ def prepare_training():
         augmentation_lpf_probability=h.augmentation_lpf_probability,
         augmentation_lpf_cutoff_freq_candidates=h.augmentation_lpf_cutoff_freq_candidates,
     )
-    _is_cuda = torch.cuda.is_available()
-    # macOS/Windows default to 'spawn' which can't unpickle WavDataset from
-    # __main__. Use 'fork' on non-CUDA platforms (workers do CPU-only work).
-    _mp_context = None if _is_cuda else "fork"
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
         num_workers=min(h.num_workers, os.cpu_count()),
@@ -3866,10 +3811,10 @@ def prepare_training():
         shuffle=True,
         sampler=None,
         batch_size=h.batch_size,
-        pin_memory=_is_cuda,
+        pin_memory=True,
         drop_last=True,
         persistent_workers=True,
-        multiprocessing_context=_mp_context,
+        prefetch_factor=4
     )
 
     print("Computing mean F0s of target speakers...", end="")
@@ -4000,34 +3945,6 @@ def prepare_training():
             ]
         print(net_g.load_state_dict(checkpoint["net_g"], strict=False))
         print(net_d.load_state_dict(checkpoint["net_d"], strict=False))
-
-        # Repair weight_norm parameters that were corrupted by NaN gradients in a
-        # prior run. weight_norm computes weight = weight_g * (weight_v / ‖weight_v‖).
-        # If weight_v rows were driven to zero or NaN by a bad Adam update, all
-        # downstream convolutions produce NaN permanently. Detect and reinitialise
-        # any such rows from the module's default initialisation scale.
-        def _repair_weight_norm(module: torch.nn.Module, prefix: str = "") -> int:
-            repaired = 0
-            for name, mod in module.named_modules():
-                for attr in ("weight_v", "weight_g"):
-                    if not hasattr(mod, attr):
-                        continue
-                    param = getattr(mod, attr)
-                    if not isinstance(param, torch.Tensor):
-                        continue
-                    bad_mask = ~param.isfinite() | (param.abs() < 1e-12)
-                    # collapse to per-output-channel (dim 0) — any bad element taints the channel
-                    if bad_mask.any():
-                        # reinit bad values to small random noise
-                        param.data[bad_mask] = torch.randn_like(param.data[bad_mask]) * 1e-3
-                        repaired += bad_mask.sum().item()
-            return repaired
-
-        repaired_g = _repair_weight_norm(net_g)
-        repaired_d = _repair_weight_norm(net_d)
-        if repaired_g + repaired_d > 0:
-            print(f"[checkpoint repair] reset {repaired_g} bad weight_norm values in net_g, "
-                  f"{repaired_d} in net_d")
         if resume or skip_training:
             optim_g.load_state_dict(
                 get_decompressed_optimizer_state_dict(checkpoint["optim_g"])
@@ -4035,15 +3952,6 @@ def prepare_training():
             optim_d.load_state_dict(
                 get_decompressed_optimizer_state_dict(checkpoint["optim_d"])
             )
-            # Purge NaN/Inf Adam state for any parameters that were repaired above.
-            # A corrupted weight_v also corrupts exp_avg/exp_avg_sq in the optimizer
-            # state — if left in place, the first Adam step will re-corrupt the weight.
-            if repaired_g + repaired_d > 0:
-                for opt in (optim_g, optim_d):
-                    for state in opt.state.values():
-                        for k, v in state.items():
-                            if isinstance(v, torch.Tensor) and not v.isfinite().all():
-                                state[k] = torch.zeros_like(v)
             initial_iteration = checkpoint["iteration"]
         grad_balancer.load_state_dict(checkpoint["grad_balancer"])
         grad_scaler.load_state_dict(checkpoint["grad_scaler"])
@@ -4101,7 +4009,7 @@ def prepare_training():
     if skip_training:
         writer = None
     else:
-        writer = SummaryWriter(out_dir)
+        writer = SummaryWriter(out_dir, flush_secs=10)
         if not h.record_metrics:
             writer.add_scalar = lambda *args, **kwargs: None
             writer.add_histogram = lambda *args, **kwargs: None
@@ -4143,7 +4051,6 @@ def prepare_training():
         writer,
         _amp_device,
         _use_amp,
-        _is_cuda,
     )
 
 
@@ -4175,7 +4082,6 @@ if __name__ == "__main__":
         writer,
         _amp_device,
         _use_amp,
-        _is_cuda,
     ) = prepare_training()
 
 if __name__ == "__main__" and writer is not None:
@@ -4217,7 +4123,7 @@ if __name__ == "__main__" and writer is not None:
                 slice_starts,
                 speaker_ids,
                 formant_shift_semitone,
-            ) = map(lambda x: x.to(device, non_blocking=_is_cuda), batch)
+            ) = map(lambda x: x.to(device, non_blocking=True), batch)
 
             # === 2. 学習 ===
             with torch.amp.autocast(_amp_device, enabled=_use_amp):
@@ -4299,30 +4205,11 @@ if __name__ == "__main__" and writer is not None:
                 g_grad_norm_stats = {}
 
             # === 2.5 パラメータの更新 ===
-            # Clip discriminator gradients before stepping — unconstrained updates on
-            # MPS float32 can drive weight_norm weight_v rows toward zero over time,
-            # causing NaN on the next forward pass.
-            torch.nn.utils.clip_grad_norm_(net_d.parameters(), 1.0)
             grad_scaler.step(optim_g)
             optim_g.zero_grad(set_to_none=True)
             grad_scaler.step(optim_d)
             optim_d.zero_grad(set_to_none=True)
             grad_scaler.update()
-
-            # Post-step weight_norm health check: reset any weight_v rows whose
-            # L2 norm has collapsed toward zero. weight_norm computes
-            # weight = weight_g * (weight_v / ‖weight_v‖); zero norm → NaN weight.
-            # Only needed on MPS (float32 precision); CUDA uses fp16 scaler which
-            # naturally prevents this drift.
-            if not _is_cuda:
-                for module in net_d.modules():
-                    if hasattr(module, "weight_v"):
-                        wv = module.weight_v  # [out, in, *kernel]
-                        norms = wv.flatten(1).norm(dim=1)  # [out]
-                        bad = norms < 1e-6
-                        if bad.any():
-                            with torch.no_grad():
-                                module.weight_v[bad] = torch.randn_like(module.weight_v[bad]) * 1e-2
 
             # === 3. ログ ===
             dict_scalars["loss_g/loss_loudness"].append(loss_loudness)
@@ -4349,16 +4236,19 @@ if __name__ == "__main__" and writer is not None:
                 dict_scalars[f"~loss_discriminator/{k}"].append(v)
             for k, v in gradient_balancer_stats.items():
                 dict_scalars[f"~gradient_balancer/{k}"].append(v)
-
-            if (iteration + 1) % 1000 == 0 or iteration == 0:
+            _tb_interval = 10
+            if (iteration + 1) % _tb_interval == 0 or iteration == 0:
                 for name, scalars in dict_scalars.items():
                     if scalars:
                         writer.add_scalar(
                             name, sum(scalars) / len(scalars), iteration + 1
                         )
                         scalars.clear()
-                for name, param in net_g.named_parameters():
-                    writer.add_histogram(f"weight/{name}", param, iteration + 1)
+                writer.flush()
+                # Histograms are expensive — only every 1000 iters
+                if (iteration + 1) % 1000 == 0 or iteration == 0:
+                    for name, param in net_g.named_parameters():
+                        writer.add_histogram(f"weight/{name}", param, iteration + 1)
 
                 intermediate_feature_stats = {}
                 hook_handles = []
@@ -4442,8 +4332,6 @@ if __name__ == "__main__" and writer is not None:
                 net_g.eval()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                elif torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
 
                 dict_qualities_all = defaultdict(list)
                 n_added_wavs = 0
@@ -4534,8 +4422,6 @@ if __name__ == "__main__" and writer is not None:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                elif torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
 
             # === 5. 保存 ===
             if (iteration + 1) % h.save_interval == 0 or iteration + 1 in {
