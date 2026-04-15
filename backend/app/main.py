@@ -36,11 +36,16 @@ async def lifespan(app: FastAPI):
     samples_dir = os.path.join(project_root, "data", "samples")
     os.makedirs(samples_dir, exist_ok=True)
 
+    # Ensure temp dir exists for offline job input/output files
+    temp_dir = os.path.join(project_root, "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+
     print(json.dumps({
         "event": "startup",
         "db_path": str(db_path),
         "project_root": project_root,
         "data_dir": samples_dir,
+        "temp_dir": temp_dir,
     }), flush=True)
     yield
 

@@ -88,6 +88,7 @@ async def client(tmp_path, monkeypatch):
     temp_db = str(tmp_path / "test.db")
     monkeypatch.setattr(db_module, "DB_PATH", temp_db)
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
     await db_module.init_db()
 
     from backend.app.main import app  # noqa: PLC0415
@@ -100,18 +101,14 @@ async def client(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def sync_client(tmp_path, monkeypatch):
-    """Synchronous Starlette TestClient — required for WebSocket tests.
-
-    httpx does not support WebSocket; starlette.testclient does.
-    Uses the same DB isolation strategy as the async ``client`` fixture.
-    """
+    """Synchronous Starlette TestClient — required for WebSocket tests."""
     import backend.app.db as db_module  # noqa: PLC0415
 
     temp_db = str(tmp_path / "test.db")
     monkeypatch.setattr(db_module, "DB_PATH", temp_db)
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
 
-    # Init DB synchronously via asyncio.run (Python 3.11 compatible)
     asyncio.run(db_module.init_db())
 
     from backend.app.main import app  # noqa: PLC0415
@@ -279,11 +276,14 @@ async def test_get_status_active_job(client, mock_manager):
 
 @pytest.mark.anyio
 async def test_get_status_no_job(client, mock_manager):
-    """GET /api/training/status/unknown → 404 when no active job."""
+    """GET /api/training/status/unknown → 200 idle when no active job (not 404)."""
     mock_manager.get_job.return_value = None
 
     resp = await client.get("/api/training/status/unknown-profile-id")
-    assert resp.status_code == 404, resp.text
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["phase"] == "idle"
+    assert body["status"] == "idle"
 
 
 # ---------------------------------------------------------------------------

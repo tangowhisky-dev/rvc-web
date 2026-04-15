@@ -449,6 +449,8 @@ async def convert_audio(
     use_best: bool = Form(False),
     noise_reduction: bool = Form(False),
     sola_crossfade_ms: int = Form(_SOLA_BUF_MS_DEFAULT),
+    pitch_shift_semitones: float = Form(0.0),
+    formant_shift_semitones: float = Form(0.0),
     file: UploadFile = File(...),
 ):
     """Convert an uploaded audio file using a trained profile.
@@ -461,34 +463,42 @@ async def convert_audio(
     # Load profile
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT id, name, profile_dir FROM profiles WHERE id = ?", (profile_id,)
+            "SELECT id, name, profile_dir, pipeline, model_path FROM profiles WHERE id = ?",
+            (profile_id,),
         )
         row = await cursor.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Profile not found")
 
+    profile_pipeline = str(row["pipeline"]) if row["pipeline"] else "rvc"
     pdir = row["profile_dir"]
     model_path = None
     index_path = None
     if pdir and os.path.isdir(pdir):
-        # Resolve model: prefer model_best.pth when use_best is set and file
-        # exists; fall back to model_infer.pth (latest) otherwise.
-        if use_best:
-            best_candidate = os.path.join(pdir, "model_best.pth")
-            mp = best_candidate if os.path.exists(best_candidate) else os.path.join(pdir, "model_infer.pth")
+        if profile_pipeline == "beatrice2":
+            # Beatrice 2: checkpoint_latest.pt.gz; no FAISS index
+            b2_ckpt = os.path.join(pdir, "beatrice2_out", "checkpoint_latest.pt.gz")
+            if os.path.exists(b2_ckpt):
+                model_path = b2_ckpt
         else:
-            mp = os.path.join(pdir, "model_infer.pth")
-        if os.path.exists(mp):
-            model_path = mp
-        import glob
+            # Resolve model: prefer model_best.pth when use_best is set and file
+            # exists; fall back to model_infer.pth (latest) otherwise.
+            if use_best:
+                best_candidate = os.path.join(pdir, "model_best.pth")
+                mp = best_candidate if os.path.exists(best_candidate) else os.path.join(pdir, "model_infer.pth")
+            else:
+                mp = os.path.join(pdir, "model_infer.pth")
+            if os.path.exists(mp):
+                model_path = mp
+            import glob
 
-        matches = glob.glob(os.path.join(pdir, "*.index"))
-        if matches:
-            index_path = matches[0]
+            matches = glob.glob(os.path.join(pdir, "*.index"))
+            if matches:
+                index_path = matches[0]
 
     if not model_path:
         raise HTTPException(status_code=400, detail="Profile has no trained model yet")
-    if not index_path:
+    if profile_pipeline != "beatrice2" and not index_path:
         raise HTTPException(status_code=400, detail="Profile has no FAISS index yet")
 
     # Read input audio
@@ -535,38 +545,82 @@ async def convert_audio(
         def _progress(fraction: float):
             loop.call_soon_threadsafe(progress_queue.put_nowait, fraction)
 
-        def _run():
-            try:
-                result_audio, tgt_sr = _run_offline_inference(
-                    audio_16k=audio_16k,
-                    audio_tgt=audio_16k,  # unused placeholder
-                    model_path=model_path,
-                    index_path=index_path,
-                    pitch=pitch,
-                    index_rate=index_rate,
-                    protect=protect,
-                    progress_cb=_progress,
-                    noise_reduction=noise_reduction,
-                    sola_crossfade_ms=sola_crossfade_ms,
-                )
-                # Write result to temp file preserving original format
-                out_path = _output_path(job_id, orig_ext)
-                _write_audio(out_path, result_audio, tgt_sr, orig_ext)
-                _jobs[job_id] = {
-                    "status": "done",
-                    "input_path": in_path,
-                    "result_path": out_path,
-                    "sample_rate": tgt_sr,
-                    "orig_filename": orig_filename,
-                }
-                loop.call_soon_threadsafe(progress_queue.put_nowait, "done")
-            except Exception as exc:
-                logger.exception("offline inference failed")
-                _jobs[job_id] = {"status": "error", "error": str(exc), "input_path": in_path}
-                loop.call_soon_threadsafe(progress_queue.put_nowait, f"error:{exc}")
+        # ---- Beatrice 2 inference ----
+        if profile_pipeline == "beatrice2":
+            b2_checkpoint = row["model_path"] if row["model_path"] else None
+            if not b2_checkpoint or not os.path.exists(b2_checkpoint):
+                # Try default location
+                if pdir:
+                    b2_checkpoint = os.path.join(pdir, "beatrice2_out", "checkpoint_latest.pt.gz")
+            if not b2_checkpoint or not os.path.exists(b2_checkpoint):
+                yield 'data: {"type":"error","message":"No Beatrice 2 checkpoint found. Train first."}\n\n'
+                return
 
-        # Run inference in thread pool (it's CPU/GPU intensive, blocks event loop)
-        loop.run_in_executor(None, _run)
+            def _run_b2():
+                try:
+                    from backend.beatrice2.inference import get_or_load_engine
+                    import torch
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    engine = get_or_load_engine(profile_id, b2_checkpoint, device)
+                    _progress(0.1)
+                    result = engine.convert(
+                        audio_16k,
+                        target_speaker_id=0,
+                        pitch_shift_semitones=float(pitch_shift_semitones),
+                        formant_shift_semitones=float(formant_shift_semitones),
+                    )
+                    _progress(0.9)
+                    tgt_sr = engine.OUT_SR
+                    out_path = _output_path(job_id, orig_ext)
+                    _write_audio(out_path, result, tgt_sr, orig_ext)
+                    _jobs[job_id] = {
+                        "status": "done",
+                        "input_path": in_path,
+                        "result_path": out_path,
+                        "sample_rate": tgt_sr,
+                        "orig_filename": orig_filename,
+                    }
+                    loop.call_soon_threadsafe(progress_queue.put_nowait, "done")
+                except Exception as exc:
+                    logger.exception("beatrice2 offline inference failed")
+                    _jobs[job_id] = {"status": "error", "error": str(exc), "input_path": in_path}
+                    loop.call_soon_threadsafe(progress_queue.put_nowait, f"error:{exc}")
+
+            loop.run_in_executor(None, _run_b2)
+        else:
+            # ---- RVC inference ----
+            def _run():
+                try:
+                    result_audio, tgt_sr = _run_offline_inference(
+                        audio_16k=audio_16k,
+                        audio_tgt=audio_16k,  # unused placeholder
+                        model_path=model_path,
+                        index_path=index_path,
+                        pitch=pitch,
+                        index_rate=index_rate,
+                        protect=protect,
+                        progress_cb=_progress,
+                        noise_reduction=noise_reduction,
+                        sola_crossfade_ms=sola_crossfade_ms,
+                    )
+                    # Write result to temp file preserving original format
+                    out_path = _output_path(job_id, orig_ext)
+                    _write_audio(out_path, result_audio, tgt_sr, orig_ext)
+                    _jobs[job_id] = {
+                        "status": "done",
+                        "input_path": in_path,
+                        "result_path": out_path,
+                        "sample_rate": tgt_sr,
+                        "orig_filename": orig_filename,
+                    }
+                    loop.call_soon_threadsafe(progress_queue.put_nowait, "done")
+                except Exception as exc:
+                    logger.exception("offline inference failed")
+                    _jobs[job_id] = {"status": "error", "error": str(exc), "input_path": in_path}
+                    loop.call_soon_threadsafe(progress_queue.put_nowait, f"error:{exc}")
+
+            # Run inference in thread pool (it's CPU/GPU intensive, blocks event loop)
+            loop.run_in_executor(None, _run)
 
         while True:
             try:

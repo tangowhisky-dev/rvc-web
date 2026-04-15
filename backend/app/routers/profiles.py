@@ -102,6 +102,8 @@ class ProfileOut(BaseModel):
     embedder: str = "spin-v2"
     # Vocoder decoder architecture.  Locked after first training.
     vocoder: str = "HiFi-GAN"
+    # Pipeline engine: "rvc" (default) or "beatrice2". Locked at creation.
+    pipeline: str = "rvc"
     # Best-epoch checkpoint info (None on old profiles that predate the feature).
     best_model_path: Optional[str] = None   # model_best.pth on disk, or None
     best_epoch: Optional[int] = None
@@ -204,13 +206,20 @@ async def _fetch_audio_files(db, profile_id: str) -> list[AudioFileOut]:
 def _resolve_model_path(row) -> Optional[str]:
     pdir = row["profile_dir"]
     stored = row["model_path"]
+    pipeline = (row["pipeline"] if "pipeline" in row.keys() else None) or "rvc"
     if pdir:
-        candidate = os.path.join(pdir, "model_infer.pth")
-        if os.path.exists(candidate):
-            return candidate
-        candidate_legacy = os.path.join(pdir, "model.pth")
-        if os.path.exists(candidate_legacy):
-            return candidate_legacy
+        if pipeline == "beatrice2":
+            # Beatrice 2 checkpoint
+            b2_ckpt = os.path.join(pdir, "beatrice2_out", "checkpoint_latest.pt.gz")
+            if os.path.exists(b2_ckpt):
+                return b2_ckpt
+        else:
+            candidate = os.path.join(pdir, "model_infer.pth")
+            if os.path.exists(candidate):
+                return candidate
+            candidate_legacy = os.path.join(pdir, "model.pth")
+            if os.path.exists(candidate_legacy):
+                return candidate_legacy
     return stored or None
 
 
@@ -286,6 +295,9 @@ async def _row_to_out(row, db) -> ProfileOut:
         vocoder=str(row["vocoder"])
         if "vocoder" in keys and row["vocoder"]
         else "HiFi-GAN",
+        pipeline=str(row["pipeline"])
+        if "pipeline" in keys and row["pipeline"]
+        else "rvc",
         best_model_path=_resolve_best_model_path(row),
         best_epoch=int(row["best_epoch"])
         if "best_epoch" in keys and row["best_epoch"] is not None
@@ -410,18 +422,32 @@ async def create_profile(
     seg_end: Optional[float] = Form(None),
     embedder: str = Form("spin-v2"),
     vocoder: str = Form("HiFi-GAN"),
+    pipeline: str = Form("rvc"),
 ) -> ProfileOut:
     """Upload an audio file, clip to the selected segment, and create a profile.
 
     embedder: feature embedder to use during training (locked after first run).
     vocoder: decoder architecture — "HiFi-GAN" or "RefineGAN" (locked after first run).
+    pipeline: voice conversion engine — "rvc" (default) or "beatrice2" (CUDA only).
     """
-    # Validate embedder name
+    import torch
+
+    # Validate pipeline
+    _VALID_PIPELINES = {"rvc", "beatrice2"}
+    if pipeline not in _VALID_PIPELINES:
+        raise HTTPException(status_code=400, detail=f"Invalid pipeline: {pipeline!r}")
+    if pipeline == "beatrice2" and not torch.cuda.is_available():
+        raise HTTPException(
+            status_code=400,
+            detail="Beatrice 2 requires a CUDA GPU. No CUDA device is available on this machine.",
+        )
+
+    # Validate embedder / vocoder only for RVC profiles
     _VALID_EMBEDDERS = {"spin-v2", "spin", "contentvec", "hubert"}
-    if embedder not in _VALID_EMBEDDERS:
+    if pipeline == "rvc" and embedder not in _VALID_EMBEDDERS:
         raise HTTPException(status_code=400, detail=f"Invalid embedder: {embedder!r}")
     _VALID_VOCODERS = {"HiFi-GAN", "RefineGAN"}
-    if vocoder not in _VALID_VOCODERS:
+    if pipeline == "rvc" and vocoder not in _VALID_VOCODERS:
         raise HTTPException(status_code=400, detail=f"Invalid vocoder: {vocoder!r}")
 
     profile_id = uuid.uuid4().hex
@@ -469,8 +495,8 @@ async def create_profile(
         await db.execute(
             """INSERT INTO profiles
                (id, name, status, sample_path, batch_size, audio_duration,
-                preprocessed_path, profile_dir, profile_rms, embedder, vocoder, created_at)
-               VALUES (?, ?, 'untrained', ?, 8, ?, NULL, ?, ?, ?, ?, ?)""",
+                preprocessed_path, profile_dir, profile_rms, embedder, vocoder, pipeline, created_at)
+               VALUES (?, ?, 'untrained', ?, 8, ?, NULL, ?, ?, ?, ?, ?, ?)""",
             (
                 profile_id,
                 name,
@@ -480,6 +506,7 @@ async def create_profile(
                 profile_rms,
                 embedder,
                 vocoder,
+                pipeline,
                 created_at,
             ),
         )
@@ -494,7 +521,7 @@ async def create_profile(
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder,
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder, pipeline,
                       best_epoch, best_avg_gen_loss
                FROM profiles WHERE id = ?""",
             (profile_id,),
@@ -621,7 +648,7 @@ async def list_profiles() -> list[ProfileOut]:
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder,
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder, pipeline,
                       best_epoch, best_avg_gen_loss
                FROM profiles ORDER BY created_at DESC"""
         )
@@ -644,7 +671,7 @@ async def get_profile(profile_id: str) -> ProfileOut:
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder,
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder, pipeline,
                       best_epoch, best_avg_gen_loss
                FROM profiles WHERE id = ?""",
             (profile_id,),
@@ -1027,7 +1054,7 @@ async def export_profile(profile_id: str):
         cursor = await db.execute(
             """SELECT id, name, status, created_at, batch_size,
                       profile_dir, total_epochs_trained, needs_retraining,
-                      profile_rms, embedder, vocoder,
+                      profile_rms, embedder, vocoder, pipeline,
                       best_epoch, best_avg_gen_loss
                FROM profiles WHERE id = ?""",
             (profile_id,),
@@ -1067,6 +1094,7 @@ async def export_profile(profile_id: str):
             "batch_size": row["batch_size"] or 8,
             "embedder": row["embedder"] or "spin-v2",
             "vocoder": row["vocoder"] or "HiFi-GAN",
+            "pipeline": row["pipeline"] or "rvc",
             "total_epochs_trained": int(row["total_epochs_trained"] or 0),
             "needs_retraining": bool(row["needs_retraining"]),
             "profile_rms": float(row["profile_rms"]) if row["profile_rms"] is not None else None,
@@ -1120,12 +1148,37 @@ async def export_profile(profile_id: str):
                 else:
                     logger.warning("export: audio file missing on disk: %s", src)
 
-            # Static known files
+            # Static known files (RVC)
             for rel in _EXPORT_FILES:
                 src = os.path.join(pdir, rel)
                 if os.path.isfile(src):
                     zf.write(src, rel)
                     files_included.append(rel)
+
+            # Beatrice 2 files (if applicable)
+            if (row.get("pipeline") or "rvc") == "beatrice2":
+                b2_out_dir = os.path.join(pdir, "beatrice2_out")
+                # checkpoint_latest.pt.gz
+                b2_ckpt = os.path.join(b2_out_dir, "checkpoint_latest.pt.gz")
+                if os.path.isfile(b2_ckpt):
+                    zf.write(b2_ckpt, "beatrice2_out/checkpoint_latest.pt.gz")
+                    files_included.append("beatrice2_out/checkpoint_latest.pt.gz")
+                # Most recent paraphernalia dir (inference binaries)
+                if os.path.isdir(b2_out_dir):
+                    para_dirs = sorted(
+                        [d for d in os.listdir(b2_out_dir)
+                         if d.startswith("paraphernalia_") and
+                         os.path.isdir(os.path.join(b2_out_dir, d))],
+                        reverse=True,
+                    )
+                    if para_dirs:
+                        latest_para = os.path.join(b2_out_dir, para_dirs[0])
+                        for fname in os.listdir(latest_para):
+                            fpath = os.path.join(latest_para, fname)
+                            if os.path.isfile(fpath):
+                                arc = f"beatrice2_out/{para_dirs[0]}/{fname}"
+                                zf.write(fpath, arc)
+                                files_included.append(arc)
 
             # Finalize manifest with the actual file list
             manifest["files_included"] = files_included
@@ -1315,6 +1368,15 @@ async def import_profile(
             elif rel in files_included:
                 warnings.append(f"Expected file missing from zip: {rel}")
 
+        # Extract Beatrice 2 files (checkpoint + paraphernalia)
+        if prof_meta.get("pipeline") == "beatrice2":
+            b2_files = [n for n in zip_names if n.startswith("beatrice2_out/")]
+            for arc_name in b2_files:
+                dest = os.path.join(pdir, arc_name)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with zf.open(arc_name) as src_f, open(dest, "wb") as dst_f:
+                    shutil.copyfileobj(src_f, dst_f)
+
     except Exception as exc:
         shutil.rmtree(pdir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Failed to extract zip: {exc}") from exc
@@ -1327,10 +1389,10 @@ async def import_profile(
         await db.execute(
             """INSERT INTO profiles
                (id, name, status, sample_path, batch_size, audio_duration,
-                preprocessed_path, profile_dir, profile_rms, embedder, vocoder,
+                preprocessed_path, profile_dir, profile_rms, embedder, vocoder, pipeline,
                 total_epochs_trained, needs_retraining, best_epoch, best_avg_gen_loss,
                 created_at)
-               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 new_profile_id,
                 import_name,
@@ -1342,6 +1404,7 @@ async def import_profile(
                 float(prof_meta["profile_rms"]) if prof_meta.get("profile_rms") is not None else None,
                 prof_meta.get("embedder", "spin-v2"),
                 prof_meta.get("vocoder", "HiFi-GAN"),
+                prof_meta.get("pipeline", "rvc"),
                 int(prof_meta.get("total_epochs_trained", 0)),
                 int(bool(prof_meta.get("needs_retraining", False))),
                 int(prof_meta["best_epoch"]) if prof_meta.get("best_epoch") is not None else None,
@@ -1394,7 +1457,7 @@ async def import_profile(
             """SELECT id, name, status, created_at, sample_path,
                       batch_size, audio_duration, preprocessed_path,
                       profile_dir, model_path, checkpoint_path, index_path,
-                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder,
+                      total_epochs_trained, needs_retraining, profile_rms, embedder, vocoder, pipeline,
                       best_epoch, best_avg_gen_loss
                FROM profiles WHERE id = ?""",
             (new_profile_id,),

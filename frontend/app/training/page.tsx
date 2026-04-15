@@ -25,6 +25,7 @@ interface Profile {
   needs_retraining: boolean;
   embedder: string;
   vocoder: string;
+  pipeline: string;
   best_epoch: number | null;
   best_avg_gen_loss: number | null;
   audio_files: { id: string; duration: number | null }[];
@@ -45,7 +46,7 @@ interface HardwareInfo {
 }
 
 interface TrainingMsg {
-  type: 'log' | 'phase' | 'done' | 'error' | 'keepalive' | 'epoch' | 'epoch_done' | 'index_done';
+  type: 'log' | 'phase' | 'done' | 'error' | 'keepalive' | 'epoch' | 'epoch_done' | 'index_done' | 'step_done';
   message?: string;
   phase?: string;
   elapsed_s?: number;
@@ -54,6 +55,11 @@ interface TrainingMsg {
   best_epoch?: number;
   avg_gen?: number;
   best_avg_gen?: number;
+  // Beatrice 2 step fields
+  step?: number;
+  loss_g?: number;
+  loss_d?: number;
+  loss_mel?: number;  // top-level for step_done events
   losses?: {
     loss_disc?: number;
     loss_gen?: number;
@@ -72,6 +78,14 @@ interface EpochPoint {
   loss_fm: number;
   loss_kl: number;
   loss_spk: number;
+}
+
+interface BeatriceStepPoint {
+  step: number;
+  loss_g: number | null;
+  loss_d: number | null;
+  loss_mel: number | null;
+  trained_at: string;
 }
 
 interface EpochLossPoint {
@@ -499,6 +513,66 @@ function LossChart({
 }
 
 // ---------------------------------------------------------------------------
+// BeatriceStepChart — step-based training chart for Beatrice 2 profiles
+// ---------------------------------------------------------------------------
+function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
+  if (points.length < 2) {
+    return (
+      <div className="h-36 flex items-center justify-center text-zinc-600 font-mono text-[11px]">
+        {points.length === 0 ? 'Chart will appear after first step' : 'Waiting for more steps…'}
+      </div>
+    );
+  }
+
+  const melPoints = points
+    .filter(p => p.loss_mel != null)
+    .map(p => ({ step: p.step, mel: p.loss_mel! }));
+
+  const gPoints = points
+    .filter(p => p.loss_g != null)
+    .map(p => ({ step: p.step, g: p.loss_g! }));
+
+  const mergedMap = new Map<number, { step: number; mel?: number; g?: number; d?: number }>();
+  for (const p of points) {
+    if (!mergedMap.has(p.step)) mergedMap.set(p.step, { step: p.step });
+    const e = mergedMap.get(p.step)!;
+    if (p.loss_mel != null) e.mel = p.loss_mel;
+    if (p.loss_g   != null) e.g   = p.loss_g;
+    if (p.loss_d   != null) e.d   = p.loss_d;
+  }
+  const data = [...mergedMap.values()].sort((a, b) => a.step - b.step);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <ResponsiveContainer width="100%" height={160}>
+        <LineChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+          <XAxis dataKey="step" tick={{ fontSize: 10, fill: '#71717a', fontFamily: 'monospace' }}
+            label={{ value: 'step', position: 'insideRight', offset: -4, fontSize: 10, fill: '#52525b' }} />
+          <YAxis tick={{ fontSize: 10, fill: '#71717a', fontFamily: 'monospace' }} width={34} />
+          <Tooltip
+            contentStyle={{ background: '#18181b', border: '1px solid #3f3f46', borderRadius: 6, fontSize: 11, fontFamily: 'monospace' }}
+            labelStyle={{ color: '#a1a1aa' }}
+            itemStyle={{ color: '#e4e4e7' }}
+          />
+          <Line type="monotone" dataKey="mel" stroke="#22d3ee" dot={false} strokeWidth={1.5} name="mel" />
+          <Line type="monotone" dataKey="g"   stroke="#a78bfa" dot={false} strokeWidth={1}   name="gen" />
+          <Line type="monotone" dataKey="d"   stroke="#f59e0b" dot={false} strokeWidth={1}   name="disc" />
+        </LineChart>
+      </ResponsiveContainer>
+      <div className="flex gap-4 text-[10px] font-mono text-zinc-500">
+        <span className="text-cyan-400">— mel</span>
+        <span className="text-violet-400">— gen</span>
+        <span className="text-amber-400">— disc</span>
+        <span className="ml-auto">
+          step {data[data.length - 1].step} · latest mel {data.filter(d => d.mel != null).at(-1)?.mel?.toFixed(3) ?? '—'}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Batch Size Selector — slider with sweet-spot and max-safe markers
 // ---------------------------------------------------------------------------
 
@@ -681,6 +755,7 @@ export default function TrainingPage() {
   const [jobState, setJobState] = useState<JobState>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [epochPoints, setEpochPoints] = useState<EpochPoint[]>([]);
+  const [stepPoints, setStepPoints]   = useState<BeatriceStepPoint[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
@@ -692,28 +767,39 @@ export default function TrainingPage() {
   }, [logLines]);
   useEffect(() => () => { wsRef.current?.close(); wsRef.current = null; }, []);
 
-  // Load historical epoch losses whenever the selected profile changes.
-  // New epochs from a live run are appended on top of these.
+  // Load historical epoch/step losses whenever the selected profile changes.
   useEffect(() => {
-    if (!selectedId) { setEpochPoints([]); return; }
+    if (!selectedId) { setEpochPoints([]); setStepPoints([]); return; }
+    const sel = profiles.find(p => p.id === selectedId);
+    const isB2 = sel?.pipeline === 'beatrice2';
     let cancelled = false;
     fetch(`${API}/api/training/losses/${selectedId}`)
       .then(r => r.ok ? r.json() : [])
-      .then((rows: EpochLossPoint[]) => {
+      .then((rows: (EpochLossPoint | BeatriceStepPoint)[]) => {
         if (cancelled) return;
-        setEpochPoints(rows.map(r => ({
-          epoch:     r.epoch,
-          loss_mel:  r.loss_mel  ?? 0,
-          loss_gen:  r.loss_gen  ?? 0,
-          loss_disc: r.loss_disc ?? 0,
-          loss_fm:   r.loss_fm   ?? 0,
-          loss_kl:   r.loss_kl   ?? 0,
-          loss_spk:  r.loss_spk  ?? 0,
-        })));
+        if (isB2) {
+          setStepPoints((rows as BeatriceStepPoint[]).map(r => ({
+            step:     r.step,
+            loss_g:   r.loss_g   ?? null,
+            loss_d:   r.loss_d   ?? null,
+            loss_mel: r.loss_mel ?? null,
+            trained_at: r.trained_at,
+          })));
+        } else {
+          setEpochPoints((rows as EpochLossPoint[]).map(r => ({
+            epoch:     (r as EpochLossPoint).epoch,
+            loss_mel:  (r as EpochLossPoint).loss_mel  ?? 0,
+            loss_gen:  (r as EpochLossPoint).loss_gen  ?? 0,
+            loss_disc: (r as EpochLossPoint).loss_disc ?? 0,
+            loss_fm:   (r as EpochLossPoint).loss_fm   ?? 0,
+            loss_kl:   (r as EpochLossPoint).loss_kl   ?? 0,
+            loss_spk:  (r as EpochLossPoint).loss_spk  ?? 0,
+          })));
+        }
       })
-      .catch(() => { if (!cancelled) setEpochPoints([]); });
+      .catch(() => { if (!cancelled) { setEpochPoints([]); setStepPoints([]); } });
     return () => { cancelled = true; };
-  }, [selectedId]);
+  }, [selectedId, profiles]);
 
   // -------------------------------------------------------------------------
   // attachWs — wire up a WebSocket for profile_id and drive UI state from it.
@@ -723,27 +809,37 @@ export default function TrainingPage() {
     closeWs();
 
     // Seed chart with all historical losses before live events arrive.
-    // This ensures resumed runs show prior epochs immediately.
+    const selProfile = profiles.find(p => p.id === profileId);
+    const isB2Profile = selProfile?.pipeline === 'beatrice2';
     fetch(`${API}/api/training/losses/${profileId}`)
       .then(r => r.ok ? r.json() : [])
-      .then((rows: EpochLossPoint[]) => {
+      .then((rows: (EpochLossPoint | BeatriceStepPoint)[]) => {
         if (!rows.length) return;
-        setEpochPoints(prev => {
-          const existingEpochs = new Set(prev.map(p => p.epoch));
-          const fresh = rows
-            .filter(r => !existingEpochs.has(r.epoch))
-            .map(r => ({
-              epoch:     r.epoch,
-              loss_mel:  r.loss_mel  ?? 0,
-              loss_gen:  r.loss_gen  ?? 0,
-              loss_disc: r.loss_disc ?? 0,
-              loss_fm:   r.loss_fm   ?? 0,
-              loss_kl:   r.loss_kl   ?? 0,
-              loss_spk:  r.loss_spk  ?? 0,
-            }));
-          if (!fresh.length) return prev;
-          return [...prev, ...fresh].sort((a, b) => a.epoch - b.epoch);
-        });
+        if (isB2Profile) {
+          setStepPoints(prev => {
+            const existingSteps = new Set(prev.map(p => p.step));
+            const fresh = (rows as BeatriceStepPoint[]).filter(r => !existingSteps.has(r.step));
+            if (!fresh.length) return prev;
+            return [...prev, ...fresh].sort((a, b) => a.step - b.step);
+          });
+        } else {
+          setEpochPoints(prev => {
+            const existingEpochs = new Set(prev.map(p => p.epoch));
+            const fresh = (rows as EpochLossPoint[])
+              .filter(r => !existingEpochs.has(r.epoch))
+              .map(r => ({
+                epoch:     r.epoch,
+                loss_mel:  r.loss_mel  ?? 0,
+                loss_gen:  r.loss_gen  ?? 0,
+                loss_disc: r.loss_disc ?? 0,
+                loss_fm:   r.loss_fm   ?? 0,
+                loss_kl:   r.loss_kl   ?? 0,
+                loss_spk:  r.loss_spk  ?? 0,
+              }));
+            if (!fresh.length) return prev;
+            return [...prev, ...fresh].sort((a, b) => a.epoch - b.epoch);
+          });
+        }
       })
       .catch(() => {});
 
@@ -786,6 +882,22 @@ export default function TrainingPage() {
                 : p
             ));
           }
+        } else if (msg.type === 'step_done') {
+          // Beatrice 2 step event
+          if (msg.step != null) {
+            const pt: BeatriceStepPoint = {
+              step:     msg.step,
+              loss_g:   msg.loss_g   ?? null,
+              loss_d:   msg.loss_d   ?? null,
+              loss_mel: msg.loss_mel ?? null,
+              trained_at: new Date().toISOString(),
+            };
+            setStepPoints(prev => {
+              const without = prev.filter(p => p.step !== pt.step);
+              return [...without, pt].sort((a, b) => a.step - b.step);
+            });
+          }
+          if (msg.message) appendLog(msg.message);
         } else if (msg.type === 'done') {
           setCurrentPhase('done');
           setJobState('done');
@@ -1056,36 +1168,50 @@ export default function TrainingPage() {
                 )}
               </div>
 
-              {/* Epochs — narrow fixed width */}
+              {/* Epochs / Steps — narrow fixed width */}
               <div className="flex flex-col gap-2 w-48 shrink-0">
-                <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
-                  <span className="text-cyan-400">⟳</span> Epochs
-                </label>
-                <input
-                  type="number" value={epochs} min={1} max={1000}
-                  disabled={isRunning}
-                  onChange={(e) => setEpochs(Math.max(1, Math.min(1000, Number(e.target.value))))}
-                  className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
-                             font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
-                             disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
-                />
-                {/* Resume / retrain hint */}
                 {(() => {
                   const sel = profiles.find(p => p.id === selectedId);
-                  if (!sel) return null;
+                  const isB2 = sel?.pipeline === 'beatrice2';
                   return (
-                    <div className="flex flex-col gap-1">
-                      {sel.total_epochs_trained > 0 && (
-                        <span className="text-[10px] font-mono text-amber-500/80 leading-tight">
-                          ↳ resume {sel.total_epochs_trained} → {sel.total_epochs_trained + epochs}
+                    <>
+                      <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
+                        <span className="text-cyan-400">⟳</span> {isB2 ? 'Steps' : 'Epochs'}
+                      </label>
+                      <input
+                        type="number" value={epochs}
+                        min={isB2 ? 500 : 1} max={isB2 ? 50000 : 1000}
+                        step={isB2 ? 500 : 1}
+                        disabled={isRunning}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          setEpochs(isB2 ? Math.max(500, Math.min(50000, v)) : Math.max(1, Math.min(1000, v)));
+                        }}
+                        className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
+                                   font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
+                                   disabled:opacity-40 disabled:cursor-not-allowed hover:border-zinc-600 transition-colors"
+                      />
+                      {/* Resume / retrain hint */}
+                      {!isB2 && (
+                        <div className="flex flex-col gap-1">
+                          {sel && sel.total_epochs_trained > 0 && (
+                            <span className="text-[10px] font-mono text-amber-500/80 leading-tight">
+                              ↳ resume {sel.total_epochs_trained} → {sel.total_epochs_trained + epochs}
+                            </span>
+                          )}
+                          {sel?.needs_retraining && (
+                            <span className="text-[10px] font-mono text-amber-400 leading-tight">
+                              ⚠ retrain recommended
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {isB2 && (
+                        <span className="text-[10px] font-mono text-amber-400/80 leading-tight">
+                          ◈ Beatrice 2 · CUDA required
                         </span>
                       )}
-                      {sel.needs_retraining && (
-                        <span className="text-[10px] font-mono text-amber-400 leading-tight">
-                          ⚠ retrain recommended
-                        </span>
-                      )}
-                    </div>
+                    </>
                   );
                 })()}
               </div>
@@ -1101,7 +1227,11 @@ export default function TrainingPage() {
               />
             </div>
 
-            {/* Overtraining Stop + Speaker Loss Weight — same row */}
+            {/* Overtraining Stop + Speaker Loss Weight — RVC only */}
+            {(() => {
+              const sel2 = profiles.find(p => p.id === selectedId);
+              if (sel2?.pipeline === 'beatrice2') return null;
+              return (
             <div className="border-t border-zinc-800/60 pt-4">
               <div className="flex flex-wrap gap-x-8 gap-y-4">
 
@@ -1323,6 +1453,8 @@ export default function TrainingPage() {
               </div>
 
             </div>
+              ); // end !isB2 conditional
+            })()}
 
             {/* Actions */}
             <div className="flex items-center gap-3 pt-2 border-t border-zinc-800">
@@ -1357,7 +1489,24 @@ export default function TrainingPage() {
           </section>
         )}
 
-        {epochPoints.length > 0 ? (
+        {(() => {
+          const selProfile = profiles.find(p => p.id === selectedId);
+          const isB2 = selProfile?.pipeline === 'beatrice2';
+          if (isB2 && stepPoints.length > 0) return (
+          <section>
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500">Loss Curves</h2>
+              <span className="text-[10px] font-mono text-zinc-600">
+                {stepPoints.length} step{stepPoints.length !== 1 ? 's' : ''}
+                {isRunning ? ` · +${epochs} target` : ''}
+              </span>
+            </div>
+            <div className="bg-zinc-950 rounded-lg p-3 border border-zinc-800">
+              <BeatriceStepChart points={stepPoints} />
+            </div>
+          </section>
+          );
+          if (!isB2 && epochPoints.length > 0) return (
           <section>
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500">Loss Curves</h2>
@@ -1370,23 +1519,22 @@ export default function TrainingPage() {
               <LossChart
                 points={epochPoints}
                 totalEpochs={(() => {
-                  const sel = profiles.find(p => p.id === selectedId);
-                  const priorEpochs = sel?.total_epochs_trained ?? 0;
-                  // When running: domain extends to absolute target (prior + new)
-                  // When idle: domain = max epoch actually recorded
+                  const priorEpochs = selProfile?.total_epochs_trained ?? 0;
                   if (isRunning) {
                     return Math.max(
                       epochPoints.length > 0 ? epochPoints[epochPoints.length - 1].epoch : 0,
                       priorEpochs + epochs,
                     );
                   }
-                  return undefined; // LossChart falls back to max(points.epoch)
+                  return undefined;
                 })()}
-                bestEpoch={profiles.find(p => p.id === selectedId)?.best_epoch ?? null}
+                bestEpoch={selProfile?.best_epoch ?? null}
               />
             </div>
           </section>
-        ) : null}
+          );
+          return null;
+        })()}
 
         <section>
           <div className="flex items-center justify-between mb-3">

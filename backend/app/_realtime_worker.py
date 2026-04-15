@@ -217,8 +217,196 @@ def _save_thread(audio_q: queue.Queue, save_path: str, sr: int,
 
 
 # ---------------------------------------------------------------------------
+# Beatrice 2 realtime inference helper
+# ---------------------------------------------------------------------------
+
+
+def _run_beatrice2_realtime(
+    cmd_q,
+    evt_q,
+    engine,
+    input_device_id,
+    output_device_id,
+    block_params,
+    tgt_sr,
+    pitch_shift_semitones,
+    formant_shift_semitones,
+    silence_threshold_db,
+    output_gain,
+    noise_reduction,
+    profile_rms,
+    audio_save_q,
+    audio_in_save_q,
+) -> None:
+    """Beatrice 2 realtime loop.
+
+    Reuses the same SOLA crossfade, noise reduction, gate, and RMS matching
+    infrastructure as the RVC path. Only the infer step differs.
+    """
+    import collections
+    import numpy as np
+    import sounddevice as _sd
+
+    block_16k   = block_params["block_16k"]
+    extra_16k   = block_params["extra_16k"]
+    return_length = block_params["return_length"]
+    sola_buf    = block_params["sola_buf"]
+
+    _BLOCK_48K_LOCAL = int(block_params.get("block_48k", _BLOCK_48K))
+    _EXTRA_48K       = int(block_params.get("extra_48k", _EXTRA_48K_CONST))
+
+    # Rolling RMS estimation
+    _ewma_alpha = 0.05
+    _ema_rms_in  = 0.02
+    _ema_rms_out = 0.02
+    _rms_cap     = 1.5
+    _rms_window  = collections.deque(maxlen=3)
+
+    # SOLA state
+    import torch as _torch
+    sola_buffer = _torch.zeros(sola_buf, dtype=_torch.float32)
+    input_buffer_16k = np.zeros(extra_16k + block_16k, dtype=np.float32)
+    input_buffer_48k = np.zeros(_EXTRA_48K + _BLOCK_48K_LOCAL, dtype=np.float32)
+    out_fade_window  = _torch.sin(
+        _torch.linspace(0, 0.5 * np.pi, sola_buf) ** 2
+    )
+    in_fade_window = 1.0 - out_fade_window
+
+    # RNNoise state
+    _rnn_state = None
+    _rnn_available = False
+    if noise_reduction:
+        try:
+            import librnnoise
+            _rnn_state = librnnoise.RNNoiseState()
+            _rnn_available = True
+        except Exception:
+            pass
+
+    # Gate
+    _silence_threshold_linear = 10 ** (silence_threshold_db / 20.0)
+
+    params = {
+        "pitch_shift_semitones": float(pitch_shift_semitones),
+        "formant_shift_semitones": float(formant_shift_semitones),
+        "silence_threshold_db": float(silence_threshold_db),
+        "output_gain": float(output_gain),
+        "noise_reduction": bool(noise_reduction),
+    }
+
+    def _process_block(input_48k: np.ndarray) -> np.ndarray:
+        nonlocal input_buffer_16k, input_buffer_48k, sola_buffer
+        nonlocal _ema_rms_in, _ema_rms_out, _rnn_state
+
+        # ---- Noise reduction (48k) ----
+        if _rnn_available and params["noise_reduction"] and _rnn_state is not None:
+            try:
+                import librnnoise
+                denoised = librnnoise.process_audio(_rnn_state, input_48k.astype(np.float32))
+            except Exception:
+                denoised = input_48k
+        else:
+            denoised = input_48k
+
+        # ---- Resample 48k → 16k ----
+        from torchaudio.transforms import Resample as _R
+        t_in = _torch.from_numpy(denoised).unsqueeze(0)
+        t_16k = _R(orig_freq=48000, new_freq=16000)(t_in).squeeze(0)
+        block_new_16k = t_16k.numpy()
+
+        input_buffer_16k = np.roll(input_buffer_16k, -block_16k)
+        input_buffer_16k[-block_16k:] = block_new_16k
+
+        input_buffer_48k = np.roll(input_buffer_48k, -_BLOCK_48K_LOCAL)
+        input_buffer_48k[-_BLOCK_48K_LOCAL:] = input_48k
+
+        # ---- Gate ----
+        rms_in = float(np.sqrt(np.mean(block_new_16k ** 2)) + 1e-9)
+        _rms_window.append(rms_in)
+        _ema_rms_in = (1 - _ewma_alpha) * _ema_rms_in + _ewma_alpha * rms_in
+        if max(_rms_window) < _silence_threshold_linear:
+            # Gate: pass through zeros
+            out = np.zeros(return_length, dtype=np.float32)
+            sola_buffer = _torch.zeros(sola_buf, dtype=_torch.float32)
+            return out
+
+        # ---- Beatrice 2 infer ----
+        converted = engine.convert(
+            input_buffer_16k,
+            pitch_shift_semitones=params["pitch_shift_semitones"],
+            formant_shift_semitones=params["formant_shift_semitones"],
+        )  # float32 at 24 kHz
+
+        # ---- Resample to 48k ----
+        t_out = _torch.from_numpy(converted).unsqueeze(0)
+        t_48k = _R(orig_freq=tgt_sr, new_freq=48000)(t_out).squeeze(0)
+        out_np = t_48k.numpy()
+
+        # Trim to expected return length (in 48k samples)
+        expected_48k = int(return_length * 48000 / tgt_sr)
+        if len(out_np) > expected_48k:
+            out_np = out_np[:expected_48k]
+        elif len(out_np) < expected_48k:
+            out_np = np.pad(out_np, (0, expected_48k - len(out_np)))
+
+        # ---- RMS matching ----
+        rms_out = float(np.sqrt(np.mean(out_np ** 2)) + 1e-9)
+        _ema_rms_out = (1 - _ewma_alpha) * _ema_rms_out + _ewma_alpha * rms_out
+        target_rms = float(profile_rms) if profile_rms else _ema_rms_in
+        if _ema_rms_out > 1e-5:
+            scale = min(target_rms / (_ema_rms_out + 1e-9), _rms_cap)
+            out_np = out_np * scale
+        out_np = out_np * float(params["output_gain"])
+
+        # ---- SOLA crossfade ----
+        # Merge sola_buffer with head of out_np
+        head = _torch.from_numpy(out_np[:sola_buf])
+        merged = sola_buffer * out_fade_window + head * in_fade_window
+        sola_buffer = _torch.from_numpy(out_np[return_length - sola_buf:return_length])
+
+        out_full = np.concatenate([merged.numpy(), out_np[sola_buf:return_length]])
+        return out_full.astype(np.float32)
+
+    # ---- Audio I/O loop ----
+    evt_q.put({"type": "ready"})
+
+    def _audio_callback(indata, outdata, frames, time_info, status):
+        block_in = indata[:, 0].astype(np.float32)
+        out_block = _process_block(block_in)
+        # Ensure correct output length
+        n = min(len(out_block), frames)
+        outdata[:n, 0] = out_block[:n]
+        if n < frames:
+            outdata[n:, 0] = 0.0
+        if audio_save_q is not None:
+            audio_save_q.put(out_block.copy())
+        if audio_in_save_q is not None:
+            audio_in_save_q.put(block_in.copy())
+
+    with _sd.Stream(
+        samplerate=48000,
+        blocksize=_BLOCK_48K_LOCAL,
+        device=(input_device_id, output_device_id),
+        channels=1,
+        dtype="float32",
+        callback=_audio_callback,
+        latency="low",
+    ):
+        while True:
+            try:
+                cmd = cmd_q.get(timeout=0.1)
+            except Exception:
+                continue
+            if cmd is None or (isinstance(cmd, dict) and cmd.get("type") == "stop"):
+                break
+            if isinstance(cmd, dict) and cmd.get("type") == "update_params":
+                params.update(cmd.get("params", {}))
+
+
+# ---------------------------------------------------------------------------
 # Worker entry point
 # ---------------------------------------------------------------------------
+
 
 def run_worker(
     cmd_q: multiprocessing.Queue,
@@ -241,6 +429,10 @@ def run_worker(
     model_path: str | None = None,
     index_path: str | None = None,
     profile_rms: float | None = None,
+    # Beatrice 2 fields
+    pipeline: str = "rvc",
+    pitch_shift_semitones: float = 0.0,
+    formant_shift_semitones: float = 0.0,
 ) -> None:
     """Run in isolated child process. Owns all native code (fairseq, sounddevice, MPS)."""
 
@@ -304,9 +496,62 @@ def run_worker(
         except Exception:
             pass
 
-        from infer.lib.rtrvc import RVC
-
         import os as _os
+
+        # ----------------------------------------------------------------
+        # Beatrice 2 path: load checkpoint, run convert() in the block loop
+        # ----------------------------------------------------------------
+        if pipeline == "beatrice2":
+            sys.path.insert(0, rvc_root)
+            from backend.beatrice2.inference import BeatriceInferenceEngine
+
+            b2_ckpt = model_path
+            if not b2_ckpt or not _os.path.exists(b2_ckpt):
+                pdir_b2 = _os.path.join(rvc_root, "data", "profiles", profile_id)
+                b2_ckpt = _os.path.join(pdir_b2, "beatrice2_out", "checkpoint_latest.pt.gz")
+            if not _os.path.exists(b2_ckpt):
+                raise RuntimeError(
+                    f"Beatrice 2 checkpoint not found — checked {model_path!r} and "
+                    f"{b2_ckpt!r}. Train a Beatrice 2 profile first."
+                )
+
+            b2_engine = BeatriceInferenceEngine(b2_ckpt, device=infer_device)
+            _B2_OUT_SR = b2_engine.OUT_SR  # 24 000 Hz
+            tgt_sr = _B2_OUT_SR
+
+            block_params = _compute_block_params(_BLOCK_48K, tgt_sr=tgt_sr,
+                                                 sola_buf_ms=sola_crossfade_ms)
+            return_length = block_params["return_length"]
+            block_16k   = block_params["block_16k"]
+            sola_buf    = block_params["sola_buf"]
+            extra_16k   = block_params["extra_16k"]
+            p_len       = block_params["p_len"]
+
+            # Use the same SOLA/gate/RMS machinery but swap out the infer step
+            # ----------------------------------------------------------------
+            _run_beatrice2_realtime(
+                cmd_q=cmd_q,
+                evt_q=evt_q,
+                engine=b2_engine,
+                input_device_id=input_device_id,
+                output_device_id=output_device_id,
+                block_params=block_params,
+                tgt_sr=tgt_sr,
+                pitch_shift_semitones=pitch_shift_semitones,
+                formant_shift_semitones=formant_shift_semitones,
+                silence_threshold_db=silence_threshold_db,
+                output_gain=output_gain,
+                noise_reduction=noise_reduction,
+                profile_rms=profile_rms,
+                audio_save_q=audio_save_q,
+                audio_in_save_q=audio_in_save_q,
+            )
+            return
+
+        # ----------------------------------------------------------------
+        # RVC path (default)
+        # ----------------------------------------------------------------
+        from infer.lib.rtrvc import RVC
 
         # Resolve model path
         resolved_model_path = model_path

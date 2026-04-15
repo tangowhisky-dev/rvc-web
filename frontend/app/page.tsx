@@ -32,6 +32,7 @@ interface Profile {
   needs_retraining: boolean;
   embedder: string;
   vocoder: string;
+  pipeline: string;
   best_model_path: string | null;
   best_epoch: number | null;
   best_avg_gen_loss: number | null;
@@ -423,12 +424,14 @@ interface AudioFilePickerProps {
   /** If provided, shows a "Profile Name" field and creates a new profile. */
   newProfile?: boolean;
   /** For existing profiles, called with (profileId, file, segStart, segEnd) */
-  onSubmit: (args: { name?: string; file: File; segStart: number; segEnd: number; embedder?: string; vocoder?: string }) => Promise<void>;
+  onSubmit: (args: { name?: string; file: File; segStart: number; segEnd: number; embedder?: string; vocoder?: string; pipeline?: string }) => Promise<void>;
   onCancel: () => void;
   submitLabel?: string;
   showNameField?: boolean;
-  /** Show embedder + vocoder selectors (new-profile creation only) */
+  /** Show embedder + vocoder + engine selectors (new-profile creation only) */
   showEmbedder?: boolean;
+  /** Whether CUDA is available (for Beatrice 2 gating) */
+  hasCuda?: boolean;
 }
 
 const EMBEDDER_OPTIONS: { value: string; label: string; description: string }[] = [
@@ -443,8 +446,9 @@ const VOCODER_OPTIONS: { value: string; label: string; description: string }[] =
   { value: 'RefineGAN', label: 'RefineGAN',   description: 'Better speech clarity · slower training' },
 ];
 
-function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField, showEmbedder }: AudioFilePickerProps) {
+function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField, showEmbedder, hasCuda }: AudioFilePickerProps) {
   const [nameInput, setNameInput]           = useState('');
+  const [pipeline, setPipeline]             = useState('rvc');
   const [embedder, setEmbedder]             = useState('spin-v2');
   const [vocoder, setVocoder]               = useState('HiFi-GAN');
   const [file, setFile]                     = useState<File | null>(null);
@@ -507,7 +511,7 @@ function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField, showE
     setUploading(true);
     setError(null);
     try {
-      await onSubmit({ name: showNameField ? nameInput.trim() : undefined, file, segStart: startSec, segEnd: endSec, embedder: showEmbedder ? embedder : undefined, vocoder: showEmbedder ? vocoder : undefined });
+      await onSubmit({ name: showNameField ? nameInput.trim() : undefined, file, segStart: startSec, segEnd: endSec, embedder: showEmbedder ? embedder : undefined, vocoder: showEmbedder ? vocoder : undefined, pipeline: showEmbedder ? pipeline : undefined });
       // Reset on success
       setNameInput('');
       setFile(null);
@@ -571,6 +575,51 @@ function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField, showE
         <div className="flex flex-col gap-2">
           <div className="flex items-center gap-2">
             <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
+              Engine
+            </label>
+            <span className="text-[10px] font-mono text-amber-500/80 bg-amber-950/30 border border-amber-800/40 px-1.5 py-0.5 rounded">
+              locked at creation
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => setPipeline('rvc')}
+              className={`text-left px-3 py-2 rounded-lg border text-[12px] font-mono transition-colors ${
+                pipeline === 'rvc'
+                  ? 'bg-indigo-900/30 border-indigo-600/50 text-indigo-300'
+                  : 'bg-zinc-900 border-zinc-700 text-zinc-400 hover:border-zinc-600 hover:text-zinc-300'
+              }`}
+            >
+              <div className="font-semibold">◈ RVC</div>
+              <div className="text-[10px] opacity-70 mt-0.5">Works on MPS · CPU · CUDA · epoch training</div>
+            </button>
+            <button
+              type="button"
+              onClick={() => { if (hasCuda) setPipeline('beatrice2'); }}
+              disabled={!hasCuda}
+              className={`text-left px-3 py-2 rounded-lg border text-[12px] font-mono transition-colors ${
+                pipeline === 'beatrice2'
+                  ? 'bg-amber-900/30 border-amber-600/50 text-amber-300'
+                  : hasCuda
+                    ? 'bg-zinc-900 border-zinc-700 text-zinc-400 hover:border-zinc-600 hover:text-zinc-300'
+                    : 'bg-zinc-900/50 border-zinc-800 text-zinc-600 cursor-not-allowed'
+              }`}
+            >
+              <div className="font-semibold">◈ Beatrice 2</div>
+              <div className="text-[10px] opacity-70 mt-0.5">
+                {hasCuda ? 'Source-filter vocoder · CUDA · step training' : 'CUDA GPU required — not available'}
+              </div>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Embedder + vocoder selectors — only for RVC profiles */}
+      {showEmbedder && pipeline === 'rvc' && (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
               Feature Embedder
             </label>
             <span className="text-[10px] font-mono text-amber-500/80 bg-amber-950/30 border border-amber-800/40 px-1.5 py-0.5 rounded">
@@ -597,8 +646,8 @@ function AudioFilePicker({ onSubmit, onCancel, submitLabel, showNameField, showE
         </div>
       )}
 
-      {/* Vocoder selector — shown only for new profile creation */}
-      {showEmbedder && (
+      {/* Vocoder selector — shown only for new RVC profile creation */}
+      {showEmbedder && pipeline === 'rvc' && (
         <div className="flex flex-col gap-2">
           <div className="flex items-center gap-2">
             <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
@@ -672,12 +721,22 @@ interface UploadPanelProps {
 }
 
 function UploadPanel({ onUploaded, onCancel }: UploadPanelProps) {
-  async function handleSubmit({ name, file, segStart, segEnd, embedder, vocoder }: { name?: string; file: File; segStart: number; segEnd: number; embedder?: string; vocoder?: string }) {
+  const [hasCuda, setHasCuda] = useState(false);
+
+  useEffect(() => {
+    fetch(`${API}/api/training/hardware`)
+      .then(r => r.json())
+      .then(d => setHasCuda(Boolean(d.cuda_available)))
+      .catch(() => {});
+  }, []);
+
+  async function handleSubmit({ name, file, segStart, segEnd, embedder, vocoder, pipeline }: { name?: string; file: File; segStart: number; segEnd: number; embedder?: string; vocoder?: string; pipeline?: string }) {
     const form = new FormData();
     form.append('name', name!);
     form.append('file', file);
     form.append('seg_start', String(segStart));
     form.append('seg_end',   String(segEnd));
+    if (pipeline) form.append('pipeline', pipeline);
     if (embedder) form.append('embedder', embedder);
     if (vocoder)  form.append('vocoder',  vocoder);
 
@@ -695,6 +754,7 @@ function UploadPanel({ onUploaded, onCancel }: UploadPanelProps) {
       <AudioFilePicker
         showNameField
         showEmbedder
+        hasCuda={hasCuda}
         onSubmit={handleSubmit}
         onCancel={onCancel}
         submitLabel="↑ Create Profile"

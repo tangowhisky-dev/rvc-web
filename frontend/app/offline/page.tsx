@@ -20,6 +20,7 @@ interface Profile {
   total_epochs_trained: number;
   embedder: string;
   vocoder: string;
+  pipeline?: string;
   best_model_path?: string | null;
   best_epoch?: number | null;
   best_avg_gen_loss?: number | null;
@@ -365,6 +366,9 @@ export default function OfflinePage() {
   const [protect, setProtect]           = useState(0.33);
   const [noiseReduction, setNoiseReduction] = useState(false);
   const [solaCrossfadeMs, setSolaCrossfadeMs] = useState(20);
+  // Beatrice 2 params
+  const [pitchShift, setPitchShift]           = useState(0);
+  const [formantShift, setFormantShift]       = useState(0);
 
   // Job state
   const [jobStatus, setJobStatus]   = useState<'idle' | 'running' | 'done' | 'error'>('idle');
@@ -442,6 +446,9 @@ export default function OfflinePage() {
     form.append('use_best', String(useBest));
     form.append('noise_reduction', String(noiseReduction));
     form.append('sola_crossfade_ms', String(solaCrossfadeMs));
+    // Beatrice 2 params (ignored by RVC backend)
+    form.append('pitch_shift_semitones', String(pitchShift));
+    form.append('formant_shift_semitones', String(formantShift));
     form.append('file', inputFile);
 
     const abort = new AbortController();
@@ -593,6 +600,20 @@ export default function OfflinePage() {
           <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">
             Inference Parameters
           </label>
+          {selectedProfile?.pipeline === 'beatrice2' ? (
+            <div className="grid grid-cols-2 gap-6">
+              <ParamSlider
+                label={`Pitch Shift (${pitchShift > 0 ? '+' : ''}${pitchShift} st)`}
+                value={pitchShift} min={-12} max={12} step={0.5}
+                onChange={setPitchShift} hint="Semitone pitch shift"
+              />
+              <ParamSlider
+                label={`Formant Shift (${formantShift > 0 ? '+' : ''}${formantShift} st)`}
+                value={formantShift} min={-3} max={3} step={0.25}
+                onChange={setFormantShift} hint="Formant shift (vocal tract)"
+              />
+            </div>
+          ) : (
           <div className="grid grid-cols-3 gap-6">
             <ParamSlider
               label="Pitch" value={pitch} min={-24} max={24} step={1}
@@ -607,6 +628,7 @@ export default function OfflinePage() {
               onChange={setProtect} hint="Consonant preservation"
             />
           </div>
+          )}
 
           {/* Noise Reduction + SOLA Crossfade — side by side */}
           <div className="flex gap-2 items-stretch pt-2 border-t border-zinc-800/60">

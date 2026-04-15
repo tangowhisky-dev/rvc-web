@@ -23,6 +23,7 @@ interface Profile {
   total_epochs_trained: number;
   embedder?: string;
   vocoder?: string;
+  pipeline?: string;
   best_model_path?: string | null;
   best_epoch?: number | null;
   best_avg_gen_loss?: number | null;
@@ -37,6 +38,9 @@ interface SessionParams {
   noise_reduction: boolean;
   noise_reduction_output: boolean;
   sola_crossfade_ms: number;
+  // Beatrice 2 params (ignored for RVC profiles)
+  pitch_shift_semitones: number;
+  formant_shift_semitones: number;
 }
 
 type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
@@ -47,7 +51,7 @@ type SessionState = 'idle' | 'starting' | 'active' | 'stopping';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 const WS_BASE = (API ?? 'http://localhost:8000').replace('http://', 'ws://').replace('https://', 'wss://');
-const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.50, protect: 0.33, silence_threshold_db: -55, output_gain: 1.0, noise_reduction: true, noise_reduction_output: false, sola_crossfade_ms: 20 };
+const DEFAULT_PARAMS: SessionParams = { pitch: 0, index_rate: 0.50, protect: 0.33, silence_threshold_db: -55, output_gain: 1.0, noise_reduction: true, noise_reduction_output: false, sola_crossfade_ms: 20, pitch_shift_semitones: 0, formant_shift_semitones: 0 };
 
 // ---------------------------------------------------------------------------
 // Utility: find default device by name fragment
@@ -865,55 +869,108 @@ export default function RealtimePage() {
             Inference Parameters
           </h2>
           <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 flex flex-col gap-5">
-            <div className="grid grid-cols-3 gap-6">
-              <ParamSlider
-                label="Pitch"
-                value={params.pitch}
-                min={-12}
-                max={12}
-                step={1}
-                disabled={false}
-                onChange={(v) => handleParamChange('pitch', v)}
-              />
-              <ParamSlider
-                label="Index Rate"
-                value={params.index_rate}
-                min={0}
-                max={1}
-                step={0.05}
-                disabled={false}
-                onChange={(v) => handleParamChange('index_rate', v)}
-              />
-              <ParamSlider
-                label="Protect"
-                value={params.protect}
-                min={0}
-                max={1}
-                step={0.05}
-                disabled={false}
-                onChange={(v) => handleParamChange('protect', v)}
-              />
-            </div>
-            <div className="grid grid-cols-2 gap-6">
-              <ParamSlider
-                label={`Silence Gate (${params.silence_threshold_db} dBFS)`}
-                value={params.silence_threshold_db}
-                min={-70}
-                max={-10}
-                step={1}
-                disabled={false}
-                onChange={(v) => handleParamChange('silence_threshold_db', v)}
-              />
-              <ParamSlider
-                label={`Output Volume (${params.output_gain.toFixed(2)}×)`}
-                value={params.output_gain}
-                min={0.1}
-                max={3.0}
-                step={0.05}
-                disabled={false}
-                onChange={(v) => handleParamChange('output_gain', v)}
-              />
-            </div>
+            {(() => {
+              const selProfile = profiles.find(p => p.id === profileId);
+              const isB2 = selProfile?.pipeline === 'beatrice2';
+              return isB2 ? (
+                <>
+                  {/* Beatrice 2: pitch shift + formant shift */}
+                  <div className="grid grid-cols-2 gap-6">
+                    <ParamSlider
+                      label={`Pitch Shift (${params.pitch_shift_semitones > 0 ? '+' : ''}${params.pitch_shift_semitones} st)`}
+                      value={params.pitch_shift_semitones}
+                      min={-12}
+                      max={12}
+                      step={0.5}
+                      disabled={false}
+                      onChange={(v) => handleParamChange('pitch_shift_semitones', v)}
+                    />
+                    <ParamSlider
+                      label={`Formant Shift (${params.formant_shift_semitones > 0 ? '+' : ''}${params.formant_shift_semitones} st)`}
+                      value={params.formant_shift_semitones}
+                      min={-3}
+                      max={3}
+                      step={0.25}
+                      disabled={false}
+                      onChange={(v) => handleParamChange('formant_shift_semitones', v)}
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-6">
+                    <ParamSlider
+                      label={`Silence Gate (${params.silence_threshold_db} dBFS)`}
+                      value={params.silence_threshold_db}
+                      min={-70}
+                      max={-10}
+                      step={1}
+                      disabled={false}
+                      onChange={(v) => handleParamChange('silence_threshold_db', v)}
+                    />
+                    <ParamSlider
+                      label={`Output Volume (${params.output_gain.toFixed(2)}×)`}
+                      value={params.output_gain}
+                      min={0.1}
+                      max={3.0}
+                      step={0.05}
+                      disabled={false}
+                      onChange={(v) => handleParamChange('output_gain', v)}
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  {/* RVC: pitch + index_rate + protect */}
+                  <div className="grid grid-cols-3 gap-6">
+                    <ParamSlider
+                      label="Pitch"
+                      value={params.pitch}
+                      min={-12}
+                      max={12}
+                      step={1}
+                      disabled={false}
+                      onChange={(v) => handleParamChange('pitch', v)}
+                    />
+                    <ParamSlider
+                      label="Index Rate"
+                      value={params.index_rate}
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      disabled={false}
+                      onChange={(v) => handleParamChange('index_rate', v)}
+                    />
+                    <ParamSlider
+                      label="Protect"
+                      value={params.protect}
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      disabled={false}
+                      onChange={(v) => handleParamChange('protect', v)}
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-6">
+                    <ParamSlider
+                      label={`Silence Gate (${params.silence_threshold_db} dBFS)`}
+                      value={params.silence_threshold_db}
+                      min={-70}
+                      max={-10}
+                      step={1}
+                      disabled={false}
+                      onChange={(v) => handleParamChange('silence_threshold_db', v)}
+                    />
+                    <ParamSlider
+                      label={`Output Volume (${params.output_gain.toFixed(2)}×)`}
+                      value={params.output_gain}
+                      min={0.1}
+                      max={3.0}
+                      step={0.05}
+                      disabled={false}
+                      onChange={(v) => handleParamChange('output_gain', v)}
+                    />
+                  </div>
+                </>
+              );
+            })()}
 
             {/* Noise Reduction + SOLA Crossfade — side by side */}
             <div className="flex gap-2 items-stretch">

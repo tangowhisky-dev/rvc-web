@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from backend.app.db import get_db
 from backend.app.training import manager
+from backend.beatrice2.training import beatrice_manager
 
 logger = logging.getLogger("rvc_web.training")
 
@@ -62,8 +63,13 @@ class StatusResponse(BaseModel):
     progress_pct: int
     status: str
     error: Optional[str] = None
+    # RVC fields
     total_epoch: Optional[int] = None
     batch_size: Optional[int] = None
+    # Beatrice 2 fields
+    pipeline: str = "rvc"
+    total_steps: Optional[int] = None
+    step: Optional[int] = None
 
 
 class EpochLossPoint(BaseModel):
@@ -74,6 +80,18 @@ class EpochLossPoint(BaseModel):
     loss_fm: Optional[float] = None
     loss_kl: Optional[float] = None
     loss_spk: Optional[float] = None
+    trained_at: str
+
+
+class BeatriceStepPoint(BaseModel):
+    step: int
+    loss_g: Optional[float] = None
+    loss_d: Optional[float] = None
+    loss_mel: Optional[float] = None
+    loss_ap: Optional[float] = None
+    loss_loud: Optional[float] = None
+    loss_adv: Optional[float] = None
+    loss_fm: Optional[float] = None
     trained_at: str
 
 
@@ -198,7 +216,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     # Look up profile
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT id, name, status, sample_path, batch_size, profile_dir, total_epochs_trained, needs_retraining, embedder, vocoder FROM profiles WHERE id = ?",
+            "SELECT id, name, status, sample_path, batch_size, profile_dir, total_epochs_trained, needs_retraining, embedder, vocoder, pipeline FROM profiles WHERE id = ?",
             (request.profile_id,),
         )
         row = await cursor.fetchone()
@@ -248,6 +266,7 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
     # Request batch_size always wins over the profile's stored default.
     # Persist it back so the DB stays in sync with what was actually used.
     batch_size = request.batch_size
+    profile_pipeline = str(row["pipeline"]) if row["pipeline"] else "rvc"
     # Read embedder and vocoder from profile (both locked after first training run).
     profile_embedder = str(row["embedder"]) if row["embedder"] else "spin-v2"
     profile_vocoder = str(row["vocoder"]) if row["vocoder"] else "HiFi-GAN"
@@ -258,6 +277,34 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
         )
         await db.commit()
 
+    # ---------- Beatrice 2 training path ----------
+    if profile_pipeline == "beatrice2":
+        try:
+            b2_job = beatrice_manager.start_job(
+                profile_id=request.profile_id,
+                audio_dir=sample_dir,
+                project_root=project_root,
+                n_steps=request.epochs,  # epochs param repurposed as n_steps
+                batch_size=batch_size,
+                profile_name=str(row["name"]),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        logger.info(
+            json.dumps(
+                {
+                    "event": "beatrice2_training_start",
+                    "profile_id": request.profile_id,
+                    "job_id": b2_job.job_id,
+                }
+            )
+        )
+        return StartTrainingResponse(job_id=b2_job.job_id)
+
+    # ---------- RVC training path (default) ----------
     try:
         job = manager.start_job(
             request.profile_id,
@@ -313,15 +360,21 @@ async def cancel_training(request: CancelTrainingRequest) -> dict:
     Raises:
         HTTPException(404): No active job found for this profile.
     """
+    # Try RVC first, then Beatrice 2
     job = manager.get_job(request.profile_id)
-    if job is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No active training job for profile: {request.profile_id}",
-        )
+    if job is not None:
+        manager.cancel_job(request.profile_id)
+        return {"ok": True}
 
-    manager.cancel_job(request.profile_id)
-    return {"ok": True}
+    b2_job = beatrice_manager.get_job(request.profile_id)
+    if b2_job is not None:
+        beatrice_manager.cancel_job(request.profile_id)
+        return {"ok": True}
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"No active training job for profile: {request.profile_id}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -336,13 +389,26 @@ async def get_status(profile_id: str) -> StatusResponse:
     Returns status='idle' (200) when no active job exists — callers use this
     to distinguish "not running" from an actual error without noisy 404 logs.
     """
+    # Check Beatrice 2 first (rarer path, cheap)
+    b2_job = beatrice_manager.get_job(profile_id)
+    if b2_job is not None:
+        return StatusResponse(
+            phase=b2_job.phase,
+            progress_pct=b2_job.progress_pct,
+            status=b2_job.status,
+            error=b2_job.error,
+            pipeline="beatrice2",
+            total_steps=b2_job.total_steps,
+        )
+
     job = manager.get_job(profile_id)
     if job is None:
         return StatusResponse(
             phase="idle",
-            progress_pct=0.0,
+            progress_pct=0,
             status="idle",
             error=None,
+            pipeline="rvc",
         )
 
     return StatusResponse(
@@ -350,25 +416,60 @@ async def get_status(profile_id: str) -> StatusResponse:
         progress_pct=job.progress_pct,
         status=job.status,
         error=job.error,
+        pipeline="rvc",
         total_epoch=job.total_epoch,
         batch_size=job.batch_size,
     )
 
 
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # GET /api/training/losses/{profile_id}
 # ---------------------------------------------------------------------------
 
 
-@router.get("/losses/{profile_id}", response_model=list[EpochLossPoint])
-async def get_losses(profile_id: str) -> list[EpochLossPoint]:
-    """Return all persisted epoch losses for a profile, ordered by epoch.
+@router.get("/losses/{profile_id}")
+async def get_losses(profile_id: str):
+    """Return persisted losses for a profile.
 
-    Returns an empty list if no loss data exists yet (new profile, or
-    training has never completed an epoch).
+    For RVC: returns epoch_losses ordered by epoch.
+    For Beatrice 2: returns beatrice_steps ordered by step.
+    The response shape differs by pipeline; clients should check the
+    ``pipeline`` field or the presence of ``epoch`` vs ``step`` keys.
     """
     async with get_db() as db:
+        # Determine pipeline from DB
+        cursor = await db.execute(
+            "SELECT pipeline FROM profiles WHERE id = ?", (profile_id,)
+        )
+        row = await cursor.fetchone()
+        pipeline = (row["pipeline"] if row else None) or "rvc"
+
+        if pipeline == "beatrice2":
+            cursor = await db.execute(
+                """SELECT step, loss_g, loss_d, loss_mel, loss_ap, loss_loud,
+                          loss_adv, loss_fm, trained_at
+                   FROM beatrice_steps
+                   WHERE profile_id = ?
+                   ORDER BY step ASC""",
+                (profile_id,),
+            )
+            rows = await cursor.fetchall()
+            return [
+                BeatriceStepPoint(
+                    step=r["step"],
+                    loss_g=r["loss_g"],
+                    loss_d=r["loss_d"],
+                    loss_mel=r["loss_mel"],
+                    loss_ap=r["loss_ap"],
+                    loss_loud=r["loss_loud"],
+                    loss_adv=r["loss_adv"],
+                    loss_fm=r["loss_fm"],
+                    trained_at=r["trained_at"],
+                )
+                for r in rows
+            ]
+
+        # RVC path
         cursor = await db.execute(
             """SELECT epoch, loss_mel, loss_gen, loss_disc, loss_fm, loss_kl, loss_spk, trained_at
                FROM epoch_losses
@@ -411,10 +512,10 @@ async def training_websocket(websocket: WebSocket, profile_id: str) -> None:
     """
     await websocket.accept()
 
-    # Poll up to 30s for the job to appear (300 × 100ms)
+    # Poll up to 30s for the job to appear — check both RVC and Beatrice 2
     job = None
     for _ in range(300):
-        job = manager.get_job(profile_id)
+        job = manager.get_job(profile_id) or beatrice_manager.get_job(profile_id)
         if job is not None:
             break
         await asyncio.sleep(0.1)

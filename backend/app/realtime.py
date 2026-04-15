@@ -154,6 +154,9 @@ class RealtimeManager:
         rvc_root: Optional[str] = None,
         save_path: Optional[str] = None,
         use_best: bool = False,
+        # Beatrice 2 params
+        pitch_shift_semitones: float = 0.0,
+        formant_shift_semitones: float = 0.0,
     ) -> RealtimeSession:
         """Spawn isolated worker process and return a RealtimeSession.
 
@@ -173,7 +176,7 @@ class RealtimeManager:
         # Validate profile in DB and fetch artifact paths
         async with get_db() as db:
             row = await db.execute_fetchall(
-                """SELECT id, status, model_path, index_path, profile_dir, profile_rms
+                """SELECT id, status, model_path, index_path, profile_dir, profile_rms, pipeline
                    FROM profiles WHERE id = ?""",
                 (profile_id,),
             )
@@ -188,6 +191,7 @@ class RealtimeManager:
         db_index_path: Optional[str] = row[0][3] or None
         stored_profile_dir: Optional[str] = row[0][4] or None
         db_profile_rms: Optional[float] = float(row[0][5]) if row[0][5] is not None else None
+        db_pipeline: str = str(row[0][6]) if row[0][6] else "rvc"
 
         # Check for per-profile canonical paths first
         if stored_profile_dir:
@@ -197,18 +201,24 @@ class RealtimeManager:
                 if not os.path.isabs(stored_profile_dir)
                 else stored_profile_dir
             )
-            # Resolve model: prefer model_best.pth when use_best is set and the
-            # file exists; fall back to model_infer.pth (latest) otherwise.
-            if use_best:
-                candidate_best = os.path.join(abs_profile_dir, "model_best.pth")
-                candidate_model = candidate_best if os.path.exists(candidate_best) else os.path.join(abs_profile_dir, "model_infer.pth")
+            if db_pipeline == "beatrice2":
+                # Beatrice 2 checkpoint
+                b2_ckpt = os.path.join(abs_profile_dir, "beatrice2_out", "checkpoint_latest.pt.gz")
+                if os.path.exists(b2_ckpt):
+                    db_model_path = b2_ckpt
             else:
-                candidate_model = os.path.join(abs_profile_dir, "model_infer.pth")
-            candidate_index = os.path.join(abs_profile_dir, "model.index")
-            if os.path.exists(candidate_model):
-                db_model_path = candidate_model
-            if os.path.exists(candidate_index):
-                db_index_path = candidate_index
+                # Resolve model: prefer model_best.pth when use_best is set and the
+                # file exists; fall back to model_infer.pth (latest) otherwise.
+                if use_best:
+                    candidate_best = os.path.join(abs_profile_dir, "model_best.pth")
+                    candidate_model = candidate_best if os.path.exists(candidate_best) else os.path.join(abs_profile_dir, "model_infer.pth")
+                else:
+                    candidate_model = os.path.join(abs_profile_dir, "model_infer.pth")
+                candidate_index = os.path.join(abs_profile_dir, "model.index")
+                if os.path.exists(candidate_model):
+                    db_model_path = candidate_model
+                if os.path.exists(candidate_index):
+                    db_index_path = candidate_index
 
         # Spawn the worker
         ctx = multiprocessing.get_context("spawn")
@@ -242,6 +252,9 @@ class RealtimeManager:
                 model_path=db_model_path,
                 index_path=db_index_path,
                 profile_rms=db_profile_rms,
+                pipeline=db_pipeline,
+                pitch_shift_semitones=pitch_shift_semitones,
+                formant_shift_semitones=formant_shift_semitones,
             ),
             daemon=True,
         )

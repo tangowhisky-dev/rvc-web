@@ -1,7 +1,7 @@
 # Codebase Map
 
-Generated: 2026-04-15T10:02:42Z | Files: 213 | Described: 0/213
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-15T10:02:42Z","fingerprint":"9075b8de0aae03cf9576183c40ab376282466930","fileCount":213,"truncated":false} -->
+Generated: 2026-04-15T16:54:12Z | Files: 228 | Described: 0/228
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-15T16:54:12Z","fingerprint":"ede754346f70ed002fe376bfeaa7e2939380893e","fileCount":228,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
@@ -73,6 +73,49 @@ Generated: 2026-04-15T10:02:42Z | Files: 213 | Described: 0/213
 - `backend/app/routers/profiles.py`
 - `backend/app/routers/realtime.py`
 - `backend/app/routers/training.py`
+
+### backend/beatrice2/
+- `backend/beatrice2/__init__.py`
+- `backend/beatrice2/download_assets.py`
+- `backend/beatrice2/inference.py`
+- `backend/beatrice2/preprocess.py`
+- `backend/beatrice2/training.py`
+
+### backend/beatrice2/beatrice_trainer/
+- `backend/beatrice2/beatrice_trainer/__init__.py`
+- `backend/beatrice2/beatrice_trainer/__main__.py`
+- `backend/beatrice2/beatrice_trainer/config.py`
+- `backend/beatrice2/beatrice_trainer/io.py`
+
+### backend/beatrice2/beatrice_trainer/assets/
+- `backend/beatrice2/beatrice_trainer/assets/default_config.json`
+
+### backend/beatrice2/beatrice_trainer/data/
+- `backend/beatrice2/beatrice_trainer/data/__init__.py`
+- `backend/beatrice2/beatrice_trainer/data/augment.py`
+- `backend/beatrice2/beatrice_trainer/data/dataset.py`
+- `backend/beatrice2/beatrice_trainer/data/filelist.py`
+
+### backend/beatrice2/beatrice_trainer/layers/
+- `backend/beatrice2/beatrice_trainer/layers/__init__.py`
+- `backend/beatrice2/beatrice_trainer/layers/attention.py`
+- `backend/beatrice2/beatrice_trainer/layers/conv.py`
+- `backend/beatrice2/beatrice_trainer/layers/vq.py`
+
+### backend/beatrice2/beatrice_trainer/models/
+- `backend/beatrice2/beatrice_trainer/models/__init__.py`
+- `backend/beatrice2/beatrice_trainer/models/converter.py`
+- `backend/beatrice2/beatrice_trainer/models/discriminator.py`
+- `backend/beatrice2/beatrice_trainer/models/phone_extractor.py`
+- `backend/beatrice2/beatrice_trainer/models/pitch_estimator.py`
+- `backend/beatrice2/beatrice_trainer/models/vocoder.py`
+
+### backend/beatrice2/beatrice_trainer/train/
+- `backend/beatrice2/beatrice_trainer/train/__init__.py`
+- `backend/beatrice2/beatrice_trainer/train/checkpoint.py`
+- `backend/beatrice2/beatrice_trainer/train/evaluation.py`
+- `backend/beatrice2/beatrice_trainer/train/loop.py`
+- `backend/beatrice2/beatrice_trainer/train/loss.py`
 
 ### backend/rvc/
 - `backend/rvc/__init__.py`
@@ -212,28 +255,6 @@ Generated: 2026-04-15T10:02:42Z | Files: 213 | Described: 0/213
 - `backend/tests/test_realtime.py`
 - `backend/tests/test_training_integration.py`
 - `backend/tests/test_training.py`
-
-### beatrice/
-- `beatrice/.gitignore`
-- `beatrice/convert.py`
-- `beatrice/download_assets.py`
-- `beatrice/MPS-FIXES.md`
-- `beatrice/preprocess.py`
-- `beatrice/README.md`
-- `beatrice/train.sh`
-
-### beatrice/trainer/
-- `beatrice/trainer/.gitignore`
-- `beatrice/trainer/LICENSE`
-- `beatrice/trainer/README.md`
-
-### beatrice/trainer/assets/
-- `beatrice/trainer/assets/default_config.json`
-- `beatrice/trainer/assets/README.md`
-
-### beatrice/trainer/beatrice_trainer/
-- `beatrice/trainer/beatrice_trainer/__init__.py`
-- `beatrice/trainer/beatrice_trainer/__main__.py`
 
 ### data/samples/07d44be257194f168506323e6c4b4d16/
 - `data/samples/07d44be257194f168506323e6c4b4d16/v.wav`

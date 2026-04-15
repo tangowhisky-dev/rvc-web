@@ -52,6 +52,9 @@ class StartSessionRequest(BaseModel):
     use_jit: bool = False
     save_path: Optional[str] = None
     use_best: bool = False  # if True, use model_best.pth instead of model_infer.pth
+    # Beatrice 2 params (ignored for RVC profiles)
+    pitch_shift_semitones: float = 0.0
+    formant_shift_semitones: float = 0.0
 
 
 class StopSessionRequest(BaseModel):
@@ -69,6 +72,9 @@ class UpdateParamsRequest(BaseModel):
     noise_reduction_output: Optional[bool] = None
     sola_crossfade_ms: Optional[int] = None
     formant: Optional[float] = None
+    # Beatrice 2 hot-update params
+    pitch_shift_semitones: Optional[float] = None
+    formant_shift_semitones: Optional[float] = None
 
 
 class StartSessionResponse(BaseModel):
@@ -149,6 +155,8 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
             rvc_root=project_root,
             save_path=request.save_path,
             use_best=request.use_best,
+            pitch_shift_semitones=request.pitch_shift_semitones,
+            formant_shift_semitones=request.formant_shift_semitones,
         )
         # start_session is async on the real manager; MagicMock returns sync in tests
         session = await result if asyncio.iscoroutine(result) else result

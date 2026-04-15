@@ -15,6 +15,7 @@ export interface PickerProfile {
   needs_retraining?: boolean;
   embedder?: string;
   vocoder?: string;
+  pipeline?: string;
 }
 
 interface ProfilePickerProps {
@@ -121,10 +122,12 @@ export function ProfilePicker({
 // Single row — same badge style as Library page
 // ---------------------------------------------------------------------------
 function ProfileRow({ profile, selected }: { profile: PickerProfile; selected?: boolean }) {
-  const emb    = profile.embedder ?? 'spin-v2';
-  const voc    = profile.vocoder  ?? 'HiFi-GAN';
-  const locked = profile.total_epochs_trained > 0;
-  const epochs = locked ? `${profile.total_epochs_trained} epochs` : 'untrained';
+  const emb     = profile.embedder ?? 'spin-v2';
+  const voc     = profile.vocoder  ?? 'HiFi-GAN';
+  const pip     = profile.pipeline ?? 'rvc';
+  const isB2    = pip === 'beatrice2';
+  const locked  = profile.total_epochs_trained > 0;
+  const epochs  = locked ? `${profile.total_epochs_trained} epochs` : 'untrained';
 
   const statusIcon = profile.status === 'trained'  ? ' ✓'
                    : profile.status === 'training' ? ' ⟳'
@@ -140,25 +143,35 @@ function ProfileRow({ profile, selected }: { profile: PickerProfile; selected?: 
         {profile.needs_retraining && <span className="ml-1 text-amber-400">⚠</span>}
       </span>
 
-      {/* Epoch count */}
+      {/* Epoch / step count */}
       <span className={`text-[11px] font-mono tabular-nums shrink-0
                         ${locked ? 'text-cyan-600' : 'text-zinc-600'}`}>
         {epochs}
       </span>
 
-      {/* Embedder badge */}
-      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0
-                       bg-indigo-950/40 border border-indigo-800/40 text-indigo-400">
-        ◈ {emb}
-        {locked && <span className="text-indigo-600" title="Locked after first training run">🔒</span>}
-      </span>
+      {/* Pipeline badge */}
+      {isB2 ? (
+        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0
+                         bg-amber-950/40 border border-amber-800/40 text-amber-400">
+          ◈ B2
+        </span>
+      ) : (
+        <>
+          {/* Embedder badge */}
+          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0
+                           bg-indigo-950/40 border border-indigo-800/40 text-indigo-400">
+            ◈ {emb}
+            {locked && <span className="text-indigo-600" title="Locked after first training run">🔒</span>}
+          </span>
 
-      {/* Vocoder badge */}
-      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0
-                       bg-violet-950/40 border border-violet-800/40 text-violet-400">
-        ◈ {voc}
-        {locked && <span className="text-violet-600" title="Locked after first training run">🔒</span>}
-      </span>
+          {/* Vocoder badge */}
+          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0
+                           bg-violet-950/40 border border-violet-800/40 text-violet-400">
+            ◈ {voc}
+            {locked && <span className="text-violet-600" title="Locked after first training run">🔒</span>}
+          </span>
+        </>
+      )}
     </div>
   );
 }
