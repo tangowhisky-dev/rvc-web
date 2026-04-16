@@ -39,6 +39,7 @@ if not hasattr(torch.amp, "GradScaler"):
 
 PARAPHERNALIA_VERSION = "2.0.0-rc.0"
 from ..models.vocoder import slice_segments
+from .augment import get_resampler
 
 class WavDataset(torch.utils.data.Dataset):
     def __init__(

@@ -546,11 +546,12 @@ def _run_main():
         if h.profile
         else nullcontext()
     ) as profiler:
+        data_iter = iter(training_loader)
         for iteration in tqdm(range(initial_iteration, h.n_steps), desc="Training"):
             # === 1. データ前処理 ===
             try:
                 batch = next(data_iter)
-            except (NameError, StopIteration):
+            except StopIteration:
                 data_iter = iter(training_loader)
                 batch = next(data_iter)
             (
