@@ -249,11 +249,11 @@ def _run_beatrice2_realtime(
 
     block_16k   = block_params["block_16k"]
     extra_16k   = block_params["extra_16k"]
-    return_length = block_params["return_length"]
-    sola_buf    = block_params["sola_buf"]
+    return_length = block_params["block_48k"]   # output 48k samples per callback = input block size
+    sola_buf    = block_params["sola_buf_48k"]  # SOLA overlap in 48k samples
 
-    _BLOCK_48K_LOCAL = int(block_params.get("block_48k", _BLOCK_48K))
-    _EXTRA_48K       = int(block_params.get("extra_48k", _EXTRA_48K_CONST))
+    _BLOCK_48K_LOCAL = int(block_params["block_48k"])
+    _EXTRA_48K       = int(_EXTRA_TIME * _SR_48K)  # history context in 48k samples
 
     # Rolling RMS estimation
     _ewma_alpha = 0.05
@@ -335,19 +335,21 @@ def _run_beatrice2_realtime(
             input_buffer_16k,
             pitch_shift_semitones=params["pitch_shift_semitones"],
             formant_shift_semitones=params["formant_shift_semitones"],
-        )  # float32 at 24 kHz
+        )  # float32 at 24 kHz — length corresponds to full input_buffer_16k window
 
         # ---- Resample to 48k ----
         t_out = _torch.from_numpy(converted).unsqueeze(0)
         t_48k = _R(orig_freq=tgt_sr, new_freq=48000)(t_out).squeeze(0)
-        out_np = t_48k.numpy()
+        out_full_48k = t_48k.numpy()
 
-        # Trim to expected return length (in 48k samples)
-        expected_48k = int(return_length * 48000 / tgt_sr)
-        if len(out_np) > expected_48k:
-            out_np = out_np[:expected_48k]
-        elif len(out_np) < expected_48k:
-            out_np = np.pad(out_np, (0, expected_48k - len(out_np)))
+        # The engine processed the full history window; take only the tail
+        # corresponding to the current block + SOLA overlap.
+        needed_48k = return_length + sola_buf
+        if len(out_full_48k) >= needed_48k:
+            out_np = out_full_48k[-needed_48k:]
+        else:
+            # Pad at head if too short (e.g. very short audio at startup)
+            out_np = np.pad(out_full_48k, (needed_48k - len(out_full_48k), 0))
 
         # ---- RMS matching ----
         rms_out = float(np.sqrt(np.mean(out_np ** 2)) + 1e-9)
@@ -359,13 +361,17 @@ def _run_beatrice2_realtime(
         out_np = out_np * float(params["output_gain"])
 
         # ---- SOLA crossfade ----
-        # Merge sola_buffer with head of out_np
-        head = _torch.from_numpy(out_np[:sola_buf])
-        merged = sola_buffer * out_fade_window + head * in_fade_window
-        sola_buffer = _torch.from_numpy(out_np[return_length - sola_buf:return_length])
-
-        out_full = np.concatenate([merged.numpy(), out_np[sola_buf:return_length]])
-        return out_full.astype(np.float32)
+        # out_np is (return_length + sola_buf) samples:
+        #   [0 : sola_buf]           — head overlaps with previous block's sola_buffer
+        #   [sola_buf : return_length + sola_buf] — body to emit
+        if sola_buf > 0:
+            head = _torch.from_numpy(out_np[:sola_buf])
+            merged = sola_buffer * out_fade_window + head * in_fade_window
+            sola_buffer = _torch.from_numpy(out_np[return_length:].copy())
+            out_full = np.concatenate([merged.numpy(), out_np[sola_buf:]])
+        else:
+            out_full = out_np
+        return out_full[:return_length].astype(np.float32)
 
     # ---- Audio I/O loop ----
     evt_q.put({"type": "ready"})
@@ -521,11 +527,6 @@ def run_worker(
 
             block_params = _compute_block_params(_BLOCK_48K, tgt_sr=tgt_sr,
                                                  sola_buf_ms=sola_crossfade_ms)
-            return_length = block_params["return_length"]
-            block_16k   = block_params["block_16k"]
-            sola_buf    = block_params["sola_buf"]
-            extra_16k   = block_params["extra_16k"]
-            p_len       = block_params["p_len"]
 
             # Use the same SOLA/gate/RMS machinery but swap out the infer step
             # ----------------------------------------------------------------

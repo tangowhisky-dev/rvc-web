@@ -77,11 +77,12 @@ async def _insert_beatrice_step(
     step: int,
     scalars: dict,
 ) -> None:
-    """Insert one row into beatrice_steps for step `step`."""
+    """Insert or update one row in beatrice_steps for the given step."""
     import datetime
 
     trained_at = datetime.datetime.utcnow().isoformat()
-    row_id = uuid.uuid4().hex
+    # Use a deterministic id based on profile+step so INSERT OR REPLACE deduplicates.
+    row_id = f"{profile_id}_{step}"
     async with get_db() as db:
         await db.execute(
             """INSERT OR REPLACE INTO beatrice_steps
@@ -434,25 +435,30 @@ async def _run_beatrice_pipeline(
     scalars_task.cancel()
 
     rc = proc.returncode
-    if rc == 0 or job.status == "cancelled":
+    was_cancelled = job.status == "cancelled"
+
+    if rc == 0 or was_cancelled:
         job.phase = "done"
         job.progress_pct = 100
 
-        # Locate best model — use checkpoint_latest.pt.gz
+        # Locate checkpoint — use checkpoint_latest.pt.gz
         model_path = checkpoint if os.path.exists(checkpoint) else None
 
-        # Update DB
-        async with get_db() as db:
-            await db.execute(
-                """UPDATE profiles
-                   SET status      = 'trained',
-                       model_path  = ?
-                   WHERE id = ?""",
-                (model_path, profile_id),
-            )
-            await db.commit()
-
-        if job.status != "cancelled":
+        if was_cancelled:
+            # Cancelled: mark failed (or partial), don't overwrite status already set
+            # by cancel_job(). DB status was already set to 'failed' by cancel_job.
+            pass
+        else:
+            # Successful completion — mark trained
+            async with get_db() as db:
+                await db.execute(
+                    """UPDATE profiles
+                       SET status      = 'trained',
+                           model_path  = ?
+                       WHERE id = ?""",
+                    (model_path, profile_id),
+                )
+                await db.commit()
             job.status = "done"
             job.queue.put_nowait(
                 {

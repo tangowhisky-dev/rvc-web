@@ -53,15 +53,21 @@ class BeatriceInferenceEngine:
             checkpoint = torch.load(f, map_location="cpu", weights_only=False)
 
         # Reconstruct models from checkpoint
+        h = checkpoint.get("h", {})
+        n_speakers = h.get("n_speakers", 1)
+        pitch_bins = h.get("pitch_bins", 448)
+        hidden_channels = h.get("hidden_channels", 256)
+
         self.phone_extractor = PhoneExtractor()
         self.pitch_estimator = PitchEstimator()
 
-        # ConverterNetwork needs n_speakers from state dict
-        n_speakers = checkpoint.get("n_speakers", 1)
+        # ConverterNetwork needs architectural hyperparams from h
         self.net_g = ConverterNetwork(
             phone_extractor=self.phone_extractor,
             pitch_estimator=self.pitch_estimator,
             n_speakers=n_speakers,
+            pitch_bins=pitch_bins,
+            hidden_channels=hidden_channels,
         )
 
         # Load weights
@@ -158,7 +164,7 @@ class BeatriceInferenceEngine:
         # Ratio: out_sr / in_sr * hop_length relationship
         # The vocoder decimates by 160/240 ratio implicitly; we trim proportionally
         expected_out = original_length * self._out_sample_rate // self._in_sample_rate
-        out = converted.squeeze(0)  # [T_out]
+        out = converted.squeeze()  # [T_out] — remove both batch and channel dims
         if out.shape[-1] > expected_out:
             out = out[:expected_out]
 

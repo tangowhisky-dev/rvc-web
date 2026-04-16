@@ -19,6 +19,7 @@ HF repo layout (assets/pretrained/, assets/ir/, assets/noise/, assets/test/).
 """
 
 import argparse
+import os
 import sys
 import urllib.request
 from pathlib import Path

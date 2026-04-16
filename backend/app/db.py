@@ -84,7 +84,8 @@ CREATE TABLE IF NOT EXISTS beatrice_steps (
     loss_loud   REAL,
     loss_adv    REAL,
     loss_fm     REAL,
-    trained_at  TEXT NOT NULL
+    trained_at  TEXT NOT NULL,
+    UNIQUE (profile_id, step)
 )
 """
 
