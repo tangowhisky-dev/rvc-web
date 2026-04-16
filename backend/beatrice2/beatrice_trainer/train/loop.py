@@ -64,6 +64,7 @@ from ..data.augment import (compute_grad_norm, compute_mean_f0, get_resampler,
                              convolve, random_formant_shift, random_filter,
                              get_noise, get_butterworth_lpf, augment_audio)
 from ..data.dataset import WavDataset
+from ..data.filelist import AUDIO_FILE_SUFFIXES
 
 def prepare_training():
     # 各種準備をする
