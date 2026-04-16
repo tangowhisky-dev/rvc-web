@@ -13,9 +13,10 @@ By default downloads:
   - 8 test utterances (~2 MB)                 [required for evaluation audio]
   - 20 impulse response files (IR)            [required — trainer asserts dir non-empty]
   - 20 background noise files                 [required — trainer asserts dir non-empty]
+  - UTMOS MOS model weights (~411 MB)         [required — perceptual quality assessment]
 
-All files are placed under {PROJECT_ROOT}/assets/beatrice2/ which mirrors the
-HF repo layout (assets/pretrained/, assets/ir/, assets/noise/, assets/test/).
+All Beatrice 2 assets land under {PROJECT_ROOT}/assets/beatrice2/.
+The UTMOS weights are loaded directly by QualityTester (no torch.hub machinery).
 """
 
 import argparse
@@ -130,6 +131,27 @@ def _default_assets_dir() -> Path:
     return _project_root() / "assets" / "beatrice2"
 
 
+def _download_utmos(assets_dir: Path, force: bool = False) -> None:
+    """Download UTMOS MOS model weights into assets_dir/utmos/.
+
+    The weights are loaded directly by QualityTester (no torch.hub machinery).
+    Source: https://github.com/tarepan/SpeechMOS/releases/tag/v1.0.0
+    Licence: MIT (tarepan/SpeechMOS, derived from sarulab-speech/UTMOS22)
+    Size: ~411 MB
+    """
+    weights_url = (
+        "https://github.com/tarepan/SpeechMOS/releases/download/v1.0.0/"
+        "utmos22_strong_step7459_v1.pt"
+    )
+    dest = assets_dir / "utmos" / "utmos22_strong_step7459_v1.pt"
+
+    print("UTMOS MOS model (~411 MB):")
+    if dest.exists() and not force:
+        print(f"  Skipped  {dest.name} (already present)")
+    else:
+        _download(weights_url, dest)
+
+
 def download_assets(assets_dir: Path, full: bool = False, force: bool = False):
     """Download all required Beatrice 2 assets into *assets_dir*.
 
@@ -181,6 +203,9 @@ def download_assets(assets_dir: Path, full: bool = False, force: bool = False):
         print()
         print("Tip: using a 20-file subset of IR/noise (sufficient for training).")
         print("For the full 1000-file augmentation set, re-run with --full.")
+
+    print()
+    _download_utmos(assets_dir, force=force)
 
 
 def main():

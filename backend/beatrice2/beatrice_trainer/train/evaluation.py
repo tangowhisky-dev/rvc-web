@@ -39,12 +39,37 @@ if not hasattr(torch.amp, "GradScaler"):
 
 PARAPHERNALIA_VERSION = "2.0.0-rc.0"
 
+# Weights file downloaded by backend/beatrice2/download_assets.py into
+# assets/beatrice2/utmos/utmos22_strong_step7459_v1.pt
+_UTMOS_WEIGHTS_RELPATH = os.path.join(
+    "assets", "beatrice2", "utmos", "utmos22_strong_step7459_v1.pt"
+)
+
+
+def _utmos_weights_path() -> Path:
+    """Resolve the UTMOS weights file against PROJECT_ROOT."""
+    root = os.environ.get("PROJECT_ROOT")
+    if root:
+        return Path(root) / _UTMOS_WEIGHTS_RELPATH
+    # Fallback: walk up from this file to find the project root
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / _UTMOS_WEIGHTS_RELPATH
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"UTMOS weights not found. Run: python3 -m backend.beatrice2.download_assets"
+    )
+
+
 class QualityTester(nn.Module):
     def __init__(self):
         super().__init__()
-        self.utmos = torch.hub.load(
-            "tarepan/SpeechMOS:v1.0.0", "utmos22_strong", trust_repo=True
-        ).eval()
+        from ..models.utmos import UTMOS22Strong
+        weights_path = _utmos_weights_path()
+        model = UTMOS22Strong()
+        state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
+        model.load_state_dict(state_dict)
+        self.utmos = model.eval()
 
     @torch.inference_mode()
     def compute_mos(self, wav: torch.Tensor) -> dict[str, list[float]]:
