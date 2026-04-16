@@ -30,9 +30,6 @@ from backend.app.db import get_db, DB_PATH
 # ---------------------------------------------------------------------------
 
 _TQDM_RE = re.compile(r"Training:\s+(\d+)%.*?(\d+)/(\d+)")
-# Checkpoint-save line emitted by beatrice_trainer after saving:
-# "Saved checkpoint_12345.pt.gz"
-_CKPT_SAVE_RE = re.compile(r"Saved .*checkpoint.*\.pt\.gz")
 
 
 # ---------------------------------------------------------------------------
@@ -69,29 +66,60 @@ async def _update_db_status(profile_id: str, status: str) -> None:
         await db.commit()
 
 
-async def _fetch_step_losses(profile_id: str, step: int) -> dict:
-    """Read losses for a specific step from DB (written by BeatriceDBWriter)."""
-    try:
-        async with get_db() as db:
-            cursor = await db.execute(
-                """SELECT loss_mel, loss_loud, loss_ap, loss_adv, loss_fm, loss_d
-                   FROM beatrice_steps
-                   WHERE profile_id = ? AND step = ?""",
-                (profile_id, step),
-            )
-            row = await cursor.fetchone()
-            if row:
-                return {
-                    "loss_mel":  row[0],
-                    "loss_loud": row[1],
-                    "loss_ap":   row[2],
-                    "loss_adv":  row[3],
-                    "loss_fm":   row[4],
-                    "loss_d":    row[5],
-                }
-    except Exception:
-        pass
-    return {}
+_B2_POLL_INTERVAL = 2.0  # seconds between beatrice_steps polls
+
+
+async def _poll_beatrice_steps(
+    job: "BeatriceTrainingJob",
+    profile_id: str,
+    proc_done: asyncio.Event,
+) -> None:
+    """Poll beatrice_steps every 2s; emit step_done events with DB losses.
+
+    Mirrors _poll_rvc_epochs for the Beatrice 2 pipeline.
+    Stops one cycle after proc_done is set.
+    """
+    _seen_step: int = 0
+
+    while True:
+        await asyncio.sleep(_B2_POLL_INTERVAL)
+
+        try:
+            async with get_db() as db:
+                cursor = await db.execute(
+                    """SELECT step, loss_mel, loss_loud, loss_ap,
+                              loss_adv, loss_fm, loss_d
+                       FROM beatrice_steps
+                       WHERE profile_id = ? AND step > ?
+                       ORDER BY step ASC""",
+                    (profile_id, _seen_step),
+                )
+                rows = await cursor.fetchall()
+        except Exception:
+            rows = []
+
+        for row in rows:
+            step = int(row[0])
+            losses = {
+                "loss_mel":  row[1],
+                "loss_loud": row[2],
+                "loss_ap":   row[3],
+                "loss_adv":  row[4],
+                "loss_fm":   row[5],
+                "loss_d":    row[6],
+            }
+            pct = int(100 * step / job.total_steps) if job.total_steps else 0
+            job.queue.put_nowait({
+                "type": "step_done",
+                "step": step,
+                "total_steps": job.total_steps,
+                "progress_pct": pct,
+                "losses": losses,
+            })
+            _seen_step = step
+
+        if proc_done.is_set():
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -339,12 +367,16 @@ async def _run_beatrice_pipeline(
         await _update_db_status(profile_id, "failed")
         return
 
-    # Drain stdout: parse tqdm progress lines and checkpoint-save lines.
-    # At every checkpoint save (every evaluation_interval steps), fetch the
-    # latest losses from DB (written by BeatriceDBWriter inside the subprocess)
-    # and emit a step_done event — mirroring RVC's epoch_done pattern.
+    # DB poller — emits step_done events as BeatriceDBWriter inserts rows.
+    # Runs concurrently with stdout drain; stops after proc exits.
+    _proc_done = asyncio.Event()
+    poll_task = asyncio.create_task(
+        _poll_beatrice_steps(job, profile_id, _proc_done)
+    )
+
+    # Drain stdout: forward log lines and parse tqdm for progress % display.
+    # step_done events are now entirely owned by _poll_beatrice_steps above.
     assert proc.stdout is not None
-    _last_step_with_losses = 0
     async for raw_line in proc.stdout:
         line = raw_line.decode("utf-8", errors="replace").rstrip()
         if not line:
@@ -367,27 +399,21 @@ async def _run_beatrice_pipeline(
                     "phase": "train",
                 }
             )
-            # Every 10 steps (same cadence as DB writes) emit a step_done event
-            # with losses fetched from DB.
-            if step > _last_step_with_losses and step % 10 == 0:
-                losses = await _fetch_step_losses(profile_id, step)
-                if losses:
-                    _last_step_with_losses = step
-                    job.queue.put_nowait(
-                        {
-                            "type": "step_done",
-                            "step": step,
-                            "total_steps": total,
-                            "progress_pct": pct,
-                            "losses": losses,
-                        }
-                    )
         else:
             job.queue.put_nowait(
                 {"type": "log", "message": line, "phase": "train"}
             )
 
     await proc.wait()
+
+    # Signal poller; wait for its final sweep before proceeding
+    _proc_done.set()
+    await asyncio.sleep(_B2_POLL_INTERVAL + 0.5)
+    poll_task.cancel()
+    try:
+        await poll_task
+    except asyncio.CancelledError:
+        pass
 
     rc = proc.returncode
     was_cancelled = job.status == "cancelled"

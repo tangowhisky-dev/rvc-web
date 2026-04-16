@@ -37,7 +37,6 @@ from dataclasses import dataclass, field
 from random import shuffle
 from typing import Dict, Optional
 
-import aiofiles
 import numpy as np
 
 from backend.app.db import get_db
@@ -120,83 +119,141 @@ async def _run_subprocess(
 
 
 # ---------------------------------------------------------------------------
-# Log-file tailer for train.py
+# DB poller for RVC training — replaces log-file tailing
 # ---------------------------------------------------------------------------
 
+_RVC_POLL_INTERVAL = 2.0  # seconds between epoch_losses polls
 
-async def _tail_train_log(job: TrainingJob, log_path: str) -> None:
-    """Poll train.log for new lines and put them into job.queue.
 
-    Waits up to 10 seconds for the log file to appear (it is created by a
-    child mp.Process inside train.py, so there is a race between subprocess
-    start and file creation).
+async def _poll_rvc_epochs(
+    job: "TrainingJob",
+    profile_id: str,
+    prior_epochs: int,
+    total_epoch: int,
+    overtrain_threshold: int,
+    proc_done: asyncio.Event,
+) -> None:
+    """Poll epoch_losses every 2s; emit epoch_done events with DB losses.
 
-    Polls every 200ms. Stops when job status is no longer "training".
+    Replaces stdout/logfile parsing for epoch detection.  train.py's
+    TrainingDBWriter already writes losses to DB before emitting the
+    '====> Epoch:' log line, so polling always gets complete data.
+
+    Stops two seconds after proc_done is set (one final sweep to catch
+    the last epoch written before subprocess exit).
     """
-    # Wait up to 10s for log file to appear
-    deadline = time.monotonic() + 10.0
-    while not os.path.exists(log_path):
-        if time.monotonic() >= deadline:
-            await job.queue.put(
-                {
-                    "type": "log",
-                    "message": "Warning: train.log did not appear within 10s; skipping tail",
-                    "phase": "train",
-                }
-            )
-            return
-        await asyncio.sleep(0.2)
+    _seen_epoch: int = prior_epochs
+    _best_avg_gen: float = float("inf")
+    _best_epoch: int = prior_epochs
+    _min_delta: float = 0.004
+    _ot_consecutive: int = 0
+    _ot_triggered: bool = False
 
-    async with aiofiles.open(log_path, "r") as f:
-        # Seek to end so we don't replay pre-existing content on re-runs
-        await f.seek(0, 2)  # SEEK_END
+    # Seed OT state from DB on resume
+    if overtrain_threshold > 0 and prior_epochs > 0:
+        try:
+            async with get_db() as _db:
+                row = await _db.execute_fetchall(
+                    "SELECT best_avg_gen_loss, best_epoch FROM profiles WHERE id = ?",
+                    (profile_id,),
+                )
+                if row and row[0][0] is not None:
+                    _best_avg_gen = float(row[0][0])
+                    _best_epoch = int(row[0][1] or prior_epochs)
+        except Exception:
+            pass
 
-        while job.status == "training":
-            line = await f.readline()
-            if line:
-                stripped = line.rstrip()
-                if stripped:
-                    # Detect epoch-start lines: "Train Epoch: N [N%]"
-                    if "Train Epoch:" in stripped:
-                        import re as _re
+    while True:
+        await asyncio.sleep(_RVC_POLL_INTERVAL)
 
-                        m = _re.search(r"Train Epoch:\s*(\d+)", stripped)
-                        if m:
-                            epoch_num = int(m.group(1))
-                            await job.queue.put(
-                                {
-                                    "type": "epoch",
-                                    "message": f"Epoch {epoch_num} started",
-                                    "phase": "train",
-                                    "epoch": epoch_num,
-                                }
-                            )
-                            continue  # don't also emit the raw line
-                    # Detect epoch-done lines: "====> Epoch: N [timestamp] | (elapsed)"
-                    if "====> Epoch:" in stripped:
-                        import re as _re
+        try:
+            async with get_db() as _db:
+                rows = await _db.execute_fetchall(
+                    """SELECT epoch, loss_mel, loss_gen, loss_disc,
+                              loss_fm, loss_kl, loss_spk
+                       FROM epoch_losses
+                       WHERE profile_id = ? AND epoch > ?
+                       ORDER BY epoch ASC""",
+                    (profile_id, _seen_epoch),
+                )
+        except Exception:
+            rows = []
 
-                        m = _re.search(r"====> Epoch:\s*(\d+)", stripped)
-                        if m:
-                            epoch_num = int(m.group(1))
-                            await job.queue.put(
-                                {
-                                    "type": "epoch_done",
-                                    "message": f"Epoch {epoch_num} complete",
-                                    "phase": "train",
-                                    "epoch": epoch_num,
-                                }
-                            )
-                            continue
-                    await job.queue.put(
-                        {
-                            "type": "log",
-                            "message": stripped,
-                            "phase": "train",
-                        }
+        for row in rows:
+            epoch_num = int(row[0])
+            losses = {
+                "loss_mel":  row[1],
+                "loss_gen":  row[2],
+                "loss_disc": row[3],
+                "loss_fm":   row[4],
+                "loss_kl":   row[5],
+                "loss_spk":  row[6],
+            }
+
+            # Overtraining detection
+            ot_label = ""
+            if overtrain_threshold > 0 and not _ot_triggered:
+                cur_mel = losses.get("loss_mel") or float("inf")
+                if cur_mel < _best_avg_gen - _min_delta:
+                    _ot_consecutive = 0
+                    _best_avg_gen = cur_mel
+                    _best_epoch = epoch_num
+                else:
+                    _ot_consecutive += 1
+
+                if _ot_consecutive >= overtrain_threshold:
+                    _ot_triggered = True
+                    ot_label = f" ⚠ overtraining ({_ot_consecutive} epochs no improvement)"
+                    await job.queue.put({
+                        "type": "log",
+                        "message": (
+                            f"Stopping early at epoch {epoch_num}: mel loss has not "
+                            f"improved for {_ot_consecutive} consecutive epochs "
+                            f"(threshold={overtrain_threshold}). "
+                            f"Best was epoch {_best_epoch} "
+                            f"(avg_mel={_best_avg_gen:.4f})."
+                        ),
+                        "phase": "train",
+                    })
+                    try:
+                        if job._proc is not None:
+                            job._proc.terminate()
+                    except Exception:
+                        pass
+
+            # Check best-epoch flag from DB
+            try:
+                async with get_db() as _db2:
+                    brow = await _db2.execute_fetchall(
+                        "SELECT best_epoch FROM profiles WHERE id = ?",
+                        (profile_id,),
                     )
-            else:
-                await asyncio.sleep(0.2)
+                    db_best = int(brow[0][0]) if brow and brow[0][0] else _best_epoch
+            except Exception:
+                db_best = _best_epoch
+
+            is_best = (db_best == epoch_num)
+            if is_best:
+                _best_epoch = epoch_num
+
+            msg: dict = {
+                "type": "epoch_done",
+                "message": f"Epoch {epoch_num}{ot_label}",
+                "phase": "train",
+                "epoch": epoch_num,
+                "is_best": is_best,
+                "best_epoch": _best_epoch,
+                "best_avg_gen": round(_best_avg_gen, 4) if _best_avg_gen < float("inf") else None,
+                "losses": losses,
+            }
+            if overtrain_threshold > 0:
+                msg["overtrain_consecutive"] = _ot_consecutive
+            await job.queue.put(msg)
+            _seen_epoch = epoch_num
+
+        # Stop one cycle after proc exits (catches last epoch)
+        if proc_done.is_set():
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -1106,8 +1163,6 @@ async def _run_pipeline(
     # count on early-stop / cancel so we don't credit epochs that didn't run.
     _last_completed_epoch: int = prior_epochs
 
-    log_path = os.path.join(exp_dir, "train.log")
-
     # Persistent training log — written to profile_dir so it survives exp_dir
     # wipes and is scoped per profile.  train.py's own FileHandler is broken
     # (the file descriptor doesn't survive mp.Process pickling on macOS/Linux
@@ -1128,46 +1183,36 @@ async def _run_pipeline(
         except OSError:
             pass
 
-    # Tail train.log concurrently while train.py runs (belt + suspenders —
-    # in case the FileHandler works in some configurations)
-    tail_task = asyncio.create_task(_tail_train_log(job, log_path))
+    # proc_done event — set after train_proc.wait() so _poll_rvc_epochs
+    # can do one final sweep and then stop cleanly.
+    _proc_done = asyncio.Event()
+
+    # DB epoch poller — the source of truth for epoch_done events.
+    # Replaces _tail_train_log + epoch parsing in _drain_stdout entirely.
+    poll_task = asyncio.create_task(
+        _poll_rvc_epochs(
+            job,
+            job.profile_id,
+            prior_epochs,
+            total_epoch,
+            overtrain_threshold,
+            _proc_done,
+        )
+    )
 
     # Stream stdout into job queue for real-time frontend display.
     # Responsibilities:
-    #   - Stream log lines to the WS client
-    #   - Parse epoch markers → emit structured epoch_done events
-    #   - Overtraining detection (terminate subprocess when threshold hit)
-    # NOT responsible for: DB writes (train.py owns those directly).
+    #   - Tee every line to the profile-scoped train.log
+    #   - Forward useful log lines to frontend (tracebacks, warnings, etc.)
+    #   - Log the best-epoch line so it appears in the UI log pane
+    # NOT responsible for: epoch detection, DB writes, OT detection
+    #   (all moved to _poll_rvc_epochs above).
     async def _drain_stdout() -> None:
         if train_proc.stdout is None:
             return
         import re as _re
 
         nonlocal _last_completed_epoch
-
-        # Overtraining detection — track session-local best mel loss.
-        # Seed from DB so resume runs don't restart the OT counter from scratch.
-        _best_avg_gen: float = float("inf")
-        _best_epoch: int = prior_epochs
-        _min_delta: float = 0.004
-        if overtrain_threshold > 0 and prior_epochs > 0:
-            try:
-                async with get_db() as _db:
-                    row = await _db.execute_fetchall(
-                        "SELECT best_avg_gen_loss, best_epoch FROM profiles WHERE id = ?",
-                        (job.profile_id,),
-                    )
-                    if row and row[0][0] is not None:
-                        _best_avg_gen = float(row[0][0])
-                        _best_epoch = int(row[0][1] or prior_epochs)
-            except Exception:
-                pass
-
-        # is_best flag for the current epoch — set when train.py's "best model
-        # updated" line is seen; consumed and reset at epoch_done.
-        _current_epoch_is_best: bool = False
-        _ot_consecutive: int = 0
-        _ot_triggered: bool = False
 
         async for raw_line in train_proc.stdout:
             line = raw_line.decode(errors="replace").rstrip()
@@ -1189,116 +1234,23 @@ async def _run_pipeline(
             if not clean:
                 continue
 
-            # Per-batch loss lines — suppress entirely (DB epoch averages are
-            # the source of truth; no stdout parsing needed).
+            # Per-batch loss lines — suppress (DB epoch averages are source of truth)
             if "losses:" in clean:
                 continue
-
             # "Train Epoch: N [pct%]" — suppress (fires every batch)
             if "Train Epoch:" in clean:
                 continue
-
             # "[step, lr]" list line — suppress
             if clean.startswith("[") and "," in clean:
                 continue
-
-            # Best-epoch line — update local OT state so the detection threshold
-            # is accurate. DB write already done by train.py.
-            if "best model updated" in clean and "G_best.pth" in clean:
-                _bm = _re.search(r"epoch=(\d+).*avg_mel=([0-9.]+)", clean)
-                if _bm:
-                    _best_epoch = int(_bm.group(1))
-                    _best_avg_gen = float(_bm.group(2))
-                    _current_epoch_is_best = True
-                await job.queue.put({"type": "log", "message": clean, "phase": "train"})
-                continue
-
-            # Epoch done: "====> Epoch: N [timestamp] (elapsed)"
+            # Epoch-done line — suppress; _poll_rvc_epochs handles this via DB
             if "====> Epoch:" in clean:
                 m = _re.search(r"====> Epoch:\s*(\d+)", clean)
-                if not m:
-                    await job.queue.put({"type": "log", "message": clean, "phase": "train"})
-                    continue
-
-                epoch_num = int(m.group(1))
-                elapsed_m = _re.search(r"\(([^)]+)\)", clean)
-                elapsed = elapsed_m.group(1) if elapsed_m else ""
-
-                is_best_epoch = _current_epoch_is_best
-                _current_epoch_is_best = False
-
-                # Fetch epoch-average losses from DB (written by TrainingDBWriter
-                # in train.py at line ~1001, before the "====> Epoch:" log line).
-                # This replaces the previous stdout-parsed last-batch values which
-                # were single-batch noise, not epoch averages.
-                losses: dict = {}
-                try:
-                    async with get_db() as _db:
-                        _row = await _db.execute_fetchall(
-                            """SELECT loss_mel, loss_gen, loss_disc, loss_fm, loss_kl, loss_spk
-                               FROM epoch_losses
-                               WHERE profile_id = ? AND epoch = ?""",
-                            (job.profile_id, epoch_num),
-                        )
-                        if _row:
-                            r = _row[0]
-                            losses = {
-                                "loss_mel":  r[0],
-                                "loss_gen":  r[1],
-                                "loss_disc": r[2],
-                                "loss_fm":   r[3],
-                                "loss_kl":   r[4],
-                                "loss_spk":  r[5],
-                            }
-                except Exception:
-                    pass  # non-fatal — chart will catch up on next DB poll
-
-                # Overtraining detection using epoch-average mel from DB.
-                # loss_gen reaches equilibrium by epoch ~12 and provides no
-                # discriminating signal after that; mel decreases monotonically.
-                ot_label = ""
-                if overtrain_threshold > 0 and not _ot_triggered:
-                    cur_mel = losses.get("loss_mel", float("inf"))
-                    if cur_mel < _best_avg_gen + _min_delta:
-                        _ot_consecutive = 0
-                    else:
-                        _ot_consecutive += 1
-
-                    if (_ot_consecutive >= overtrain_threshold):
-                        _ot_triggered = True
-                        ot_label = f" ⚠ overtraining ({_ot_consecutive} epochs no improvement)"
-                        await job.queue.put({
-                            "type": "log",
-                            "message": (
-                                f"Stopping early at epoch {epoch_num}: mel loss "
-                                f"has not improved for {_ot_consecutive} consecutive "
-                                f"epochs (threshold={overtrain_threshold}). "
-                                f"Best was epoch {_best_epoch} (avg_mel={_best_avg_gen:.4f})."
-                            ),
-                            "phase": "train",
-                        })
-                        try:
-                            train_proc.terminate()
-                        except Exception:
-                            pass
-
-                msg: dict = {
-                    "type": "epoch_done",
-                    "message": f"Epoch {epoch_num} ({elapsed}){ot_label}",
-                    "phase": "train",
-                    "epoch": epoch_num,
-                    "is_best": is_best_epoch,
-                    "best_epoch": _best_epoch,
-                    "best_avg_gen": round(_best_avg_gen, 4) if _best_avg_gen < float("inf") else None,
-                }
-                if losses:
-                    msg["losses"] = losses
-                if overtrain_threshold > 0:
-                    msg["overtrain_consecutive"] = _ot_consecutive
-                await job.queue.put(msg)
-                _last_completed_epoch = epoch_num
+                if m:
+                    _last_completed_epoch = int(m.group(1))
                 continue
 
+            # Best-epoch line — forward to UI log pane (informational)
             await job.queue.put({"type": "log", "message": clean, "phase": "train"})
 
     stdout_task = asyncio.create_task(_drain_stdout())
@@ -1326,13 +1278,17 @@ async def _run_pipeline(
     await train_proc.wait()
     job._proc = None
 
-    # Give the readers a moment to drain remaining lines
-    await asyncio.sleep(0.5)
+    # Signal poller that subprocess has exited; it will do one final sweep
+    _proc_done.set()
 
-    tail_task.cancel()
+    # Give stdout/stderr readers a moment to drain remaining buffered lines,
+    # and give the poller time to do its final sweep.
+    await asyncio.sleep(_RVC_POLL_INTERVAL + 0.5)
+
     stdout_task.cancel()
     stderr_task.cancel()
-    for task in (tail_task, stdout_task, stderr_task):
+    poll_task.cancel()
+    for task in (stdout_task, stderr_task, poll_task):
         try:
             await task
         except asyncio.CancelledError:
