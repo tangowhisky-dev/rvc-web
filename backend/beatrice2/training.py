@@ -344,7 +344,7 @@ async def _run_beatrice_pipeline(
     # Check for existing checkpoint — resume automatically
     checkpoint = os.path.join(out_dir, "checkpoint_latest.pt.gz")
     if os.path.exists(checkpoint):
-        cmd += ["--resume", "true"]
+        cmd += ["--resume"]
         job.queue.put_nowait(
             {"type": "log", "message": "Resuming from existing checkpoint.", "phase": "train"}
         )
@@ -434,10 +434,11 @@ async def _run_beatrice_pipeline(
             async with get_db() as db:
                 await db.execute(
                     """UPDATE profiles
-                       SET status      = 'trained',
-                           model_path  = ?
+                       SET status              = 'trained',
+                           model_path          = ?,
+                           total_epochs_trained = ?
                        WHERE id = ?""",
-                    (model_path, profile_id),
+                    (model_path, n_steps, profile_id),
                 )
                 await db.commit()
             job.status = "done"

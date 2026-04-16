@@ -523,90 +523,182 @@ function LossChart({
 // ---------------------------------------------------------------------------
 // BeatriceStepChart — step-based training chart for Beatrice 2 profiles
 //
-// Two panels:
-//   Top:    mel + loud + ap  (reconstruction quality — lower is better)
-//   Bottom: adv + fm + disc  (GAN stability — should settle, not monotone)
+// Matches the visual quality of LossChart (RVC):
+//   - Stat cards: current value + % change from first point
+//   - EMA smoothing on mel (main reconstruction signal)
+//   - Custom tooltip showing all 6 losses
+//   - Two panels: reconstruction (mel/loud/ap) + adversarial (adv/fm/disc)
 // ---------------------------------------------------------------------------
+
+function B2Tooltip({ active, payload, label }: {
+  active?: boolean;
+  payload?: Array<{ dataKey: string; value: number; color: string; name: string }>;
+  label?: number;
+}) {
+  if (!active || !payload?.length) return null;
+  const vals: Record<string, number> = {};
+  for (const e of payload) if (e.value != null) vals[e.dataKey] = e.value;
+  const rows: Array<{ key: string; label: string; color: string }> = [
+    { key: 'mel_raw',  label: 'Mel (raw)',   color: '#22d3ee' },
+    { key: 'mel_ema',  label: 'Mel (trend)', color: '#22d3ee' },
+    { key: 'loud_raw', label: 'Loud',        color: '#34d399' },
+    { key: 'ap_raw',   label: 'AP',          color: '#a3e635' },
+    { key: 'adv_raw',  label: 'Adv',         color: '#a78bfa' },
+    { key: 'fm_raw',   label: 'FM',          color: '#fb923c' },
+    { key: 'd_raw',    label: 'Disc',        color: '#f59e0b' },
+  ];
+  return (
+    <div className="bg-zinc-900/95 border border-zinc-700 rounded-md px-3 py-2 font-mono text-[10px] shadow-xl min-w-[150px]">
+      <div className="text-zinc-400 mb-1.5 font-semibold">step {label}</div>
+      {rows.map(r => vals[r.key] != null ? (
+        <div key={r.key} className="flex justify-between gap-4">
+          <span style={{ color: r.color, opacity: r.key.endsWith('_raw') && !r.key.startsWith('mel') ? 1 : r.key === 'mel_raw' ? 0.55 : 1 }}>{r.label}</span>
+          <span className="text-zinc-300">{vals[r.key].toFixed(3)}</span>
+        </div>
+      ) : null)}
+    </div>
+  );
+}
+
 function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
   if (points.length < 2) {
     return (
       <div className="h-36 flex items-center justify-center text-zinc-600 font-mono text-[11px]">
-        {points.length === 0 ? 'Chart will appear after first step' : 'Waiting for more steps…'}
+        {points.length === 0 ? 'Chart will appear after first steps' : 'Waiting for more steps…'}
       </div>
     );
   }
 
-  // Merge all fields by step
-  const dataMap = new Map<number, {
-    step: number;
-    mel?: number; loud?: number; ap?: number;
-    adv?: number; fm?: number;  d?: number;
-  }>();
-  for (const p of points) {
-    if (!dataMap.has(p.step)) dataMap.set(p.step, { step: p.step });
-    const e = dataMap.get(p.step)!;
-    if (p.loss_mel  != null) e.mel  = p.loss_mel;
-    if (p.loss_loud != null) e.loud = p.loss_loud;
-    if (p.loss_ap   != null) e.ap   = p.loss_ap;
-    if (p.loss_adv  != null) e.adv  = p.loss_adv;
-    if (p.loss_fm   != null) e.fm   = p.loss_fm;
-    if (p.loss_d    != null) e.d    = p.loss_d;
-  }
-  const data = [...dataMap.values()].sort((a, b) => a.step - b.step);
-  const lastStep = data[data.length - 1].step;
-  const latestMel = [...data].reverse().find(d => d.mel != null)?.mel;
+  // Extract raw series in step order
+  const sorted = [...points].sort((a, b) => a.step - b.step);
+  const melRaw  = sorted.map(p => p.loss_mel  ?? 0);
+  const loudRaw = sorted.map(p => p.loss_loud ?? 0);
+  const apRaw   = sorted.map(p => p.loss_ap   ?? 0);
+  const advRaw  = sorted.map(p => p.loss_adv  ?? 0);
+  const fmRaw   = sorted.map(p => p.loss_fm   ?? 0);
+  const dRaw    = sorted.map(p => p.loss_d    ?? 0);
 
-  const sharedAxis = {
-    tick: { fontSize: 10, fill: '#71717a', fontFamily: 'monospace' },
-  };
-  const tooltipStyle = {
-    contentStyle: { background: '#18181b', border: '1px solid #3f3f46', borderRadius: 6, fontSize: 11, fontFamily: 'monospace' },
-    labelStyle: { color: '#a1a1aa' },
-    itemStyle: { color: '#e4e4e7' },
+  const melEma = ema(melRaw);
+
+  function pctChange(raw: number[], e: number[]): string {
+    const delta = ((e[e.length - 1] - raw[0]) / Math.max(Math.abs(raw[0]), 1e-9)) * 100;
+    return `${delta < 0 ? '↓' : '↑'}${Math.abs(delta).toFixed(0)}%`;
+  }
+  function pctColor(raw: number[], e: number[]): string {
+    return e[e.length - 1] < raw[0] ? '#34d399' : '#f87171';
+  }
+
+  const chartData = sorted.map((p, i) => ({
+    step:     p.step,
+    mel_raw:  melRaw[i],
+    mel_ema:  melEma[i],
+    loud_raw: loudRaw[i],
+    ap_raw:   apRaw[i],
+    adv_raw:  advRaw[i],
+    fm_raw:   fmRaw[i],
+    d_raw:    dRaw[i],
+  }));
+
+  const lastStep  = sorted[sorted.length - 1].step;
+  const firstStep = sorted[0].step;
+  const axisStyle = { fontSize: 9, fontFamily: 'monospace', fill: '#52525b' } as const;
+  const gridProps = { strokeDasharray: '3 3' as const, stroke: '#1f1f23', vertical: false };
+  const xAxisProps = {
+    dataKey: 'step' as const,
+    type:    'number' as const,
+    domain:  [firstStep, lastStep] as [number, number],
+    tickCount: 4,
+    tick:    axisStyle,
+    tickLine: false,
+    axisLine: { stroke: '#3f3f46' },
   };
 
   return (
-    <div className="flex flex-col gap-1">
-      {/* Reconstruction losses */}
-      <div className="text-[10px] font-mono text-zinc-500 px-1">reconstruction</div>
-      <ResponsiveContainer width="100%" height={130}>
-        <LineChart data={data} margin={{ top: 2, right: 8, left: 0, bottom: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-          <XAxis dataKey="step" {...sharedAxis} hide />
-          <YAxis {...sharedAxis} width={38} />
-          <Tooltip {...tooltipStyle} />
-          <Line type="monotone" dataKey="mel"  stroke="#22d3ee" dot={false} strokeWidth={1.5} name="mel" />
-          <Line type="monotone" dataKey="loud" stroke="#34d399" dot={false} strokeWidth={1}   name="loud" />
-          <Line type="monotone" dataKey="ap"   stroke="#a3e635" dot={false} strokeWidth={1}   name="ap" />
-        </LineChart>
-      </ResponsiveContainer>
-      <div className="flex gap-3 text-[10px] font-mono text-zinc-500 px-1 pb-1">
-        <span className="text-cyan-400">— mel</span>
-        <span className="text-emerald-400">— loud</span>
-        <span className="text-lime-400">— ap</span>
+    <div className="flex flex-col gap-3">
+
+      {/* ── Reconstruction panel: Mel + Loud + AP ─────────────────────── */}
+      <div>
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-3 text-[10px] font-mono flex-wrap">
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#22d3ee' }} />
+              <span style={{ color: '#22d3ee' }}>Mel</span>
+              <span className="text-zinc-400">{melEma[melEma.length - 1].toFixed(3)}</span>
+              <span style={{ color: pctColor(melRaw, melEma) }}>{pctChange(melRaw, melEma)}</span>
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#34d399' }} />
+              <span style={{ color: '#34d399' }}>Loud</span>
+              <span className="text-zinc-400">{loudRaw[loudRaw.length - 1].toFixed(3)}</span>
+              <span style={{ color: pctColor(loudRaw, ema(loudRaw)) }}>{pctChange(loudRaw, ema(loudRaw))}</span>
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#a3e635' }} />
+              <span style={{ color: '#a3e635' }}>AP</span>
+              <span className="text-zinc-400">{apRaw[apRaw.length - 1].toFixed(3)}</span>
+              <span style={{ color: pctColor(apRaw, ema(apRaw)) }}>{pctChange(apRaw, ema(apRaw))}</span>
+            </span>
+          </div>
+          <span className="text-[9px] font-mono text-zinc-600">faded = raw · solid = trend</span>
+        </div>
+        <ResponsiveContainer width="100%" height={150}>
+          <ComposedChart data={chartData} margin={{ top: 4, right: 36, bottom: 0, left: 24 }}>
+            <CartesianGrid {...gridProps} />
+            <XAxis {...xAxisProps} hide />
+            <YAxis yAxisId="left" orientation="left"  tick={axisStyle} tickLine={false} axisLine={false}
+              tickFormatter={(v: number) => v.toFixed(1)} width={28} domain={['auto', 'auto']} />
+            <YAxis yAxisId="right" orientation="right" tick={axisStyle} tickLine={false} axisLine={false}
+              tickFormatter={(v: number) => v.toFixed(2)} width={32} domain={['auto', 'auto']} />
+            <Tooltip content={<B2Tooltip />} />
+            <Line yAxisId="left"  type="monotone" dataKey="mel_raw"  stroke="#22d3ee" strokeWidth={1}   dot={false} strokeOpacity={0.25} isAnimationActive={false} />
+            <Line yAxisId="left"  type="monotone" dataKey="mel_ema"  stroke="#22d3ee" strokeWidth={2}   dot={false} isAnimationActive={false} />
+            <Line yAxisId="right" type="monotone" dataKey="loud_raw" stroke="#34d399" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            <Line yAxisId="right" type="monotone" dataKey="ap_raw"   stroke="#a3e635" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+          </ComposedChart>
+        </ResponsiveContainer>
       </div>
 
-      {/* GAN losses */}
-      <div className="text-[10px] font-mono text-zinc-500 px-1">adversarial</div>
-      <ResponsiveContainer width="100%" height={130}>
-        <LineChart data={data} margin={{ top: 2, right: 8, left: 0, bottom: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-          <XAxis dataKey="step" {...sharedAxis}
-            label={{ value: 'step', position: 'insideRight', offset: -4, fontSize: 10, fill: '#52525b' }} />
-          <YAxis {...sharedAxis} width={38} />
-          <Tooltip {...tooltipStyle} />
-          <Line type="monotone" dataKey="adv" stroke="#a78bfa" dot={false} strokeWidth={1.5} name="adv" />
-          <Line type="monotone" dataKey="fm"  stroke="#fb923c" dot={false} strokeWidth={1}   name="fm" />
-          <Line type="monotone" dataKey="d"   stroke="#f59e0b" dot={false} strokeWidth={1}   name="disc" />
-        </LineChart>
-      </ResponsiveContainer>
-      <div className="flex gap-3 text-[10px] font-mono text-zinc-500 px-1">
-        <span className="text-violet-400">— adv</span>
-        <span className="text-orange-400">— fm</span>
-        <span className="text-amber-400">— disc</span>
-        <span className="ml-auto">
-          step {lastStep} · mel {latestMel != null ? latestMel.toFixed(3) : '—'}
-        </span>
+      {/* ── Adversarial panel: Adv + FM + Disc ────────────────────────── */}
+      <div>
+        <div className="flex items-center gap-3 mb-1 text-[10px] font-mono flex-wrap">
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#a78bfa' }} />
+            <span style={{ color: '#a78bfa' }}>Adv</span>
+            <span className="text-zinc-400">{advRaw[advRaw.length - 1].toFixed(3)}</span>
+            <span style={{ color: pctColor(advRaw, ema(advRaw)) }}>{pctChange(advRaw, ema(advRaw))}</span>
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#fb923c' }} />
+            <span style={{ color: '#fb923c' }}>FM</span>
+            <span className="text-zinc-400">{fmRaw[fmRaw.length - 1].toFixed(3)}</span>
+            <span style={{ color: pctColor(fmRaw, ema(fmRaw)) }}>{pctChange(fmRaw, ema(fmRaw))}</span>
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#f59e0b' }} />
+            <span style={{ color: '#f59e0b' }}>Disc</span>
+            <span className="text-zinc-400">{dRaw[dRaw.length - 1].toFixed(3)}</span>
+            <span className="text-zinc-600 text-[9px] ml-1">≈ flat = healthy</span>
+          </span>
+        </div>
+        <ResponsiveContainer width="100%" height={90}>
+          <ComposedChart data={chartData} margin={{ top: 2, right: 36, bottom: 0, left: 24 }}>
+            <CartesianGrid {...gridProps} />
+            <XAxis {...xAxisProps}
+              label={{ value: 'step', position: 'insideBottomRight', offset: -4, fontSize: 8, fontFamily: 'monospace', fill: '#52525b' }} />
+            <YAxis yAxisId="left" orientation="left"  tick={axisStyle} tickLine={false} axisLine={false}
+              tickFormatter={(v: number) => v.toFixed(1)} width={28} />
+            <YAxis yAxisId="right" orientation="right" tick={axisStyle} tickLine={false} axisLine={false}
+              tickFormatter={(v: number) => v.toFixed(2)} width={32} />
+            <Tooltip content={<B2Tooltip />} />
+            <Line yAxisId="left"  type="monotone" dataKey="adv_raw" stroke="#a78bfa" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            <Line yAxisId="left"  type="monotone" dataKey="fm_raw"  stroke="#fb923c" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            <Line yAxisId="right" type="monotone" dataKey="d_raw"   stroke="#f59e0b" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="text-[9px] font-mono text-zinc-600 text-right">
+        step {lastStep}
       </div>
     </div>
   );
