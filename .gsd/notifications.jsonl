@@ -13,3 +13,7 @@
 {"id":"7536005c-891d-43a8-9f30-143756d996dc","ts":"2026-04-07T13:28:38.958Z","severity":"warning","message":"[state] DB unavailable — using filesystem state derivation (degraded mode)","source":"workflow-logger","read":true}
 {"id":"986b5062-56d5-4e05-a677-8f195e8073be","ts":"2026-04-07T14:37:43.437Z","severity":"warning","message":"[state] DB unavailable — using filesystem state derivation (degraded mode)","source":"workflow-logger","read":true}
 {"id":"06018cf6-435c-40f7-8a30-d941b8784b88","ts":"2026-04-07T14:40:05.253Z","severity":"warning","message":"[state] DB unavailable — using filesystem state derivation (degraded mode)","source":"workflow-logger","read":false}
+{"id":"91701624-9a5d-487e-8e0a-39b792df8cac","ts":"2026-04-16T08:02:02.719Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}
+{"id":"baee3159-fe11-4014-a3f7-926523662589","ts":"2026-04-16T08:04:54.706Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}
+{"id":"91a98595-e382-484b-bce9-ca2c7b5ea454","ts":"2026-04-16T08:44:10.138Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}
+{"id":"4cd0af6b-6147-4b5d-88ab-7ae541780a7f","ts":"2026-04-16T09:22:41.882Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}

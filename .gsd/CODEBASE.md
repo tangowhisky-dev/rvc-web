@@ -1,7 +1,7 @@
 # Codebase Map
 
-Generated: 2026-04-16T06:09:47Z | Files: 228 | Described: 0/228
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-16T06:09:47Z","fingerprint":"ede754346f70ed002fe376bfeaa7e2939380893e","fileCount":228,"truncated":false} -->
+Generated: 2026-04-16T12:06:55Z | Files: 232 | Described: 0/232
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-16T12:06:55Z","fingerprint":"a9fc636717f89bf4877d1486470e82d1034154e4","fileCount":232,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
@@ -76,6 +76,7 @@ Generated: 2026-04-16T06:09:47Z | Files: 228 | Described: 0/228
 
 ### backend/beatrice2/
 - `backend/beatrice2/__init__.py`
+- `backend/beatrice2/db_writer.py`
 - `backend/beatrice2/download_assets.py`
 - `backend/beatrice2/inference.py`
 - `backend/beatrice2/preprocess.py`
@@ -109,6 +110,11 @@ Generated: 2026-04-16T06:09:47Z | Files: 228 | Described: 0/228
 - `backend/beatrice2/beatrice_trainer/models/phone_extractor.py`
 - `backend/beatrice2/beatrice_trainer/models/pitch_estimator.py`
 - `backend/beatrice2/beatrice_trainer/models/vocoder.py`
+
+### backend/beatrice2/beatrice_trainer/models/utmos/
+- `backend/beatrice2/beatrice_trainer/models/utmos/__init__.py`
+- `backend/beatrice2/beatrice_trainer/models/utmos/fairseq_alt.py`
+- `backend/beatrice2/beatrice_trainer/models/utmos/model.py`
 
 ### backend/beatrice2/beatrice_trainer/train/
 - `backend/beatrice2/beatrice_trainer/train/__init__.py`

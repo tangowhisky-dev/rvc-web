@@ -43,7 +43,7 @@ from ..layers.attention import ConvNeXtStack
 from ..layers.vq import VectorQuantizer
 from ..models.phone_extractor import PhoneExtractor
 from ..models.pitch_estimator import PitchEstimator
-from ..models.vocoder import Vocoder, slice_segments
+from ..models.vocoder import Vocoder, slice_segments, compute_loudness, d4c
 from ..io import dump_params, dump_layer
 
 class ConverterNetwork(nn.Module):
