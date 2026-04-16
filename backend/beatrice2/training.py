@@ -17,25 +17,22 @@ import asyncio
 import json
 import os
 import re
-import shutil
-import signal
 import sys
 import uuid
 from asyncio import subprocess as asyncio_subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, Optional
 
-import aiofiles
-
-from backend.app.db import get_db
+from backend.app.db import get_db, DB_PATH
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_SCALARS_POLL_INTERVAL = 2.0  # seconds between scalars.jsonl tail checks
 _TQDM_RE = re.compile(r"Training:\s+(\d+)%.*?(\d+)/(\d+)")
+# Checkpoint-save line emitted by beatrice_trainer after saving:
+# "Saved checkpoint_12345.pt.gz"
+_CKPT_SAVE_RE = re.compile(r"Saved .*checkpoint.*\.pt\.gz")
 
 
 # ---------------------------------------------------------------------------
@@ -72,38 +69,29 @@ async def _update_db_status(profile_id: str, status: str) -> None:
         await db.commit()
 
 
-async def _insert_beatrice_step(
-    profile_id: str,
-    step: int,
-    scalars: dict,
-) -> None:
-    """Insert or update one row in beatrice_steps for the given step."""
-    import datetime
-
-    trained_at = datetime.datetime.utcnow().isoformat()
-    # Use a deterministic id based on profile+step so INSERT OR REPLACE deduplicates.
-    row_id = f"{profile_id}_{step}"
-    async with get_db() as db:
-        await db.execute(
-            """INSERT OR REPLACE INTO beatrice_steps
-               (id, profile_id, step, loss_g, loss_d, loss_mel, loss_ap,
-                loss_loud, loss_adv, loss_fm, trained_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                row_id,
-                profile_id,
-                step,
-                scalars.get("loss_g"),
-                scalars.get("loss_d"),
-                scalars.get("loss_mel"),
-                scalars.get("loss_ap"),
-                scalars.get("loss_loud"),
-                scalars.get("loss_adv"),
-                scalars.get("loss_fm"),
-                trained_at,
-            ),
-        )
-        await db.commit()
+async def _fetch_step_losses(profile_id: str, step: int) -> dict:
+    """Read losses for a specific step from DB (written by BeatriceDBWriter)."""
+    try:
+        async with get_db() as db:
+            cursor = await db.execute(
+                """SELECT loss_mel, loss_loud, loss_ap, loss_adv, loss_fm, loss_d
+                   FROM beatrice_steps
+                   WHERE profile_id = ? AND step = ?""",
+                (profile_id, step),
+            )
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    "loss_mel":  row[0],
+                    "loss_loud": row[1],
+                    "loss_ap":   row[2],
+                    "loss_adv":  row[3],
+                    "loss_fm":   row[4],
+                    "loss_d":    row[5],
+                }
+    except Exception:
+        pass
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -231,55 +219,6 @@ def _preprocess_audio(
 
 
 # ---------------------------------------------------------------------------
-# Scalars reader (tails scalars.jsonl written by training loop)
-# ---------------------------------------------------------------------------
-
-
-async def _tail_scalars(
-    job: BeatriceTrainingJob,
-    out_dir: str,
-    profile_id: str,
-) -> None:
-    """Async task: tail scalars.jsonl, insert DB rows, push step_done events."""
-    scalars_path = os.path.join(out_dir, "scalars.jsonl")
-    lines_seen = 0
-
-    while job.status == "training":
-        await asyncio.sleep(_SCALARS_POLL_INTERVAL)
-        try:
-            async with aiofiles.open(scalars_path, encoding="utf-8") as f:
-                all_lines = await f.readlines()
-        except FileNotFoundError:
-            continue
-
-        new_lines = all_lines[lines_seen:]
-        lines_seen = len(all_lines)
-
-        for line in new_lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            step = obj.get("iteration") or obj.get("step")
-            if step is None:
-                continue
-            await _insert_beatrice_step(profile_id, int(step), obj)
-            job.queue.put_nowait(
-                {
-                    "type": "step_done",
-                    "step": int(step),
-                    "total_steps": job.total_steps,
-                    "progress_pct": int(100 * int(step) / job.total_steps),
-                    "loss_mel": obj.get("loss_mel"),
-                    "loss_g": obj.get("loss_g"),
-                    "loss_d": obj.get("loss_d"),
-                }
-            )
-
-
 # ---------------------------------------------------------------------------
 # Main pipeline coroutine
 # ---------------------------------------------------------------------------
@@ -368,6 +307,10 @@ async def _run_beatrice_pipeline(
         out_dir,
         "-c",
         config_path,
+        "--db",
+        DB_PATH,
+        "--profile-id",
+        profile_id,
     ]
 
     # Check for existing checkpoint — resume automatically
@@ -396,19 +339,18 @@ async def _run_beatrice_pipeline(
         await _update_db_status(profile_id, "failed")
         return
 
-    # Start scalars tailer
-    scalars_task = asyncio.create_task(
-        _tail_scalars(job, out_dir, profile_id)
-    )
-
-    # Drain stdout / parse tqdm progress
+    # Drain stdout: parse tqdm progress lines and checkpoint-save lines.
+    # At every checkpoint save (every evaluation_interval steps), fetch the
+    # latest losses from DB (written by BeatriceDBWriter inside the subprocess)
+    # and emit a step_done event — mirroring RVC's epoch_done pattern.
     assert proc.stdout is not None
+    _last_step_with_losses = 0
     async for raw_line in proc.stdout:
         line = raw_line.decode("utf-8", errors="replace").rstrip()
         if not line:
             continue
 
-        # Parse tqdm progress: "Training:  20%|...| 2000/10000 [...]"
+        # Parse tqdm progress: "Training:  20%|...| 2000/10000 [elapsed<eta]"
         m = _TQDM_RE.search(line)
         if m:
             pct = int(m.group(1))
@@ -425,13 +367,27 @@ async def _run_beatrice_pipeline(
                     "phase": "train",
                 }
             )
+            # Every 10 steps (same cadence as DB writes) emit a step_done event
+            # with losses fetched from DB.
+            if step > _last_step_with_losses and step % 10 == 0:
+                losses = await _fetch_step_losses(profile_id, step)
+                if losses:
+                    _last_step_with_losses = step
+                    job.queue.put_nowait(
+                        {
+                            "type": "step_done",
+                            "step": step,
+                            "total_steps": total,
+                            "progress_pct": pct,
+                            "losses": losses,
+                        }
+                    )
         else:
             job.queue.put_nowait(
                 {"type": "log", "message": line, "phase": "train"}
             )
 
     await proc.wait()
-    scalars_task.cancel()
 
     rc = proc.returncode
     was_cancelled = job.status == "cancelled"

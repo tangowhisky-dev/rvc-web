@@ -85,13 +85,12 @@ class EpochLossPoint(BaseModel):
 
 class BeatriceStepPoint(BaseModel):
     step: int
-    loss_g: Optional[float] = None
-    loss_d: Optional[float] = None
-    loss_mel: Optional[float] = None
-    loss_ap: Optional[float] = None
+    loss_mel:  Optional[float] = None
     loss_loud: Optional[float] = None
-    loss_adv: Optional[float] = None
-    loss_fm: Optional[float] = None
+    loss_ap:   Optional[float] = None
+    loss_adv:  Optional[float] = None
+    loss_fm:   Optional[float] = None
+    loss_d:    Optional[float] = None
     trained_at: str
 
 
@@ -446,8 +445,8 @@ async def get_losses(profile_id: str):
 
         if pipeline == "beatrice2":
             cursor = await db.execute(
-                """SELECT step, loss_g, loss_d, loss_mel, loss_ap, loss_loud,
-                          loss_adv, loss_fm, trained_at
+                """SELECT step, loss_mel, loss_loud, loss_ap,
+                          loss_adv, loss_fm, loss_d, trained_at
                    FROM beatrice_steps
                    WHERE profile_id = ?
                    ORDER BY step ASC""",
@@ -457,13 +456,12 @@ async def get_losses(profile_id: str):
             return [
                 BeatriceStepPoint(
                     step=r["step"],
-                    loss_g=r["loss_g"],
-                    loss_d=r["loss_d"],
                     loss_mel=r["loss_mel"],
-                    loss_ap=r["loss_ap"],
                     loss_loud=r["loss_loud"],
+                    loss_ap=r["loss_ap"],
                     loss_adv=r["loss_adv"],
                     loss_fm=r["loss_fm"],
+                    loss_d=r["loss_d"],
                     trained_at=r["trained_at"],
                 )
                 for r in rows

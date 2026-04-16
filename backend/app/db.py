@@ -77,13 +77,12 @@ CREATE TABLE IF NOT EXISTS beatrice_steps (
     id          TEXT PRIMARY KEY,
     profile_id  TEXT NOT NULL,
     step        INTEGER NOT NULL,
-    loss_g      REAL,
-    loss_d      REAL,
     loss_mel    REAL,
-    loss_ap     REAL,
     loss_loud   REAL,
+    loss_ap     REAL,
     loss_adv    REAL,
     loss_fm     REAL,
+    loss_d      REAL,
     trained_at  TEXT NOT NULL,
     UNIQUE (profile_id, step)
 )
@@ -148,6 +147,18 @@ _EPOCH_LOSSES_MIGRATIONS: list[tuple[str, str]] = [
     ("loss_spk", "REAL"),
 ]
 
+# beatrice_steps was originally created with a phantom loss_g column.
+# New schema drops loss_g and uses the real component losses.
+# SQLite can't drop columns (pre-3.35), so we just ensure the real columns exist.
+_BEATRICE_STEPS_MIGRATIONS: list[tuple[str, str]] = [
+    ("loss_mel",  "REAL"),
+    ("loss_loud", "REAL"),
+    ("loss_ap",   "REAL"),
+    ("loss_adv",  "REAL"),
+    ("loss_fm",   "REAL"),
+    ("loss_d",    "REAL"),
+]
+
 
 async def init_db() -> None:
     """Initialize the database and required data directories.
@@ -192,6 +203,16 @@ async def init_db() -> None:
             if col_name not in existing_el:
                 await db.execute(
                     f"ALTER TABLE epoch_losses ADD COLUMN {col_name} {col_def}"
+                )
+
+        # Column-level migrations on beatrice_steps (idempotent)
+        cursor = await db.execute("PRAGMA table_info(beatrice_steps)")
+        existing_bs = {row[1] for row in await cursor.fetchall()}
+
+        for col_name, col_def in _BEATRICE_STEPS_MIGRATIONS:
+            if col_name not in existing_bs:
+                await db.execute(
+                    f"ALTER TABLE beatrice_steps ADD COLUMN {col_name} {col_def}"
                 )
 
         await db.commit()

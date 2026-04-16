@@ -46,7 +46,7 @@ interface HardwareInfo {
 }
 
 interface TrainingMsg {
-  type: 'log' | 'phase' | 'done' | 'error' | 'keepalive' | 'epoch' | 'epoch_done' | 'index_done' | 'step_done';
+  type: 'log' | 'phase' | 'done' | 'error' | 'keepalive' | 'epoch' | 'epoch_done' | 'index_done' | 'step_done' | 'progress';
   message?: string;
   phase?: string;
   elapsed_s?: number;
@@ -57,16 +57,21 @@ interface TrainingMsg {
   best_avg_gen?: number;
   // Beatrice 2 step fields
   step?: number;
-  loss_g?: number;
-  loss_d?: number;
-  loss_mel?: number;  // top-level for step_done events
+  total_steps?: number;
+  progress_pct?: number;
   losses?: {
+    // RVC epoch losses
     loss_disc?: number;
     loss_gen?: number;
     loss_fm?: number;
     loss_mel?: number;
     loss_kl?: number;
     loss_spk?: number;
+    // Beatrice 2 step losses
+    loss_loud?: number;
+    loss_ap?: number;
+    loss_adv?: number;
+    loss_d?: number;
   };
 }
 
@@ -82,9 +87,12 @@ interface EpochPoint {
 
 interface BeatriceStepPoint {
   step: number;
-  loss_g: number | null;
-  loss_d: number | null;
-  loss_mel: number | null;
+  loss_mel:  number | null;
+  loss_loud: number | null;
+  loss_ap:   number | null;
+  loss_adv:  number | null;
+  loss_fm:   number | null;
+  loss_d:    number | null;
   trained_at: string;
 }
 
@@ -514,6 +522,10 @@ function LossChart({
 
 // ---------------------------------------------------------------------------
 // BeatriceStepChart — step-based training chart for Beatrice 2 profiles
+//
+// Two panels:
+//   Top:    mel + loud + ap  (reconstruction quality — lower is better)
+//   Bottom: adv + fm + disc  (GAN stability — should settle, not monotone)
 // ---------------------------------------------------------------------------
 function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
   if (points.length < 2) {
@@ -524,48 +536,76 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
     );
   }
 
-  const melPoints = points
-    .filter(p => p.loss_mel != null)
-    .map(p => ({ step: p.step, mel: p.loss_mel! }));
-
-  const gPoints = points
-    .filter(p => p.loss_g != null)
-    .map(p => ({ step: p.step, g: p.loss_g! }));
-
-  const mergedMap = new Map<number, { step: number; mel?: number; g?: number; d?: number }>();
+  // Merge all fields by step
+  const dataMap = new Map<number, {
+    step: number;
+    mel?: number; loud?: number; ap?: number;
+    adv?: number; fm?: number;  d?: number;
+  }>();
   for (const p of points) {
-    if (!mergedMap.has(p.step)) mergedMap.set(p.step, { step: p.step });
-    const e = mergedMap.get(p.step)!;
-    if (p.loss_mel != null) e.mel = p.loss_mel;
-    if (p.loss_g   != null) e.g   = p.loss_g;
-    if (p.loss_d   != null) e.d   = p.loss_d;
+    if (!dataMap.has(p.step)) dataMap.set(p.step, { step: p.step });
+    const e = dataMap.get(p.step)!;
+    if (p.loss_mel  != null) e.mel  = p.loss_mel;
+    if (p.loss_loud != null) e.loud = p.loss_loud;
+    if (p.loss_ap   != null) e.ap   = p.loss_ap;
+    if (p.loss_adv  != null) e.adv  = p.loss_adv;
+    if (p.loss_fm   != null) e.fm   = p.loss_fm;
+    if (p.loss_d    != null) e.d    = p.loss_d;
   }
-  const data = [...mergedMap.values()].sort((a, b) => a.step - b.step);
+  const data = [...dataMap.values()].sort((a, b) => a.step - b.step);
+  const lastStep = data[data.length - 1].step;
+  const latestMel = [...data].reverse().find(d => d.mel != null)?.mel;
+
+  const sharedAxis = {
+    tick: { fontSize: 10, fill: '#71717a', fontFamily: 'monospace' },
+  };
+  const tooltipStyle = {
+    contentStyle: { background: '#18181b', border: '1px solid #3f3f46', borderRadius: 6, fontSize: 11, fontFamily: 'monospace' },
+    labelStyle: { color: '#a1a1aa' },
+    itemStyle: { color: '#e4e4e7' },
+  };
 
   return (
-    <div className="flex flex-col gap-2">
-      <ResponsiveContainer width="100%" height={160}>
-        <LineChart data={data} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+    <div className="flex flex-col gap-1">
+      {/* Reconstruction losses */}
+      <div className="text-[10px] font-mono text-zinc-500 px-1">reconstruction</div>
+      <ResponsiveContainer width="100%" height={130}>
+        <LineChart data={data} margin={{ top: 2, right: 8, left: 0, bottom: 0 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-          <XAxis dataKey="step" tick={{ fontSize: 10, fill: '#71717a', fontFamily: 'monospace' }}
+          <XAxis dataKey="step" {...sharedAxis} hide />
+          <YAxis {...sharedAxis} width={38} />
+          <Tooltip {...tooltipStyle} />
+          <Line type="monotone" dataKey="mel"  stroke="#22d3ee" dot={false} strokeWidth={1.5} name="mel" />
+          <Line type="monotone" dataKey="loud" stroke="#34d399" dot={false} strokeWidth={1}   name="loud" />
+          <Line type="monotone" dataKey="ap"   stroke="#a3e635" dot={false} strokeWidth={1}   name="ap" />
+        </LineChart>
+      </ResponsiveContainer>
+      <div className="flex gap-3 text-[10px] font-mono text-zinc-500 px-1 pb-1">
+        <span className="text-cyan-400">— mel</span>
+        <span className="text-emerald-400">— loud</span>
+        <span className="text-lime-400">— ap</span>
+      </div>
+
+      {/* GAN losses */}
+      <div className="text-[10px] font-mono text-zinc-500 px-1">adversarial</div>
+      <ResponsiveContainer width="100%" height={130}>
+        <LineChart data={data} margin={{ top: 2, right: 8, left: 0, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+          <XAxis dataKey="step" {...sharedAxis}
             label={{ value: 'step', position: 'insideRight', offset: -4, fontSize: 10, fill: '#52525b' }} />
-          <YAxis tick={{ fontSize: 10, fill: '#71717a', fontFamily: 'monospace' }} width={34} />
-          <Tooltip
-            contentStyle={{ background: '#18181b', border: '1px solid #3f3f46', borderRadius: 6, fontSize: 11, fontFamily: 'monospace' }}
-            labelStyle={{ color: '#a1a1aa' }}
-            itemStyle={{ color: '#e4e4e7' }}
-          />
-          <Line type="monotone" dataKey="mel" stroke="#22d3ee" dot={false} strokeWidth={1.5} name="mel" />
-          <Line type="monotone" dataKey="g"   stroke="#a78bfa" dot={false} strokeWidth={1}   name="gen" />
+          <YAxis {...sharedAxis} width={38} />
+          <Tooltip {...tooltipStyle} />
+          <Line type="monotone" dataKey="adv" stroke="#a78bfa" dot={false} strokeWidth={1.5} name="adv" />
+          <Line type="monotone" dataKey="fm"  stroke="#fb923c" dot={false} strokeWidth={1}   name="fm" />
           <Line type="monotone" dataKey="d"   stroke="#f59e0b" dot={false} strokeWidth={1}   name="disc" />
         </LineChart>
       </ResponsiveContainer>
-      <div className="flex gap-4 text-[10px] font-mono text-zinc-500">
-        <span className="text-cyan-400">— mel</span>
-        <span className="text-violet-400">— gen</span>
+      <div className="flex gap-3 text-[10px] font-mono text-zinc-500 px-1">
+        <span className="text-violet-400">— adv</span>
+        <span className="text-orange-400">— fm</span>
         <span className="text-amber-400">— disc</span>
         <span className="ml-auto">
-          step {data[data.length - 1].step} · latest mel {data.filter(d => d.mel != null).at(-1)?.mel?.toFixed(3) ?? '—'}
+          step {lastStep} · mel {latestMel != null ? latestMel.toFixed(3) : '—'}
         </span>
       </div>
     </div>
@@ -779,10 +819,13 @@ export default function TrainingPage() {
         if (cancelled) return;
         if (isB2) {
           setStepPoints((rows as BeatriceStepPoint[]).map(r => ({
-            step:     r.step,
-            loss_g:   r.loss_g   ?? null,
-            loss_d:   r.loss_d   ?? null,
-            loss_mel: r.loss_mel ?? null,
+            step:      r.step,
+            loss_mel:  r.loss_mel  ?? null,
+            loss_loud: r.loss_loud ?? null,
+            loss_ap:   r.loss_ap   ?? null,
+            loss_adv:  r.loss_adv  ?? null,
+            loss_fm:   r.loss_fm   ?? null,
+            loss_d:    r.loss_d    ?? null,
             trained_at: r.trained_at,
           })));
         } else {
@@ -883,13 +926,17 @@ export default function TrainingPage() {
             ));
           }
         } else if (msg.type === 'step_done') {
-          // Beatrice 2 step event
-          if (msg.step != null) {
+          // Beatrice 2 step event — losses come from DB via _fetch_step_losses
+          if (msg.step != null && msg.losses) {
+            const l = msg.losses;
             const pt: BeatriceStepPoint = {
-              step:     msg.step,
-              loss_g:   msg.loss_g   ?? null,
-              loss_d:   msg.loss_d   ?? null,
-              loss_mel: msg.loss_mel ?? null,
+              step:      msg.step,
+              loss_mel:  l.loss_mel  ?? null,
+              loss_loud: l.loss_loud ?? null,
+              loss_ap:   l.loss_ap   ?? null,
+              loss_adv:  l.loss_adv  ?? null,
+              loss_fm:   l.loss_fm   ?? null,
+              loss_d:    l.loss_d    ?? null,
               trained_at: new Date().toISOString(),
             };
             setStepPoints(prev => {

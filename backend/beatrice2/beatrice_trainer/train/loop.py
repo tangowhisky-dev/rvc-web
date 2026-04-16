@@ -84,7 +84,7 @@ def prepare_training():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    (h, in_wav_dataset_dir, out_dir, resume, skip_training) = (
+    (h, in_wav_dataset_dir, out_dir, resume, skip_training, db_path, profile_id) = (
         prepare_training_configs_for_experiment
         if is_notebook()
         else prepare_training_configs
@@ -477,6 +477,8 @@ def prepare_training():
         writer,
         _amp_device,
         _use_amp,
+        db_path,
+        profile_id,
     )
 
 
@@ -510,7 +512,13 @@ def _run_main():
         writer,
         _amp_device,
         _use_amp,
+        db_path,
+        profile_id,
     ) = prepare_training()
+
+    # Direct DB writer — same pattern as RVC's TrainingDBWriter
+    from backend.beatrice2.db_writer import BeatriceDBWriter
+    _db_writer = BeatriceDBWriter(db_path, profile_id)
 
     if h.compile_convnext:
         raw_convnextstack_forward = ConvNeXtStack.forward
@@ -665,13 +673,27 @@ def _run_main():
                 dict_scalars[f"~gradient_balancer/{k}"].append(v)
             _tb_interval = 10
             if (iteration + 1) % _tb_interval == 0 or iteration == 0:
-                for name, scalars in dict_scalars.items():
-                    if scalars:
-                        writer.add_scalar(
-                            name, sum(scalars) / len(scalars), iteration + 1
-                        )
-                        scalars.clear()
+                # Compute averages before clearing
+                scalar_avgs = {
+                    name: sum(vals) / len(vals)
+                    for name, vals in dict_scalars.items()
+                    if vals
+                }
+                for name, avg in scalar_avgs.items():
+                    writer.add_scalar(name, avg, iteration + 1)
+                    dict_scalars[name].clear()
                 writer.flush()
+
+                # Write step losses directly to DB — same pattern as RVC's TrainingDBWriter
+                _db_writer.insert_step_loss(iteration + 1, {
+                    "loss_mel":  scalar_avgs.get("loss_g/loss_mel"),
+                    "loss_loud": scalar_avgs.get("loss_g/loss_loudness"),
+                    "loss_adv":  scalar_avgs.get("loss_g/loss_adv"),
+                    "loss_fm":   scalar_avgs.get("loss_g/loss_fm"),
+                    "loss_ap":   scalar_avgs.get("loss_g/loss_ap"),
+                    "loss_d":    scalar_avgs.get("loss_d/loss_discriminator"),
+                })
+
                 # Histograms are expensive — only every 1000 iters
                 if (iteration + 1) % 1000 == 0 or iteration == 0:
                     for name, param in net_g.named_parameters():

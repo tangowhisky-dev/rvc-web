@@ -161,6 +161,8 @@ def prepare_training_configs() -> tuple[dict, Path, Path, bool, bool]:
     parser.add_argument("-o", "--out_dir", type=Path, help="output directory")
     parser.add_argument("-r", "--resume", action="store_true", help="resume training")
     parser.add_argument("-c", "--config", type=Path, help="path to the config file")
+    parser.add_argument("--db", type=str, default="", help="path to rvc.db for direct loss writes")
+    parser.add_argument("--profile-id", type=str, default="", help="profile ID for DB writes")
     # fmt: on
     args = parser.parse_args()
 
@@ -204,7 +206,9 @@ def prepare_training_configs() -> tuple[dict, Path, Path, bool, bool]:
             del h[key]
     # resume
     resume = args.resume
-    return h, in_wav_dataset_dir, out_dir, resume, False
+    db_path = args.db or ""
+    profile_id = args.profile_id or ""
+    return h, in_wav_dataset_dir, out_dir, resume, False, db_path, profile_id
 
 
 class AttrDict(dict):
