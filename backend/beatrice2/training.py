@@ -355,7 +355,6 @@ async def _run_beatrice_pipeline(
     # Phase 3: Training subprocess
     # ------------------------------------------------------------------
     env = dict(os.environ)
-    env["BEATRICE_TRAINER_ROOT"] = project_root
     env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
 

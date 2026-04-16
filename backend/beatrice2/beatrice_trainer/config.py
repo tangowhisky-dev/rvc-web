@@ -45,8 +45,8 @@ def is_notebook() -> bool:
 
 
 def repo_root() -> Path:
-    if "BEATRICE_TRAINER_ROOT" in os.environ:
-        return Path(os.environ["BEATRICE_TRAINER_ROOT"])
+    if "PROJECT_ROOT" in os.environ:
+        return Path(os.environ["PROJECT_ROOT"])
     d = Path.cwd() / "dummy" if is_notebook() else Path(__file__)
     assert d.is_absolute(), d
     for d in d.parents:
