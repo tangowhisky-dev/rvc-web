@@ -136,6 +136,7 @@ global_step = 0
 lowest_mel = float("inf")   # best EMA-smoothed mel seen so far (best-epoch criterion)
 _ema_mel   = float("inf")   # running EMA of epoch-average mel; inf until first epoch completes
 _EMA_MEL_ALPHA = 0.33       # α=0.33 → ~1.7 epoch half-life; smooths minibatch noise without lag
+_BEST_SAVE_WARMUP = 50      # don't save G_best.pth for the first N epochs (too noisy)
 
 
 class EpochRecorder:
@@ -985,6 +986,19 @@ def train_and_evaluate(
         #   adding meaningful lag — a real improvement clears the threshold within
         #   1-2 epochs, while a single lucky epoch doesn't trigger a premature save.
         #
+        # WHY skip early epochs (epoch <= _BEST_SAVE_WARMUP=50):
+        #   In the first ~50 epochs the model is adapting from the pretrained
+        #   weights — mel loss drops steeply and nearly every epoch beats the
+        #   previous one.  Saving G_best.pth on every improvement during this
+        #   phase wastes I/O and locks best_epoch to a checkpoint that will be
+        #   far surpassed within tens more epochs.  We track the EMA throughout
+        #   warmup so lowest_mel is properly calibrated when saving begins; we
+        #   just don't write the file or update the DB until epoch 51+.
+        #
+        #   If training ends before epoch 51 (or is cancelled early), G_best.pth
+        #   will never be written.  In that case model_best.pth is absent and
+        #   model_infer.pth (from G_latest.pth) serves as the inference model.
+        #
         # This runs every epoch regardless of save_every_epoch.
         if _epoch_gen_count > 0:
             avg_mel = _epoch_mel_sum / _epoch_gen_count
@@ -996,20 +1010,27 @@ def train_and_evaluate(
             _min_delta = 0.004  # must improve by at least this to count
             if _ema_mel < lowest_mel - _min_delta:
                 lowest_mel = _ema_mel
-                best_path = os.path.join(hps.model_dir, "G_best.pth")
-                utils.save_checkpoint(
-                    net_g,
-                    optim_g,
-                    hps.train.learning_rate,
-                    epoch,
-                    best_path,
-                )
-                logger.info(
-                    f"best model updated → G_best.pth  "
-                    f"(epoch={epoch}, avg_mel={avg_mel:.4f}, ema_mel={_ema_mel:.4f})"
-                )
-                # Store raw avg_mel in DB (more interpretable than the EMA value)
-                _db_writer.update_best_epoch(epoch, avg_mel)
+                if epoch > _BEST_SAVE_WARMUP:
+                    best_path = os.path.join(hps.model_dir, "G_best.pth")
+                    utils.save_checkpoint(
+                        net_g,
+                        optim_g,
+                        hps.train.learning_rate,
+                        epoch,
+                        best_path,
+                    )
+                    logger.info(
+                        f"best model updated → G_best.pth  "
+                        f"(epoch={epoch}, avg_mel={avg_mel:.4f}, ema_mel={_ema_mel:.4f})"
+                    )
+                    # Store raw avg_mel in DB (more interpretable than the EMA value)
+                    _db_writer.update_best_epoch(epoch, avg_mel)
+                else:
+                    logger.info(
+                        f"best mel improved (warmup epoch {epoch}/{_BEST_SAVE_WARMUP}) — "
+                        f"tracking only, no save  "
+                        f"(avg_mel={avg_mel:.4f}, ema_mel={_ema_mel:.4f})"
+                    )
 
         # Write epoch-average losses directly to DB
         if rank == 0 and _epoch_gen_count > 0:
