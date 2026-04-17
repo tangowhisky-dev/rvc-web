@@ -30,7 +30,10 @@ from backend.app.db import get_db, DB_PATH
 # Constants
 # ---------------------------------------------------------------------------
 
-_TQDM_RE = re.compile(r"Training:\s+(\d+)%.*?(\d+)/(\d+)")
+_TQDM_RE = re.compile(
+    r"Training:\s+(\d+)%.*?\|\s*(\d+)/(\d+)"
+    r"(?:\s*\[(\d+:\d+)<(\S+),\s*([\d.]+)s/it)?"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -405,12 +408,16 @@ async def _run_beatrice_pipeline(
         if not line:
             continue
 
-        # Parse tqdm progress: "Training:  20%|...| 2000/10000 [elapsed<eta]"
+        # Parse tqdm progress: "Training:  20%|...| 2000/10000 [01:23<05:32,  3.21s/it]"
         m = _TQDM_RE.search(line)
         if m:
-            pct = int(m.group(1))
-            step = int(m.group(2))
+            pct   = int(m.group(1))
+            step  = int(m.group(2))
             total = int(m.group(3))
+            elapsed_str  = m.group(4) or ""   # e.g. "01:23"
+            eta_str      = m.group(5) or ""   # e.g. "05:32"
+            secs_per_it  = m.group(6) or ""   # e.g. "3.21"
+
             job.progress_pct = pct
             job.total_steps = total
             job.queue.put_nowait(
@@ -422,6 +429,18 @@ async def _run_beatrice_pipeline(
                     "phase": "train",
                 }
             )
+            # Emit a human-readable log line every 100 iterations
+            if step > 0 and step % 100 == 0:
+                parts = [f"Step {step}/{total}"]
+                if secs_per_it:
+                    parts.append(f"{secs_per_it}s/it")
+                if elapsed_str:
+                    parts.append(f"elapsed {elapsed_str}")
+                if eta_str and eta_str != "?":
+                    parts.append(f"ETA {eta_str}")
+                job.queue.put_nowait(
+                    {"type": "log", "message": "  ".join(parts), "phase": "train"}
+                )
         else:
             job.queue.put_nowait(
                 {"type": "log", "message": line, "phase": "train"}
