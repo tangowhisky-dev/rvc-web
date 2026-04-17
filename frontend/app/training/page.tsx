@@ -1312,6 +1312,7 @@ export default function TrainingPage() {
                 {(() => {
                   const sel = profiles.find(p => p.id === selectedId);
                   const isB2 = sel?.pipeline === 'beatrice2';
+                  const minB2Steps = isB2 ? Math.round(10000 * Math.sqrt(8 / batchSize)) : 1;
                   return (
                     <>
                       <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
@@ -1319,12 +1320,12 @@ export default function TrainingPage() {
                       </label>
                       <input
                         type="number" value={epochs}
-                        min={isB2 ? 500 : 1} max={isB2 ? 50000 : 1000}
+                        min={isB2 ? minB2Steps : 1} max={isB2 ? 50000 : 1000}
                         step={isB2 ? 500 : 1}
                         disabled={isRunning}
                         onChange={(e) => {
                           const v = Number(e.target.value);
-                          setEpochs(isB2 ? Math.max(500, Math.min(50000, v)) : Math.max(1, Math.min(1000, v)));
+                          setEpochs(isB2 ? Math.max(minB2Steps, Math.min(50000, v)) : Math.max(1, Math.min(1000, v)));
                         }}
                         className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 text-[13px]
                                    font-mono text-zinc-200 focus:outline-none focus:border-cyan-600
@@ -1346,9 +1347,14 @@ export default function TrainingPage() {
                         </div>
                       )}
                       {isB2 && (
-                        <span className="text-[10px] font-mono text-amber-400/80 leading-tight">
-                          ◈ Beatrice 2 · CUDA required
-                        </span>
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[10px] font-mono text-amber-400/80 leading-tight">
+                            ◈ Beatrice 2 · CUDA required
+                          </span>
+                          <span className="text-[10px] font-mono text-zinc-500 leading-tight">
+                            min {minB2Steps.toLocaleString()} steps @ bs={batchSize}
+                          </span>
+                        </div>
                       )}
                     </>
                   );
@@ -1719,43 +1725,83 @@ export default function TrainingPage() {
         </footer>
 
         {/* Tips */}
-        <TipsPanel tips={[
-          {
-            icon: '📊',
-            title: 'Epoch count: 200–500 for speech, 500–1000 for singing',
-            body: 'Results at 25 epochs are audible but rough. Speech cloning typically becomes convincing at 200+ epochs. More training data means fewer epochs needed for the same quality.',
-          },
-          {
-            icon: '🛑',
-            title: 'Overtraining detection is active',
-            body: 'When the generator loss stops improving and starts climbing, training halts automatically. This is a sign to stop — more epochs past this point hurt quality.',
-          },
-          {
-            icon: '🎙️',
-            title: 'Audio quality matters more than quantity',
-            body: 'One hour of clean, single-speaker, dry (no reverb) audio beats 10 hours of noisy or multi-speaker recordings. Remove silence, music beds, and cross-talk before uploading.',
-          },
-          {
-            icon: '🔁',
-            title: 'Batch size and save frequency',
-            body: 'Larger batches train faster but need more GPU memory. Save every 10–25 epochs so you can roll back to an earlier checkpoint if overtraining is detected.',
-          },
-          {
-            icon: '🗂️',
-            title: 'SPIN-v2 embedder gives the best speaker identity preservation',
-            body: 'ContentVec is a good fallback if SPIN-v2 produces artefacts. HuBERT is the most forgiving with noisy or reverberant data.',
-          },
-          {
-            icon: '🔊',
-            title: 'RefineGAN vs HiFi-GAN',
-            body: 'RefineGAN produces crisper, more detailed speech at the cost of slightly longer training time. For quick experiments, HiFi-GAN converges faster and is more forgiving.',
-          },
-          {
-            icon: '🎤',
-            title: 'Speaker Loss (ECAPA-TDNN) for better voice cloning',
-            body: 'The training pipeline now includes an optional speaker identity loss using ECAPA-TDNN. Set c_spk > 0 in the training config to activate it. This loss directly optimises for speaker similarity, making the cloned voice sound more like the target speaker. Recommended weight: 1.0–3.0.',
-          },
-        ]} />
+        {(() => {
+          const _tipProfile = profiles.find(p => p.id === selectedId);
+          const _isB2 = _tipProfile?.pipeline === 'beatrice2';
+          if (_isB2) return (
+            <TipsPanel tips={[
+              {
+                icon: '🔢',
+                title: 'Minimum steps scale with batch size',
+                body: 'The reference recipe is 10 000 steps at batch size 8. For other batch sizes use: min_steps = 10 000 × √(8 ÷ batch_size). Examples: bs 4 → 14 142 steps, bs 8 → 10 000, bs 16 → 7 071, bs 32 → 5 000, bs 64 → 3 536. The UI enforces this minimum automatically as you change batch size.',
+              },
+              {
+                icon: '⚖️',
+                title: 'Batch size trades gradient quality for step count',
+                body: 'Larger batches produce lower-variance gradient estimates — each step is more reliable but you need fewer of them (√ rule, not linear). bs 32 at 5 000 steps sees 2× more total audio than bs 8 at 10 000 steps, but converges to similar quality. Use the largest batch that fits in VRAM.',
+              },
+              {
+                icon: '📈',
+                title: 'Good targets for a typical dataset',
+                body: 'Quick test: 500–1 000 steps (bs 8). Usable voice: 2 000–3 000 steps. Good quality: 5 000–8 000 steps. Best quality: 10 000+ steps (bs 8) or 5 000+ steps (bs 32). Watch UTMOS at evaluation checkpoints — if it stops improving over 1 000 steps, you have found the ceiling for your dataset.',
+              },
+              {
+                icon: '🔁',
+                title: 'Resuming continues from the last checkpoint',
+                body: 'Each resume run adds the requested steps on top of the previous total. Warmup (first 50 % of total steps, capped at 5 000) is computed from the cumulative step count, so the learning rate curve is always consistent regardless of how many times you resume.',
+              },
+              {
+                icon: '🎙️',
+                title: 'Audio quality matters more than quantity',
+                body: 'Clean, single-speaker, dry (no reverb) audio is critical. The trainer preprocesses audio into 6-second chunks at 16 kHz — very short clips or heavy background noise will degrade convergence. 10–30 minutes of clean speech is a solid starting point.',
+              },
+              {
+                icon: '📉',
+                title: 'Mel loss is the key signal',
+                body: 'Mel loss (L1 spectrogram error) is the primary quality proxy — lower is better. The adversarial and feature-matching losses stabilise training but plateau early. If mel loss is still decreasing, keep training. If it has been flat for 1 000+ steps, you are at the limit.',
+              },
+            ]} />
+          );
+          return (
+            <TipsPanel tips={[
+              {
+                icon: '📊',
+                title: 'Epoch count: 200–500 for speech, 500–1000 for singing',
+                body: 'Results at 25 epochs are audible but rough. Speech cloning typically becomes convincing at 200+ epochs. More training data means fewer epochs needed for the same quality.',
+              },
+              {
+                icon: '🛑',
+                title: 'Overtraining detection is active',
+                body: 'When the generator loss stops improving and starts climbing, training halts automatically. This is a sign to stop — more epochs past this point hurt quality.',
+              },
+              {
+                icon: '🎙️',
+                title: 'Audio quality matters more than quantity',
+                body: 'One hour of clean, single-speaker, dry (no reverb) audio beats 10 hours of noisy or multi-speaker recordings. Remove silence, music beds, and cross-talk before uploading.',
+              },
+              {
+                icon: '🔁',
+                title: 'Batch size and save frequency',
+                body: 'Larger batches train faster but need more GPU memory. Save every 10–25 epochs so you can roll back to an earlier checkpoint if overtraining is detected.',
+              },
+              {
+                icon: '🗂️',
+                title: 'SPIN-v2 embedder gives the best speaker identity preservation',
+                body: 'ContentVec is a good fallback if SPIN-v2 produces artefacts. HuBERT is the most forgiving with noisy or reverberant data.',
+              },
+              {
+                icon: '🔊',
+                title: 'RefineGAN vs HiFi-GAN',
+                body: 'RefineGAN produces crisper, more detailed speech at the cost of slightly longer training time. For quick experiments, HiFi-GAN converges faster and is more forgiving.',
+              },
+              {
+                icon: '🎤',
+                title: 'Speaker Loss (ECAPA-TDNN) for better voice cloning',
+                body: 'The training pipeline now includes an optional speaker identity loss using ECAPA-TDNN. Set c_spk > 0 in the training config to activate it. This loss directly optimises for speaker similarity, making the cloned voice sound more like the target speaker. Recommended weight: 1.0–3.0.',
+              },
+            ]} />
+          );
+        })()}
 
         {/* Loss reference */}
         <LossGuide losses={[
