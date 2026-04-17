@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import sys
@@ -187,6 +188,11 @@ def _write_beatrice_config(
             "batch_size": batch_size,
             "use_amp": True,
             "num_workers": min(4, os.cpu_count() or 2),
+            # warmup = 50% of total steps, capped at 5000.
+            # Must be based on total_steps (not per-run increment) because the
+            # scheduler always counts from step 0 and is fast-forwarded on resume.
+            # Cap at 5000 matches upstream pretrained model assumption (n_steps≥10k).
+            "warmup_steps": min(math.ceil(total_steps * 0.5), 5000),
             "save_interval": max(500, total_steps // 20),
             "evaluation_interval": max(500, total_steps // 20),
             "record_metrics": record_metrics,
