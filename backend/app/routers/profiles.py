@@ -855,7 +855,8 @@ async def profile_health(profile_id: str) -> HealthStatus:
     """File-existence health check for a profile."""
     async with get_db() as db:
         cursor = await db.execute(
-            """SELECT id, status, profile_dir, model_path, checkpoint_path, index_path
+            """SELECT id, status, profile_dir, model_path, checkpoint_path, index_path,
+                      pipeline
                FROM profiles WHERE id = ?""",
             (profile_id,),
         )
@@ -868,6 +869,8 @@ async def profile_health(profile_id: str) -> HealthStatus:
         audio_files = await _fetch_audio_files(db, profile_id)
 
     errors: list[str] = []
+    pipeline = (row["pipeline"] if "pipeline" in row.keys() else None) or "rvc"
+    is_beatrice2 = pipeline == "beatrice2"
 
     # Audio check — at least one file must exist on disk
     audio_ok = (
@@ -886,13 +889,16 @@ async def profile_health(profile_id: str) -> HealthStatus:
             "model_infer.pth missing — profile is marked trained but inference model not found"
         )
 
-    # Index check
-    index = _resolve_index_path(row)
-    index_ok = bool(index and os.path.exists(index))
-    if row["status"] == "trained" and not index_ok:
-        errors.append(
-            "model.index missing — profile is marked trained but index file not found"
-        )
+    # Index check — Beatrice 2 has no index file; skip the check entirely.
+    if is_beatrice2:
+        index_ok = True
+    else:
+        index = _resolve_index_path(row)
+        index_ok = bool(index and os.path.exists(index))
+        if row["status"] == "trained" and not index_ok:
+            errors.append(
+                "model.index missing — profile is marked trained but index file not found"
+            )
 
     can_train = audio_ok
     can_infer = model_ok and index_ok
