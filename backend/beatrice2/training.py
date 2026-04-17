@@ -152,6 +152,23 @@ def _write_beatrice_config(
     except (FileNotFoundError, json.JSONDecodeError):
         cfg = {}
 
+    # When resuming, n_steps must be initial_iteration + requested_steps so that
+    # range(initial_iteration, n_steps) produces the right number of iterations.
+    # Read completed steps from the existing config.json if present.
+    existing_config_path = os.path.join(out_dir, "config.json")
+    completed_steps = 0
+    if os.path.exists(existing_config_path):
+        try:
+            with open(existing_config_path, encoding="utf-8") as _f:
+                _existing = json.load(_f)
+            # The checkpoint stores iteration count; config.json n_steps is the
+            # previous target. Use it as the completed count for the resume case.
+            completed_steps = int(_existing.get("n_steps", 0))
+        except (json.JSONDecodeError, ValueError, KeyError):
+            completed_steps = 0
+
+    total_steps = completed_steps + n_steps if completed_steps > 0 else n_steps
+
     cfg.update(
         {
             "phone_extractor_file": os.path.join(
@@ -166,12 +183,12 @@ def _write_beatrice_config(
             "in_ir_wav_dir": os.path.join(assets_dir, "ir"),
             "in_noise_wav_dir": os.path.join(assets_dir, "noise"),
             "in_test_wav_dir": os.path.join(assets_dir, "test"),
-            "n_steps": n_steps,
+            "n_steps": total_steps,
             "batch_size": batch_size,
             "use_amp": True,
             "num_workers": min(4, os.cpu_count() or 2),
-            "save_interval": max(500, n_steps // 20),
-            "evaluation_interval": max(500, n_steps // 20),
+            "save_interval": max(500, total_steps // 20),
+            "evaluation_interval": max(500, total_steps // 20),
             "record_metrics": record_metrics,
         }
     )
