@@ -521,9 +521,10 @@ def _run_main():
     from backend.beatrice2.db_writer import BeatriceDBWriter
     _db_writer = BeatriceDBWriter(db_path, profile_id)
 
-    # Best-UTMOS tracking — save checkpoint_best.pt.gz when UTMOS improves
+    # Best-UTMOS tracking — checkpoint_best.pt.gz copied in save block
     _best_utmos: float = -float("inf")
     _best_utmos_step: int = -1
+    _needs_best_copy: bool = False  # set when UTMOS improves; cleared after save block copies
 
     if h.compile_convnext:
         raw_convnextstack_forward = ConvNeXtStack.forward
@@ -871,7 +872,7 @@ def _run_main():
                             f"~validation_{metric_name}/{i:03d}", value, iteration + 1
                         )
 
-                # Write UTMOS to DB and track best checkpoint
+                # Write UTMOS to DB and track best step — checkpoint copied in save block below
                 _utmos_now = dict_qualities.get("utmos")
                 if _utmos_now is not None:
                     _is_new_best = _utmos_now > _best_utmos
@@ -879,28 +880,9 @@ def _run_main():
                     if _is_new_best:
                         _best_utmos = _utmos_now
                         _best_utmos_step = iteration + 1
+                        _needs_best_copy = True
                         _db_writer.update_best_utmos(iteration + 1, _utmos_now)
-                        # Save best checkpoint
-                        _best_ckpt_path = out_dir / "checkpoint_best.pt.gz"
-                        with gzip.open(_best_ckpt_path, "wb") as _f:
-                            torch.save(
-                                {
-                                    "iteration": iteration + 1,
-                                    "net_g": net_g.state_dict(),
-                                    "phone_extractor": phone_extractor.state_dict(),
-                                    "pitch_estimator": pitch_estimator.state_dict(),
-                                    "net_d": {
-                                        k: v.half() for k, v in net_d.state_dict().items()
-                                    },
-                                    "optim_g": get_compressed_optimizer_state_dict(optim_g),
-                                    "optim_d": get_compressed_optimizer_state_dict(optim_d),
-                                    "grad_balancer": grad_balancer.state_dict(),
-                                    "grad_scaler": grad_scaler.state_dict(),
-                                    "h": dict(h),
-                                },
-                                _f,
-                            )
-                        print(f"[best] UTMOS {_utmos_now:.4f} at step {iteration + 1} → checkpoint_best.pt.gz", flush=True)
+                        print(f"[best] new best UTMOS {_utmos_now:.4f} at step {iteration + 1}", flush=True)
 
                 del dict_qualities, dict_qualities_all
 
@@ -941,6 +923,13 @@ def _run_main():
                         f,
                     )
                 shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")
+                # Copy to checkpoint_best.pt.gz if UTMOS improved since last save.
+                # Done here (not in eval block) so we never do two torch.save calls
+                # in the same iteration — avoids double peak-RAM pressure.
+                if _needs_best_copy:
+                    shutil.copy(checkpoint_file_save, out_dir / "checkpoint_best.pt.gz")
+                    _needs_best_copy = False
+                    print(f"[best] checkpoint_best.pt.gz updated (step {_best_utmos_step}, UTMOS {_best_utmos:.4f})", flush=True)
 
                 # 推論用
                 paraphernalia_dir = out_dir / f"paraphernalia_{name}"
