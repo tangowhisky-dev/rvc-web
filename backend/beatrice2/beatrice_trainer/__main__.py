@@ -46,5 +46,12 @@ from .data import *  # noqa: F401, F403
 # above from train/loop.py.
 
 if __name__ == "__main__":
+    import sys, traceback
     from .train.loop import _run_main
-    _run_main()
+    try:
+        _run_main()
+    except Exception:
+        print("\n[FATAL] Unhandled exception in training loop:", flush=True)
+        traceback.print_exc(file=sys.stdout)
+        sys.stdout.flush()
+        sys.exit(1)

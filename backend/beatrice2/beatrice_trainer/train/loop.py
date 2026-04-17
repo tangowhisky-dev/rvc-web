@@ -900,7 +900,7 @@ def _run_main():
                                 },
                                 _f,
                             )
-                        print(f"[best] UTMOS {_utmos_now:.4f} at step {iteration + 1} → checkpoint_best.pt.gz")
+                        print(f"[best] UTMOS {_utmos_now:.4f} at step {iteration + 1} → checkpoint_best.pt.gz", flush=True)
 
                 del dict_qualities, dict_qualities_all
 
