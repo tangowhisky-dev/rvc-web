@@ -91,6 +91,8 @@ class BeatriceStepPoint(BaseModel):
     loss_adv:  Optional[float] = None
     loss_fm:   Optional[float] = None
     loss_d:    Optional[float] = None
+    utmos:     Optional[float] = None   # UTMOS MOS score (1–5); present at evaluation steps only
+    is_best:   Optional[int]   = None   # 1 if this step had the best UTMOS seen so far
     trained_at: str
 
 
@@ -446,7 +448,7 @@ async def get_losses(profile_id: str):
         if pipeline == "beatrice2":
             cursor = await db.execute(
                 """SELECT step, loss_mel, loss_loud, loss_ap,
-                          loss_adv, loss_fm, loss_d, trained_at
+                          loss_adv, loss_fm, loss_d, utmos, is_best, trained_at
                    FROM beatrice_steps
                    WHERE profile_id = ?
                    ORDER BY step ASC""",
@@ -462,6 +464,8 @@ async def get_losses(profile_id: str):
                     loss_adv=r["loss_adv"],
                     loss_fm=r["loss_fm"],
                     loss_d=r["loss_d"],
+                    utmos=r["utmos"],
+                    is_best=r["is_best"],
                     trained_at=r["trained_at"],
                 )
                 for r in rows

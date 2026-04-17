@@ -92,7 +92,7 @@ async def _poll_beatrice_steps(
             async with get_db() as db:
                 cursor = await db.execute(
                     """SELECT step, loss_mel, loss_loud, loss_ap,
-                              loss_adv, loss_fm, loss_d
+                              loss_adv, loss_fm, loss_d, utmos, is_best
                        FROM beatrice_steps
                        WHERE profile_id = ? AND step > ?
                        ORDER BY step ASC""",
@@ -111,6 +111,8 @@ async def _poll_beatrice_steps(
                 "loss_adv":  row[4],
                 "loss_fm":   row[5],
                 "loss_d":    row[6],
+                "utmos":     row[7],
+                "is_best":   row[8],
             }
             pct = int(100 * step / job.total_steps) if job.total_steps else 0
             job.queue.put_nowait({
@@ -464,8 +466,13 @@ async def _run_beatrice_pipeline(
         job.phase = "done"
         job.progress_pct = 100
 
-        # Locate checkpoint — use checkpoint_latest.pt.gz
-        model_path = checkpoint if os.path.exists(checkpoint) else None
+        # Locate checkpoint — prefer checkpoint_best.pt.gz (best UTMOS) over latest
+        checkpoint_best = os.path.join(out_dir, "checkpoint_best.pt.gz")
+        model_path = (
+            checkpoint_best if os.path.exists(checkpoint_best)
+            else checkpoint if os.path.exists(checkpoint)
+            else None
+        )
 
         if was_cancelled:
             # Cancelled: mark failed (or partial), don't overwrite status already set
@@ -484,10 +491,11 @@ async def _run_beatrice_pipeline(
                 )
                 await db.commit()
             job.status = "done"
+            _used_best = os.path.exists(checkpoint_best)
             job.queue.put_nowait(
                 {
                     "type": "done",
-                    "message": "Beatrice 2 training complete.",
+                    "message": f"Beatrice 2 training complete. Model: {'best (highest UTMOS)' if _used_best else 'latest checkpoint'}.",
                     "phase": "done",
                     "output_path": model_path or "",
                 }

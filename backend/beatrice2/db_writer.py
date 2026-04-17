@@ -37,6 +37,8 @@ class BeatriceDBWriter:
           loss_adv   — adversarial (generator)
           loss_fm    — feature matching
           loss_d     — discriminator total
+          utmos      — UTMOS MOS score (1–5); only present at evaluation steps
+          is_best    — 1 if this step has the best UTMOS seen so far
         """
         if not self._enabled:
             return
@@ -49,8 +51,9 @@ class BeatriceDBWriter:
                            (id, profile_id, step,
                             loss_mel, loss_loud, loss_ap,
                             loss_adv, loss_fm, loss_d,
+                            utmos, is_best,
                             trained_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(profile_id, step) DO UPDATE SET
                            loss_mel   = excluded.loss_mel,
                            loss_loud  = excluded.loss_loud,
@@ -58,6 +61,8 @@ class BeatriceDBWriter:
                            loss_adv   = excluded.loss_adv,
                            loss_fm    = excluded.loss_fm,
                            loss_d     = excluded.loss_d,
+                           utmos      = COALESCE(excluded.utmos, utmos),
+                           is_best    = COALESCE(excluded.is_best, is_best),
                            trained_at = excluded.trained_at""",
                     (
                         row_id,
@@ -69,9 +74,32 @@ class BeatriceDBWriter:
                         losses.get("loss_adv"),
                         losses.get("loss_fm"),
                         losses.get("loss_d"),
+                        losses.get("utmos"),
+                        losses.get("is_best"),
                         trained_at,
                     ),
                 )
                 conn.commit()
         except Exception as exc:
             logger.warning(f"[BeatriceDBWriter] insert_step_loss failed: {exc}")
+
+    def update_best_utmos(self, step: int, utmos: float) -> None:
+        """Mark `step` as the new best-UTMOS checkpoint and clear previous best flag."""
+        if not self._enabled:
+            return
+        try:
+            with sqlite3.connect(self._db_path, timeout=10) as conn:
+                # Clear previous best
+                conn.execute(
+                    "UPDATE beatrice_steps SET is_best = 0 WHERE profile_id = ? AND is_best = 1",
+                    (self._profile_id,),
+                )
+                # Set new best (upsert in case the step row doesn't exist yet)
+                conn.execute(
+                    """UPDATE beatrice_steps SET is_best = 1, utmos = ?
+                       WHERE profile_id = ? AND step = ?""",
+                    (utmos, self._profile_id, step),
+                )
+                conn.commit()
+        except Exception as exc:
+            logger.warning(f"[BeatriceDBWriter] update_best_utmos failed: {exc}")

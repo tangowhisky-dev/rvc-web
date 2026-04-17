@@ -72,6 +72,8 @@ interface TrainingMsg {
     loss_ap?: number;
     loss_adv?: number;
     loss_d?: number;
+    utmos?: number;
+    is_best?: number;
   };
 }
 
@@ -93,6 +95,8 @@ interface BeatriceStepPoint {
   loss_adv:  number | null;
   loss_fm:   number | null;
   loss_d:    number | null;
+  utmos:     number | null;
+  is_best:   number | null;  // 1 if this step was best UTMOS
   trained_at: string;
 }
 
@@ -539,6 +543,7 @@ function B2Tooltip({ active, payload, label }: {
   const vals: Record<string, number> = {};
   for (const e of payload) if (e.value != null) vals[e.dataKey] = e.value;
   const rows: Array<{ key: string; label: string; color: string }> = [
+    { key: 'utmos_raw', label: 'UTMOS ↑',   color: '#facc15' },
     { key: 'mel_raw',  label: 'Mel (raw)',   color: '#22d3ee' },
     { key: 'mel_ema',  label: 'Mel (trend)', color: '#22d3ee' },
     { key: 'loud_raw', label: 'Loud',        color: '#34d399' },
@@ -552,7 +557,7 @@ function B2Tooltip({ active, payload, label }: {
       <div className="text-zinc-400 mb-1.5 font-semibold">step {label}</div>
       {rows.map(r => vals[r.key] != null ? (
         <div key={r.key} className="flex justify-between gap-4">
-          <span style={{ color: r.color, opacity: r.key.endsWith('_raw') && !r.key.startsWith('mel') ? 1 : r.key === 'mel_raw' ? 0.55 : 1 }}>{r.label}</span>
+          <span style={{ color: r.color, opacity: r.key.endsWith('_raw') && !r.key.startsWith('mel') && !r.key.startsWith('utmos') ? 1 : r.key === 'mel_raw' ? 0.55 : 1 }}>{r.label}</span>
           <span className="text-zinc-300">{vals[r.key].toFixed(3)}</span>
         </div>
       ) : null)}
@@ -578,6 +583,14 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
   const fmRaw   = sorted.map(p => p.loss_fm   ?? 0);
   const dRaw    = sorted.map(p => p.loss_d    ?? 0);
 
+  // UTMOS — sparse (only at evaluation steps); null entries are gaps in the line
+  const utmosPoints = sorted
+    .map((p, i) => p.utmos != null ? { step: p.step, utmos_raw: p.utmos, i } : null)
+    .filter((x): x is { step: number; utmos_raw: number; i: number } => x !== null);
+  const bestUtmosStep = sorted.find(p => p.is_best === 1)?.step ?? null;
+  const latestUtmos   = utmosPoints[utmosPoints.length - 1]?.utmos_raw ?? null;
+  const hasUtmos      = utmosPoints.length > 0;
+
   const melEma = ema(melRaw);
 
   function pctChange(raw: number[], e: number[]): string {
@@ -589,14 +602,15 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
   }
 
   const chartData = sorted.map((p, i) => ({
-    step:     p.step,
-    mel_raw:  melRaw[i],
-    mel_ema:  melEma[i],
-    loud_raw: loudRaw[i],
-    ap_raw:   apRaw[i],
-    adv_raw:  advRaw[i],
-    fm_raw:   fmRaw[i],
-    d_raw:    dRaw[i],
+    step:      p.step,
+    mel_raw:   melRaw[i],
+    mel_ema:   melEma[i],
+    loud_raw:  loudRaw[i],
+    ap_raw:    apRaw[i],
+    adv_raw:   advRaw[i],
+    fm_raw:    fmRaw[i],
+    d_raw:     dRaw[i],
+    utmos_raw: p.utmos ?? undefined,   // undefined = gap in line (recharts skips nulls)
   }));
 
   const lastStep  = sorted[sorted.length - 1].step;
@@ -615,6 +629,52 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
 
   return (
     <div className="flex flex-col gap-3">
+
+      {/* ── UTMOS panel — quality ceiling signal ──────────────────────── */}
+      {hasUtmos ? (
+        <div className="border border-yellow-900/40 rounded-lg p-2 bg-yellow-950/10">
+          <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center gap-3 text-[10px] font-mono flex-wrap">
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#facc15' }} />
+                <span style={{ color: '#facc15' }} className="font-semibold">UTMOS</span>
+                {latestUtmos != null && (
+                  <span className="text-zinc-300 font-semibold">{latestUtmos.toFixed(3)}</span>
+                )}
+                {bestUtmosStep != null && (
+                  <span className="text-yellow-500/70 text-[9px]">★ best @ step {bestUtmosStep}</span>
+                )}
+              </span>
+            </div>
+            <span className="text-[9px] font-mono text-zinc-600">higher = better (1–5 MOS scale)</span>
+          </div>
+          <ResponsiveContainer width="100%" height={90}>
+            <ComposedChart data={chartData} margin={{ top: 4, right: 36, bottom: 0, left: 24 }}>
+              <CartesianGrid {...gridProps} />
+              <XAxis {...xAxisProps} hide />
+              <YAxis yAxisId="left" orientation="left" tick={axisStyle} tickLine={false} axisLine={false}
+                tickFormatter={(v: number) => v.toFixed(2)} width={28} domain={[1, 5]} />
+              <Tooltip content={<B2Tooltip />} />
+              {bestUtmosStep != null && (
+                <ReferenceLine yAxisId="left" x={bestUtmosStep} stroke="#facc15" strokeOpacity={0.3} strokeDasharray="4 2" />
+              )}
+              <Line yAxisId="left" type="monotone" dataKey="utmos_raw" stroke="#facc15" strokeWidth={2}
+                dot={{ r: 3, fill: '#facc15', strokeWidth: 0 }} connectNulls={false}
+                isAnimationActive={false} />
+            </ComposedChart>
+          </ResponsiveContainer>
+          <div className="text-[9px] font-mono text-yellow-700/80 mt-1 leading-tight">
+            Evaluated every {utmosPoints.length > 1
+              ? (utmosPoints[utmosPoints.length - 1].step - utmosPoints[0].step) / (utmosPoints.length - 1)
+              : '—'} steps · plateau = training ceiling reached
+          </div>
+        </div>
+      ) : (
+        <div className="border border-zinc-800/40 rounded-lg p-2 text-[10px] font-mono text-zinc-600">
+          UTMOS will appear after the first evaluation checkpoint
+          {' '}(every {Math.max(500, sorted.length > 0 ? Math.round((sorted[sorted.length-1].step) / 20 / 500) * 500 : 500)} steps)
+        </div>
+      )}
 
       {/* ── Reconstruction panel: Mel + Loud + AP ─────────────────────── */}
       <div>
@@ -918,6 +978,8 @@ export default function TrainingPage() {
             loss_adv:  r.loss_adv  ?? null,
             loss_fm:   r.loss_fm   ?? null,
             loss_d:    r.loss_d    ?? null,
+            utmos:     r.utmos     ?? null,
+            is_best:   r.is_best   ?? null,
             trained_at: r.trained_at,
           })));
         } else {
@@ -1029,6 +1091,8 @@ export default function TrainingPage() {
               loss_adv:  l.loss_adv  ?? null,
               loss_fm:   l.loss_fm   ?? null,
               loss_d:    l.loss_d    ?? null,
+              utmos:     l.utmos     ?? null,
+              is_best:   l.is_best   ?? null,
               trained_at: new Date().toISOString(),
             };
             setStepPoints(prev => {

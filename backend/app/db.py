@@ -157,6 +157,8 @@ _BEATRICE_STEPS_MIGRATIONS: list[tuple[str, str]] = [
     ("loss_adv",  "REAL"),
     ("loss_fm",   "REAL"),
     ("loss_d",    "REAL"),
+    ("utmos",     "REAL"),   # UTMOS MOS score (1–5); written at evaluation_interval steps only
+    ("is_best",   "INTEGER NOT NULL DEFAULT 0"),  # 1 if this step had best UTMOS so far
 ]
 
 

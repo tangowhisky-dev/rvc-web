@@ -521,6 +521,10 @@ def _run_main():
     from backend.beatrice2.db_writer import BeatriceDBWriter
     _db_writer = BeatriceDBWriter(db_path, profile_id)
 
+    # Best-UTMOS tracking — save checkpoint_best.pt.gz when UTMOS improves
+    _best_utmos: float = -float("inf")
+    _best_utmos_step: int = -1
+
     if h.compile_convnext:
         raw_convnextstack_forward = ConvNeXtStack.forward
         compiled_convnextstack_forward = torch.compile(
@@ -866,6 +870,38 @@ def _run_main():
                         writer.add_scalar(
                             f"~validation_{metric_name}/{i:03d}", value, iteration + 1
                         )
+
+                # Write UTMOS to DB and track best checkpoint
+                _utmos_now = dict_qualities.get("utmos")
+                if _utmos_now is not None:
+                    _is_new_best = _utmos_now > _best_utmos
+                    _db_writer.insert_step_loss(iteration + 1, {"utmos": _utmos_now, "is_best": 1 if _is_new_best else 0})
+                    if _is_new_best:
+                        _best_utmos = _utmos_now
+                        _best_utmos_step = iteration + 1
+                        _db_writer.update_best_utmos(iteration + 1, _utmos_now)
+                        # Save best checkpoint
+                        _best_ckpt_path = out_dir / "checkpoint_best.pt.gz"
+                        with gzip.open(_best_ckpt_path, "wb") as _f:
+                            torch.save(
+                                {
+                                    "iteration": iteration + 1,
+                                    "net_g": net_g.state_dict(),
+                                    "phone_extractor": phone_extractor.state_dict(),
+                                    "pitch_estimator": pitch_estimator.state_dict(),
+                                    "net_d": {
+                                        k: v.half() for k, v in net_d.state_dict().items()
+                                    },
+                                    "optim_g": get_compressed_optimizer_state_dict(optim_g),
+                                    "optim_d": get_compressed_optimizer_state_dict(optim_d),
+                                    "grad_balancer": grad_balancer.state_dict(),
+                                    "grad_scaler": grad_scaler.state_dict(),
+                                    "h": dict(h),
+                                },
+                                _f,
+                            )
+                        print(f"[best] UTMOS {_utmos_now:.4f} at step {iteration + 1} → checkpoint_best.pt.gz")
+
                 del dict_qualities, dict_qualities_all
 
                 net_g.train()
