@@ -1,0 +1,17 @@
+# Upstream: https://huggingface.co/fierce-cats/beatrice-trainer (MIT)
+# This directory vendors a patched copy of beatrice_trainer/__main__.py
+# with MPS + CPU support. See git log for patch details.
+[project]
+name = "beatrice-trainer"
+version = "2.0.0rc0"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.1",
+    "torchaudio>=2.1",
+    "tqdm>=4",
+    "numpy>=1",
+    "tensorboard>=2",
+    "soundfile>=0.11",
+    "pyworld>=0.3.2",
+    "torchcodec",
+]

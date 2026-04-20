@@ -81,6 +81,7 @@ class BeatriceDBWriter:
                 )
                 conn.commit()
         except Exception as exc:
+            print(f"[BeatriceDBWriter] insert_step_loss step={step} FAILED: {exc}", flush=True)
             logger.warning(f"[BeatriceDBWriter] insert_step_loss failed: {exc}")
 
     def update_best_utmos(self, step: int, utmos: float) -> None:
