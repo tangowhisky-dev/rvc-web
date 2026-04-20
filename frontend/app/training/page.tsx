@@ -587,9 +587,11 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
   const utmosPoints = sorted
     .map((p, i) => p.utmos != null ? { step: p.step, utmos_raw: p.utmos, i } : null)
     .filter((x): x is { step: number; utmos_raw: number; i: number } => x !== null);
-  const bestUtmosStep = sorted.find(p => p.is_best === 1)?.step ?? null;
-  const latestUtmos   = utmosPoints[utmosPoints.length - 1]?.utmos_raw ?? null;
-  const hasUtmos      = utmosPoints.length > 0;
+  const bestUtmosPoint = sorted.find(p => p.is_best === 1);
+  const bestUtmosStep  = bestUtmosPoint?.step ?? null;
+  const bestUtmos      = bestUtmosPoint?.utmos ?? null;
+  const latestUtmos    = utmosPoints[utmosPoints.length - 1]?.utmos_raw ?? null;
+  const hasUtmos       = utmosPoints.length > 0;
 
   const melEma = ema(melRaw);
 
@@ -639,10 +641,10 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
                 <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#facc15' }} />
                 <span style={{ color: '#facc15' }} className="font-semibold">UTMOS</span>
                 {latestUtmos != null && (
-                  <span className="text-zinc-300 font-semibold">{latestUtmos.toFixed(3)}</span>
+                  <span className="text-zinc-300 font-semibold">current: {latestUtmos.toFixed(3)}</span>
                 )}
-                {bestUtmosStep != null && (
-                  <span className="text-yellow-500/70 text-[9px]">★ best @ step {bestUtmosStep}</span>
+                {bestUtmos != null && bestUtmosStep != null && (
+                  <span className="text-yellow-500/70 text-[9px]">★ best: {bestUtmos.toFixed(3)} @ step {bestUtmosStep}</span>
                 )}
               </span>
             </div>
