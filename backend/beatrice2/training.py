@@ -95,7 +95,8 @@ async def _poll_beatrice_steps(
                     (profile_id, _seen_step),
                 )
                 rows = await cursor.fetchall()
-        except Exception:
+        except Exception as _poll_exc:
+            print(f"[_poll_beatrice_steps] DB query failed: {_poll_exc}", flush=True)
             rows = []
 
         # Merge rows by step — evaluation steps have two rows (losses + UTMOS).
