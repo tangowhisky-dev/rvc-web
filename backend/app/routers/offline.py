@@ -560,15 +560,20 @@ async def convert_audio(
                 try:
                     from backend.beatrice2.inference import get_or_load_engine
                     import torch
+                    import numpy as np
                     device = "cuda" if torch.cuda.is_available() else "cpu"
                     engine = get_or_load_engine(profile_id, b2_checkpoint, device)
                     _progress(0.1)
-                    result = engine.convert(
+                    result = engine.convert_long(
                         audio_16k,
                         target_speaker_id=0,
                         pitch_shift_semitones=float(pitch_shift_semitones),
                         formant_shift_semitones=float(formant_shift_semitones),
                     )
+                    # Peak normalise to 0.95 to prevent clipping on save
+                    peak = np.abs(result).max()
+                    if peak > 0.95:
+                        result = result * (0.95 / peak)
                     _progress(0.9)
                     tgt_sr = engine.OUT_SR
                     out_path = _output_path(job_id, orig_ext)

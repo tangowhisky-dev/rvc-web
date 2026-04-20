@@ -170,6 +170,91 @@ class BeatriceInferenceEngine:
 
         return out.cpu().numpy().astype(np.float32)
 
+    def convert_long(
+        self,
+        audio_16k: np.ndarray,
+        target_speaker_id: int = 0,
+        pitch_shift_semitones: float = 0.0,
+        formant_shift_semitones: float = 0.0,
+        chunk_samples: int = 96000,
+    ) -> np.ndarray:
+        """Convert a long audio file by chunking into 6-second windows.
+
+        Safe for files of any length — processes ``chunk_samples`` frames at a
+        time (default 96000 = 6s @ 16kHz, matching the ``wav_length`` the model
+        was trained on).  Chunks are concatenated and trimmed to the exact
+        expected output length.  No crossfade — Beatrice 2 is fully convolutional
+        with local attention; hard chunk boundaries produce at most a 10ms
+        discontinuity which is inaudible in practice.
+
+        Used by the offline inference router.  Realtime uses ``convert()``
+        directly since it already manages its own short rolling window.
+
+        Parameters
+        ----------
+        audio_16k : np.ndarray
+            1-D float32 waveform at 16 000 Hz, any length.
+        chunk_samples : int
+            Chunk size in input samples.  Must be a multiple of 160 (hop
+            length).  Default 96000 matches training ``wav_length``.
+
+        Returns
+        -------
+        np.ndarray
+            1-D float32 waveform at ``OUT_SR`` (24 000 Hz).
+        """
+        import torch
+        import torch.nn.functional as F
+
+        _HOP = 160  # phone extractor hop length — all chunks must be multiples of this
+        assert chunk_samples % _HOP == 0, "chunk_samples must be a multiple of 160"
+
+        device = self._device
+        out_ratio = self._out_sample_rate / self._in_sample_rate  # 1.5
+
+        wav = torch.from_numpy(audio_16k).float().to(device)  # [T]
+
+        # Resample if model was saved with a different in_sample_rate
+        if self._in_sample_rate != self.IN_SR:
+            import torchaudio
+            wav = torchaudio.transforms.Resample(
+                self._in_sample_rate, self.IN_SR
+            ).to(device)(wav.unsqueeze(0)).squeeze(0)
+
+        T = wav.shape[0]
+
+        target_ids  = torch.tensor([target_speaker_id], device=device)
+        pitch_shift = torch.tensor([float(pitch_shift_semitones)], device=device)
+        formant_shift = torch.tensor([float(formant_shift_semitones)], device=device)
+
+        chunks_out = []
+        with torch.inference_mode():
+            for start in range(0, T, chunk_samples):
+                chunk = wav[start : start + chunk_samples]  # [N]
+
+                # Pad last chunk to multiple of _HOP
+                rem = chunk.shape[0] % _HOP
+                if rem != 0:
+                    chunk = F.pad(chunk, (0, _HOP - rem))
+
+                # net_g expects [batch, 1, T]
+                out = self.net_g(
+                    chunk.unsqueeze(0).unsqueeze(0),
+                    target_ids,
+                    formant_shift,
+                    pitch_shift,
+                )  # [1, 1, T_out] or [1, T_out]
+                chunks_out.append(out.squeeze().cpu().float())
+
+        y_hat = torch.cat(chunks_out, dim=0)
+
+        # Trim to exact expected output length (trim once after concat to avoid
+        # per-chunk rounding drift)
+        expected_samples = int(T * out_ratio)
+        y_hat = y_hat[:expected_samples]
+
+        return y_hat.numpy().astype(np.float32)
+
     def unload(self) -> None:
         """Release GPU memory."""
         import torch
