@@ -153,7 +153,7 @@ function ProfileRow({ profile, selected }: { profile: PickerProfile; selected?: 
       {isB2 ? (
         <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0
                          bg-amber-950/40 border border-amber-800/40 text-amber-400">
-          ◈ B2
+          ◈ Beatrice 2
         </span>
       ) : (
         <>

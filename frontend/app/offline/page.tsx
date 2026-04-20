@@ -572,6 +572,7 @@ export default function OfflinePage() {
               total_epochs_trained: p.total_epochs_trained,
               embedder: p.embedder,
               vocoder: p.vocoder,
+              pipeline: p.pipeline,
               best_model_path: p.best_model_path,
               best_epoch: p.best_epoch,
               best_avg_gen_loss: p.best_avg_gen_loss,
