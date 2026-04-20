@@ -1087,6 +1087,8 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
                   ⭐ best (epoch {profile.best_epoch}, {profile.best_avg_gen_loss?.toFixed(3) ?? ''})
                 </span>
               )}
+              {/* Embedder + vocoder badges — RVC only */}
+              {profile.pipeline !== 'beatrice2' && (<>
               {/* Embedder badge — clickable if not locked */}
               <span
                 className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono
@@ -1113,6 +1115,14 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
                   <span className="text-violet-600" title="Locked after first training run">🔒</span>
                 )}
               </span>
+              </>)}
+              {/* Beatrice 2 engine badge */}
+              {profile.pipeline === 'beatrice2' && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono
+                               bg-emerald-950/40 border border-emerald-800/40 text-emerald-400">
+                  ◈ Beatrice 2
+                </span>
+              )}
             </div>
             {/* Edit dropdown */}
             {editField && (
