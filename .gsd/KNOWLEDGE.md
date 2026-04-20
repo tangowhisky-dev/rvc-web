@@ -7,22 +7,30 @@ Read at the start of every unit. Never remove or edit existing entries.
 
 ## Service Management
 
-**Rule: Always use `start.sh` and `stop.sh` (in the project root `rvc-web/`) to start and stop services.**
+**Rule: Always use `start.sh` and `stop.sh` (project root) to start/stop services.**
 
-Never start the backend or frontend manually (no raw `uvicorn`, `conda run`, `pnpm dev`, or `bg_shell` commands).
-Never kill services manually with `lsof | kill` or `pkill` — use `stop.sh` instead.
+Never use raw `uvicorn`, `conda run`, `pnpm dev`, `lsof | kill`, or `pkill`.
 
-Reasons:
-- `start.sh` exports required env vars (`PROJECT_ROOT`, `KMP_DUPLICATE_LIB_OK`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`) that the backend and training pipeline depend on.
-- `start.sh` kills stale ports and dangling training/inference processes before starting.
-- `stop.sh` shuts down worker subprocesses (`spawn_main`, `_realtime_worker`) before killing the backend, preventing orphaned GPU processes.
-- `start.sh` writes PIDs to `.pids/` so `stop.sh` can do a clean shutdown.
+- `start.sh` exports required env vars (`PROJECT_ROOT`, `KMP_DUPLICATE_LIB_OK`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`), kills stale ports and dangling processes, writes PIDs to `.pids/`.
+- `stop.sh` shuts down worker subprocesses (`spawn_main`, `_realtime_worker`) before killing the backend.
 
-Usage:
-```bash
-./start.sh   # start backend + frontend (from rvc-web/ root)
-./stop.sh    # stop everything cleanly
+---
+
+## Directory Layout
+
 ```
+rvc-web/
+  assets/              ← pretrained weights, hubert, rmvpe, beatrice2
+  backend/app/         ← FastAPI app
+  backend/beatrice2/   ← Beatrice 2 pipeline + trainer source
+  backend/rvc/         ← RVC code; assets/ and logs/ are symlinks to project root
+  data/profiles/       ← per-profile audio, checkpoints, model files
+  data/rvc.db          ← SQLite DB
+  logs/                ← RVC training workspace (rvc_finetune_active/)
+```
+
+`PROJECT_ROOT` env var is the single source of truth (not `RVC_ROOT` — that's gone).
+Training subprocess cwd = `backend/rvc/`. The symlinks inside it make relative paths resolve correctly.
 
 ---
 
@@ -30,7 +38,7 @@ Usage:
 
 **Rule: Always convert `profile_dir` and `sample_dir` to absolute paths before passing to subprocesses.**
 
-RVC training subprocesses (`preprocess.py`, `extract_f0_print.py`, `extract_feature_print.py`, `train.py`) run with `cwd=rvc_root`. Any relative path passed to them resolves against `rvc_root`, not the project root, causing `FileNotFoundError`.
+RVC training subprocesses run with `cwd=rvc_root`. Relative paths resolve against `rvc_root`, not the project root → `FileNotFoundError`.
 
 Fix: call `os.path.abspath()` on `profile_dir` and `audio_dir` in `routers/training.py` immediately after construction.
 
@@ -40,214 +48,169 @@ Fix: call `os.path.abspath()` on `profile_dir` and `audio_dir` in `routers/train
 
 **Rule: Always pass `format="WAV"` explicitly to `soundfile.write()` when the output path has a non-standard extension.**
 
-`soundfile` infers format from the file extension. Temp files like `moeed.wav.cleaning` have an unrecognised extension and cause `TypeError: No format specified`. Always pass `format="WAV"` (or the appropriate format) explicitly.
+`soundfile` infers format from extension. Temp files like `moeed.wav.cleaning` cause `TypeError: No format specified`. Pass `format="WAV"` explicitly.
 
 ---
 
-## Training Workspace
+## RVC Training Workspace
 
-**Rule: The shared `logs/rvc_finetune_active/` directory is NOT profile-scoped — it must be treated as a temp workspace.**
+**Rule: The shared `logs/rvc_finetune_active/` directory is NOT profile-scoped.**
 
-When a profile is deleted, `routers/profiles.py` wipes `exp_dir` (`logs/rvc_finetune_active/`) entirely.
-When training starts for a new profile, `training.py` checks a sentinel file (`.profile_id`) and wipes the workspace if the profile ID changed.
-A fresh profile (no own checkpoints) must never inherit `G_latest.pth` / `D_latest.pth` from a prior profile — `_KEEP_FILES` is empty when `seeded_checkpoint=False`.
+- Profile delete wipes `exp_dir` entirely.
+- New training checks a sentinel file (`.profile_id`) and wipes if profile changed.
+- A fresh profile must never inherit `G_latest.pth`/`D_latest.pth` from a prior run.
 
 ---
 
-## Epoch Loss Tracking
+## RVC: Epoch Loss Cleanup on Profile Delete
 
-**Rule: `epoch_losses` rows must be deleted explicitly on profile delete** — `aiosqlite` does not enforce `ON DELETE CASCADE` by default.
+**Rule: `epoch_losses` rows must be deleted explicitly on profile delete** — aiosqlite does not enforce `ON DELETE CASCADE` by default.
 
-The delete handler in `routers/profiles.py` explicitly runs:
 ```sql
 DELETE FROM epoch_losses WHERE profile_id = ?
 DELETE FROM audio_files WHERE profile_id = ?
 DELETE FROM profiles WHERE id = ?
 ```
 
-## Directory Layout (post-refactor)
+---
 
-**Rule: `RVC_ROOT` env var is gone. Use `PROJECT_ROOT` instead.**
+## RVC: Best Epoch — Use `loss_mel`, Skip First 50 Epochs
 
-After the refactor the project root `rvc-web/` is the single source of truth:
+**Rule: `G_best.pth` tracks lowest epoch-average `loss_mel`, not `loss_gen`. Skip epochs 1–50.**
 
-```
-rvc-web/
-  assets/              ← pretrained weights, hubert, rmvpe (was RVC submodule/assets/)
-  backend/
-    app/               ← FastAPI application
-    rvc/               ← RVC Python code (was Retrieval-based-Voice-Conversion-WebUI/)
-      assets → ../../assets   (symlink so train.py relative writes work)
-      logs   → ../../logs     (symlink so get_hparams() relative read works)
-      configs/inuse/   ← v1/v2 JSON configs
-      infer/           ← rtrvc.py, slicer2.py, train scripts
-      rvc/             ← f0/, layers/, synthesizer.py, hubert.py
-  data/
-    profiles/          ← per-profile audio, checkpoints, model
-    rvc.db             ← SQLite database
-  frontend/            ← Next.js frontend
-  logs/                ← training workspace (rvc_finetune_active/)
-  start.sh             ← start backend + frontend
-  stop.sh              ← stop everything
-```
-
-Training subprocess cwd = `backend/rvc/`. The `assets/` and `logs/` symlinks inside `backend/rvc/` make all relative paths in the upstream training scripts resolve correctly.
+- `loss_gen` plateaus at ~epoch 12 and never improves. Using it freezes `G_best` forever.
+- `loss_mel` decreases monotonically — the direct proxy for output quality.
+- First 50 epochs are warmup; `G_best` is not updated until epoch 51.
+- In `train.py`: `lowest_mel` / `avg_mel` / `avg_mel=X` log line. DB column `best_avg_gen_loss` stores `avg_mel` (name unchanged for backward compat).
 
 ---
 
-## MPS Training: 4D Constant Padding is Not Natively Supported
+## MPS: 4D Constant Padding → Use `torch.cat`
 
-**Rule: Never use `F.pad(..., mode='constant')` on tensors with `ndim > 3` in any code that runs on MPS.**
+**Rule: Never use `F.pad(..., mode='constant')` on tensors with `ndim > 3` on MPS.**
 
-### Background
+MPS silently falls back to CPU for 4D+ constant padding — fires every attention step.
 
-PyTorch's MPS backend (Apple Silicon GPU) does not natively support constant-mode padding of tensors with more than 3 dimensions. When called, it silently falls back to a CPU-based "View Ops" implementation:
+Fix in `backend/rvc/rvc/layers/attentions.py`:
+```python
+# Before:
+x = F.pad(x, [0, 1, 0, 0, 0, 0, 0, 0])
+# After (native MPS):
+x = torch.cat([x, torch.zeros(*x.shape[:-1], 1, dtype=x.dtype, device=x.device)], dim=-1)
+```
+
+3D `F.pad` calls are fine — MPS handles ≤3D natively.
+
+---
+
+## MPS: Batch Size → LR Scaling (sqrt rule)
+
+**Rule: Scale learning rate with `LR = 1e-4 × sqrt(batch_size / 32)` on MPS.**
+
+Reference: `batch_size=32, LR=1e-4`. At `batch_size=8`, use `LR=5e-5`.
+
+`_write_config` in `backend/app/training.py` auto-scales on every training start.
+
+---
+
+## MPS: fp16 AMP Must Be Disabled
+
+**Rule: Never train with `fp16_run=True` on MPS. Use fp32.**
+
+MPS unified memory means no off-chip bandwidth to save. fp16 causes weight_norm underflow → NaN gradients → GradScaler collapse loop.
+
+`_write_config` sets: `cfg["train"]["fp16_run"] = torch.cuda.is_available()`
+
+---
+
+## Beatrice 2: DB Writer — `is_best` Default
+
+**Rule: Always use `losses.get("is_best", 0)` — never `losses.get("is_best")`.**
+
+`beatrice_steps.is_best` is `NOT NULL DEFAULT 0`. Passing an explicit `None` via `losses.get("is_best")` overrides the column default → constraint violation → every regular step insert silently fails → all losses show NULL in chart.
+
+This was the root cause of "all losses showing 0" while only UTMOS appeared.
+
+---
+
+## Beatrice 2: ON CONFLICT — COALESCE All Loss Columns
+
+**Rule: Use `COALESCE(excluded.col, col)` for ALL loss columns in the ON CONFLICT clause.**
+
+Regular step inserts (every 10 steps) have `utmos=NULL`. UTMOS-only inserts (every 500 steps) have `loss_mel=NULL` etc. Without COALESCE, one insert type overwrites the other's data with NULLs.
+
+See `backend/beatrice2/db_writer.py` `insert_step_loss()` — all 8 columns use COALESCE.
+
+---
+
+## Beatrice 2: Best Checkpoint — Skip First 1000 Steps (Warmup)
+
+**Rule: Do not designate a best checkpoint for the first 1000 steps. During warmup, `checkpoint_latest` = `checkpoint_best`.**
+
+Same rationale as RVC's 50-epoch skip: early UTMOS scores are unstable. After step 1000, best is tracked by highest UTMOS.
+
+In `loop.py`:
+```python
+_warmup = (iteration + 1) <= 1000
+_is_new_best = (not _warmup) and (_utmos_now > _best_utmos)
+```
+
+During warmup, every `save_interval` checkpoint is also copied to `checkpoint_best.pt.gz` so inference always has a loadable model.
+
+---
+
+## Beatrice 2: Training Data Flow
 
 ```
-UserWarning: MPS: The constant padding of more than 3 dimensions is not currently
-supported natively. It uses View Ops default implementation to run.
-This may have performance implications.
+loop.py (subprocess)
+  every 10 steps → BeatriceDBWriter.insert_step_loss(step, {loss_mel, loss_loud, ...})
+  every 500 steps → BeatriceDBWriter.insert_step_loss(step, {utmos, is_best})
+                  → BeatriceDBWriter.update_best_utmos(step, utmos)
+
+training.py (backend, async)
+  _poll_beatrice_steps() polls beatrice_steps every 2s
+  → emits step_done WS events with losses dict
+
+frontend training/page.tsx
+  step_done handler → setStepPoints() → BeatriceStepChart renders
 ```
 
-This fires on **every training step** — not just at startup — because the attention layers call these functions in the forward pass. The cost is a silent MPS→CPU→MPS round-trip for every attention computation, degrading training throughput.
+Poller query: `SELECT ... FROM beatrice_steps WHERE profile_id = ? AND step > ? ORDER BY step ASC`
 
-### Where it occurs in this codebase
+---
 
-`backend/rvc/rvc/layers/attentions.py` — `MultiHeadAttention._relative_position_to_absolute_position` and `_absolute_position_to_relative_position`. Both methods operate on 4D tensors `[batch, heads, length, ...]` and originally used `F.pad` with `mode='constant'` (default).
-
-### Fix applied
-
-Replace 4D `F.pad` constant-pad calls with `torch.cat` against a zero tensor of the required shape. This is semantically identical and uses only native MPS ops:
+## Beatrice 2: Subprocess Invocation
 
 ```python
-# Before (triggers MPS fallback):
-x = F.pad(x, [0, 1, 0, 0, 0, 0, 0, 0])  # pad last dim by 1
-
-# After (native on MPS):
-x = torch.cat(
-    [x, torch.zeros(*x.shape[:-1], 1, dtype=x.dtype, device=x.device)],
-    dim=-1,
-)
+cmd = [python, "-m", "backend.beatrice2.beatrice_trainer",
+       "-d", data_dir, "-o", out_dir, "-c", config_path,
+       "--db", DB_PATH, "--profile-id", profile_id]
+# cwd = project_root
 ```
 
-The 3D `F.pad` calls remaining in those same methods (on `x_flat` which is `[b, h, L]`) are fine and were left unchanged — MPS handles ≤3D constant padding natively.
-
-**Verified**: full forward pass on MPS after the fix produces zero padding warnings and numerically identical outputs.
-
-### General rule for future model changes
-
-Any time you add a new layer or attention variant that uses `F.pad` on 4D+ tensors with `mode='constant'`, replace it with `torch.cat` + zeros. Reflect/replicate modes on 4D+ tensors are also unsupported on MPS and should be avoided similarly. Prefer `torch.cat`, index-based operations, or pre-allocate and fill with `torch.zeros`/`torch.ones`.
+`DB_PATH` is passed so the subprocess's `BeatriceDBWriter` writes to the same DB the backend reads. If `--db` or `--profile-id` is missing, `_enabled=False` and all writes are silently skipped.
 
 ---
 
-## MPS Training: Learning Rate Must Be Scaled with Batch Size
+## Beatrice 2: GradBalancer `return {}` on Non-finite Gradient
 
-**Rule: When training on MPS with a reduced batch size, always scale the learning rate using the sqrt rule. Do NOT use the same LR as the CUDA baseline.**
+**Rule: When `grad_balancer.backward()` returns `{}`, the training step continues normally** — losses are still appended to `dict_scalars` and the regular insert still fires. The empty dict just means `generator_stats = {}` for that step. This is NOT a cause of missing DB rows.
 
-### Background
-
-The pretrained RVC weights were optimised at `batch_size=32, LR=1e-4`. For AdamW (and Adam generally), the appropriate batch-size scaling rule is:
-
-```
-LR_eff = LR_base × sqrt(batch_size / reference_batch_size)
-```
-
-Running the same LR with a smaller batch means each gradient update carries 4× more noise (at bs=8 vs bs=32) while the per-epoch LR decay schedule is unchanged. The result is a loss curve that oscillates at a higher floor and converges more slowly — observed as `loss_mel ≈ 36` at epoch 70 on MPS vs `≈ 23` on CUDA with the same epoch count.
-
-### Effective LR by batch size
-
-| batch_size | LR (sqrt-scaled) |
-|---|---|
-| 4  | 3.54e-5 |
-| 8  | 5.00e-5 |
-| 16 | 7.07e-5 |
-| 32 | 1.00e-4 (unchanged) |
-
-### Implementation
-
-`_write_config` in `backend/app/training.py` auto-scales LR based on the batch size argument:
-
-```python
-_REFERENCE_BATCH_SIZE = 32
-_BASE_LR = 1e-4
-_scaled_lr = _BASE_LR * math.sqrt(batch_size / _REFERENCE_BATCH_SIZE)
-cfg["train"]["learning_rate"] = round(_scaled_lr, 7)
-```
-
-This runs on every training start (fresh and continuation), so changing batch size mid-project takes effect immediately on the next run.
-
-### Why sqrt and not linear?
-
-The linear scaling rule (`LR ∝ batch_size`) is correct for SGD with momentum. For Adam/AdamW the adaptive per-parameter scaling partially compensates for gradient noise, so the optimal correction is closer to sqrt. Empirically, sqrt is the standard recommendation for fine-tuning transformer-style models with AdamW at varying batch sizes.
-
+The unfixed version (`loss.py` raising on non-finite and returning `{}` after `input.backward(grad)`) exists in `backend/beatrice2/beatrice_trainer/train/loss.py` — the NaN propagation is handled by GradScaler, not a crash.
 
 ---
 
-## MPS Training: fp16 AMP Must Be Disabled (Use fp32)
+## SQLite: Never Query `gsd.db` Directly
 
-**Rule: Never train with `fp16_run=True` on MPS. Always use fp32 on Apple Silicon.**
-
-### Background
-
-MPS fp16 AMP has two compounding instabilities that compound over training:
-
-**1. weight_norm underflow → NaN gradients → scale collapse**
-
-This model has 137 `weight_norm` hooks. `weight_norm` computes:
-
-```
-weight = weight_g × (weight_v / ‖weight_v‖)
-```
-
-In fp16, `‖weight_v‖` can underflow to zero for small weights (common early in fine-tuning). This produces a division-by-zero → inf/NaN in the weight tensor → NaN gradient on that module's output → `GradScaler` detects the inf and halves its scale (65536 → 32768 → ...).
-
-`GradScaler` defaults to `growth_interval=2000`: the scale only grows back after 2000 *consecutive* clean steps. At bs=8 with ~125 steps/epoch on MPS, that's ~16 epochs without a scale increase after each NaN event. During those 16 epochs the lower scale makes further underflow *more* likely — a positive feedback loop. Observed symptom: `loss_mel` oscillates at a high floor (~36) and refuses to converge, even as the loss steadily improves on CUDA.
-
-**2. MPS fp16 fused op coverage is narrower than CUDA**
-
-CUDA's fp16 implementation uses hardware-fused ops for reductions (softmax, layer_norm, exp) that maintain higher precision in intermediate accumulation. MPS does not provide equivalent fused paths — it executes the same ops in full fp16, producing more rounding error per step.
-
-### Why fp16 isn't needed on MPS
-
-fp16 on CUDA primarily saves **off-chip VRAM bandwidth** — tensors are half the size when transferred between DRAM and the GPU. MPS uses **unified memory** (CPU and GPU share the same physical RAM), so there is no separate off-chip transfer to optimize. fp32 on MPS uses the same memory bus as fp16 would. The throughput benefit is negligible; the stability cost is significant.
-
-### Implementation
-
-`_write_config` in `backend/app/training.py` sets `fp16_run` based on device availability:
-
-```python
-# fp16 only when CUDA is present; fp32 on MPS (unified memory, experimental AMP)
-cfg["train"]["fp16_run"] = torch.cuda.is_available()
-```
-
-`torch.cuda.is_available()` is `True` on CUDA machines (fp16 enabled, no change) and `False` on MPS-only machines (fp32, stable).
-
-### Interaction with GradScaler in train.py
-
-When `fp16_run=False`, `train.py` still constructs `GradScaler(device, enabled=fp16_run)` and `autocast(device, enabled=fp16_run)`. Both are no-ops when `enabled=False` — no code changes needed in `train.py`.
+Use `gsd_*` tools (gsd_milestone_status, gsd_journal_query, etc.). Direct `sqlite3`/`better-sqlite3` access causes WAL conflicts.
 
 ---
 
-## Best-Epoch Criterion: Use `loss_mel`, NOT `loss_gen`
+## Diagnosing "Chart Shows 0 / Waiting"
 
-**Rule: `G_best.pth` and `best_epoch` in DB must track the epoch with lowest epoch-average `loss_mel`, not `loss_gen`.**
-
-### Root cause of the bug
-`train.py` accumulated `_epoch_gen_sum` (raw adversarial `loss_gen`) and compared it against `lowest_loss_g`. `loss_gen` reaches equilibrium by epoch ~12 (bottoms at ~3.13 for this dataset) and then stays flat at 3.1–3.4 for the entire remainder of training. Using it as the best-epoch signal means `G_best.pth` freezes at epoch 12 and never updates again, even as mel loss continues dropping from 20 → 17 over the next 100+ epochs.
-
-### Why `loss_mel`
-- `loss_mel` is the L1 spectrogram reconstruction error — the direct proxy for inference output quality. The vocoder reconstructs audio from mel, so lower mel = better output.
-- `loss_mel` decreases monotonically throughout training.
-- `loss_gen` (discriminator-fooling term) and `loss_fm` (feature matching) are important for training stability but plateau early and add noise to epoch ranking.
-- `loss_kl` (latent alignment) matters in early epochs (drops from ~9 to ~1.5) but provides little discrimination between late-stage epochs.
-
-### Fix applied
-- `lowest_loss_g` renamed to `lowest_mel` in `train.py`
-- `avg_loss_g` replaced with `avg_mel = _epoch_mel_sum / _epoch_gen_count`
-- Log line changed from `avg_loss_g=X` to `avg_mel=X`
-- `_drain_stdout` regex updated from `avg_loss_g=` to `avg_mel=`
-- OT detection updated to compare `loss_mel` (not `loss_gen`) against `_best_avg_gen`
-- DB column `best_avg_gen_loss` now stores `avg_mel` value (column name unchanged for backward compat)
-
-### For existing running jobs
-The fix only takes effect on new training runs. For a run already in progress, manually copy `G_latest.pth` to `G_best.pth` and update the DB `best_epoch`/`best_avg_gen_loss` to match the current best mel epoch from `epoch_losses`.
+Checklist in order:
+1. `sqlite3 data/rvc.db "SELECT step, loss_mel, utmos FROM beatrice_steps ORDER BY step LIMIT 10;"` — are rows there? Are values non-NULL?
+2. If rows have NULLs → DB writer inserting NULLs → check `insert_step_loss` exception log in training stdout
+3. If no rows → `_enabled=False` or subprocess not receiving `--db`/`--profile-id`
+4. If rows are fine → poller silent exception (`except Exception: rows = []`) — add logging temporarily
+5. If poller fires → WS not delivering to client — check browser WS connection

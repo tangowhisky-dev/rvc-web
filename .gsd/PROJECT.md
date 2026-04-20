@@ -2,52 +2,57 @@
 
 ## What This Is
 
-A realtime voice cloning web application built on top of the RVC (Retrieval-based Voice Conversion) v2 model. The system lets a user speak into a microphone and hear their voice converted to a trained target voice with minimal latency — routed through BlackHole 2ch for system-wide audio integration on macOS.
-
-The app has three integrated capabilities:
-1. **Voice Sample Library** — upload, record, name, and manage audio samples stored in SQLite.
-2. **Training Pipeline** — fine-tune a copy of the base pretrained v2 model on a selected voice sample (preprocess → feature extract → train), streaming logs live via WebSocket. The base model is never overwritten; one fine-tuned copy is maintained per active profile.
-3. **Realtime Voice Conversion** — a Python sounddevice audio loop reads from the selected input device, runs RVC inference (using `rtrvc.py`), and writes to the selected output device (BlackHole 2ch). The browser controls start/stop, displays input/output waveforms rendered in a Web Worker, and lets the user tune pitch, index rate, and protect parameters in real time.
-
-## Core Value
-
-User speaks into their mic → RVC converts their voice to the cloned target voice → output lands on BlackHole → any app that listens to BlackHole hears the converted voice.
+A realtime voice cloning web application with two training pipelines: **RVC v2** (proven, fast) and **Beatrice 2** (higher quality, slower). Users train a voice model from uploaded audio samples, then use it for realtime voice conversion routed through a virtual audio device.
 
 ## Current State
 
-**M001 complete.** All four slices (S01–S04) are done. The full application is operational.
+Fully operational dual-pipeline system. Both RVC and Beatrice 2 training, inference, and realtime conversion work end-to-end.
 
-The FastAPI backend is fully operational: SQLite schema, all voice profile CRUD endpoints, audio device list, health check, complete training pipeline with live WebSocket log streaming, and a complete realtime voice conversion engine with 5 REST+WS endpoints.
+**Active capabilities:**
+- Voice profile management (create, delete, upload samples, record)
+- RVC v2 training — preprocess → extract features → train; epoch loss chart; best-epoch tracking (skips first 50 epochs)
+- Beatrice 2 training — preprocess → train (single subprocess); step loss chart (every 10 steps); UTMOS evaluation every 500 steps; best checkpoint skips first 1000 steps; latest = best during warmup
+- Realtime voice conversion — sounddevice audio loop, RVC or Beatrice 2 inference, waveform viz via Web Worker
+- Export trained Beatrice 2 models
+- Voice analysis (speaker embedding comparison)
 
-The Next.js 16 frontend is complete with four tabs navigable from a persistent NavBar: Library (`/`), Training (`/training`), Realtime (`/realtime`), and Setup (`/setup`). The Library page lists voice profiles with status badges, provides an upload form and delete with confirm, and shows a session-active indicator. The Training page streams live log lines via WebSocket with a 6-phase progress bar. The Realtime tab streams waveforms via Web Worker + OffscreenCanvas. The Setup page is a static 5-section BlackHole 2ch routing guide.
+## Architecture
 
-All 8 active requirements are validated:
-- R001 (Voice Sample Library) — S01 contract tests + curl
-- R002 (Training Pipeline) — S02 contract tests + 1-epoch integration run (55MB .pth in 24s)
-- R003 (Realtime Voice Conversion) — S03 contract tests (10 passing); hardware audio deferred pending trained profile
-- R004 (Live Waveform Visualization) — S03 WS contract test + browser canvas verification
-- R005 (Audio Device Selection) — S03 browser device dropdowns + auto-selection
-- R006 (Modular Audio Processing Chain) — AudioProcessor Protocol + RVCProcessor module-import verified
-- R007 (Start/Stop Scripts) — `scripts/start.sh` and `scripts/stop.sh` syntax-verified; PID file lifecycle confirmed
-- R008 (BlackHole Setup Guide) — `/setup` page with 5 sections in browser
+```
+rvc-web/
+  assets/              ← pretrained weights (hubert, rmvpe, beatrice2 pretrained)
+  backend/
+    app/               ← FastAPI app (main.py, db.py, training.py, realtime.py)
+    app/routers/       ← profiles, training, realtime, devices, analysis, offline
+    beatrice2/         ← Beatrice 2 pipeline (training.py, db_writer.py, inference.py)
+    beatrice2/beatrice_trainer/  ← trainer source (train/loop.py is the main loop)
+    rvc/               ← RVC Python code; assets/ and logs/ are symlinks into project root
+  data/
+    profiles/          ← per-profile audio, checkpoints, model files
+    rvc.db             ← SQLite database
+  frontend/            ← Next.js (App Router), TypeScript, Tailwind
+  logs/                ← training workspace (rvc_finetune_active/)
+  start.sh / stop.sh   ← always use these, never raw uvicorn/pnpm
+```
 
-`./scripts/start.sh` starts both services and opens the browser. `./scripts/stop.sh` kills both cleanly. TypeScript compiles clean. Full audible hardware validation (hearing converted voice on BlackHole) deferred until the S02 training integration test produces a trained profile.
+**Stack:** FastAPI + aiosqlite (port 8000), Next.js 14 (port 3000), SQLite, sounddevice, Python subprocess for training.
 
-## Architecture / Key Patterns
+## Key Files
 
-- **Frontend**: Next.js 14 (App Router), TypeScript, Tailwind CSS — runs on port 3000
-- **Backend**: FastAPI (Python, `rvc` conda env) — runs on port 8000
-- **Audio Engine**: Python `sounddevice` loop in a background thread, driven by `infer/lib/rtrvc.py`
-- **Training**: Subprocesses — `infer/modules/train/preprocess.py`, `extract_feature_print.py`, `train.py` — launched from FastAPI, log-streamed via WebSocket
-- **Database**: SQLite via `aiofiles` + raw SQL (no ORM) — simple, zero-setup
-- **Audio routing (macOS)**: BlackHole 2ch as virtual output device; user sets their DAW/app to use BlackHole as mic input
-- **Waveform rendering**: Web Worker + OffscreenCanvas — never blocks the main thread
-- **Service orchestration**: `scripts/start.sh` and `scripts/stop.sh` — starts conda backend + Next.js frontend
+| File | Role |
+|------|------|
+| `backend/app/db.py` | Schema, migrations, `get_db()`, `DB_PATH` |
+| `backend/app/training.py` | RVC training orchestration, `_poll_rvc_epochs` |
+| `backend/beatrice2/training.py` | Beatrice 2 orchestration, `_poll_beatrice_steps`, `beatrice_manager` |
+| `backend/beatrice2/db_writer.py` | `BeatriceDBWriter` — sync sqlite3 writer called from training subprocess |
+| `backend/beatrice2/beatrice_trainer/train/loop.py` | Beatrice 2 training loop; calls `_db_writer.insert_step_loss()` every 10 steps |
+| `backend/app/routers/training.py` | Training REST + WS endpoints; `BeatriceStepPoint` model; `get_losses()` |
+| `frontend/app/training/page.tsx` | Training UI — RVC epoch chart + Beatrice step chart + WS event handling |
+| `frontend/app/realtime/page.tsx` | Realtime VC UI |
 
-## Capability Contract
+## Database Schema (key tables)
 
-See `.gsd/REQUIREMENTS.md` for the explicit capability contract, requirement status, and coverage mapping.
-
-## Milestone Sequence
-
-- [x] M001: RVC Web App — Voice samples, fine-tuning pipeline, and realtime VC with waveforms in a polished Next.js UI
+- `profiles` — id, name, pipeline ("rvc"/"beatrice2"), status, n_steps, etc.
+- `epoch_losses` — RVC training: profile_id, epoch, loss_mel, loss_gen, loss_kl, loss_fm, loss_disc, best_epoch
+- `beatrice_steps` — Beatrice training: profile_id, step, loss_mel, loss_loud, loss_ap, loss_adv, loss_fm, loss_d, utmos, is_best
+- `audio_files` — uploaded/recorded samples per profile
