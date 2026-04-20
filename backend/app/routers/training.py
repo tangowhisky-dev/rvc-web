@@ -447,10 +447,19 @@ async def get_losses(profile_id: str):
 
         if pipeline == "beatrice2":
             cursor = await db.execute(
-                """SELECT step, loss_mel, loss_loud, loss_ap,
-                          loss_adv, loss_fm, loss_d, utmos, is_best, trained_at
+                """SELECT step,
+                          MAX(loss_mel)  AS loss_mel,
+                          MAX(loss_loud) AS loss_loud,
+                          MAX(loss_ap)   AS loss_ap,
+                          MAX(loss_adv)  AS loss_adv,
+                          MAX(loss_fm)   AS loss_fm,
+                          MAX(loss_d)    AS loss_d,
+                          MAX(utmos)     AS utmos,
+                          MAX(is_best)   AS is_best,
+                          MAX(trained_at) AS trained_at
                    FROM beatrice_steps
                    WHERE profile_id = ?
+                   GROUP BY step
                    ORDER BY step ASC""",
                 (profile_id,),
             )

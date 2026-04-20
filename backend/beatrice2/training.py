@@ -98,19 +98,30 @@ async def _poll_beatrice_steps(
         except Exception:
             rows = []
 
+        # Merge rows by step — evaluation steps have two rows (losses + UTMOS).
+        # Coalesce so one step_done event has all available fields.
+        merged: dict[int, dict] = {}
         for row in rows:
-            step        = int(row[0])
-            elapsed_sec = row[9]   # may be None for old rows
-            losses = {
-                "loss_mel":  row[1],
-                "loss_loud": row[2],
-                "loss_ap":   row[3],
-                "loss_adv":  row[4],
-                "loss_fm":   row[5],
-                "loss_d":    row[6],
-                "utmos":     row[7],
-                "is_best":   row[8],
-            }
+            step = int(row[0])
+            if step not in merged:
+                merged[step] = {
+                    "loss_mel": None, "loss_loud": None, "loss_ap": None,
+                    "loss_adv": None, "loss_fm": None, "loss_d": None,
+                    "utmos": None, "is_best": None, "elapsed_sec": None,
+                }
+            m = merged[step]
+            m["loss_mel"]    = row[1] if row[1] is not None else m["loss_mel"]
+            m["loss_loud"]   = row[2] if row[2] is not None else m["loss_loud"]
+            m["loss_ap"]     = row[3] if row[3] is not None else m["loss_ap"]
+            m["loss_adv"]    = row[4] if row[4] is not None else m["loss_adv"]
+            m["loss_fm"]     = row[5] if row[5] is not None else m["loss_fm"]
+            m["loss_d"]      = row[6] if row[6] is not None else m["loss_d"]
+            m["utmos"]       = row[7] if row[7] is not None else m["utmos"]
+            m["is_best"]     = row[8] if row[8] is not None else m["is_best"]
+            m["elapsed_sec"] = row[9] if row[9] is not None else m["elapsed_sec"]
+
+        for step, losses in sorted(merged.items()):
+            elapsed_sec = losses.pop("elapsed_sec")
 
             # Progress from DB step — no tqdm needed
             pct = int(100 * step / job.total_steps) if job.total_steps else 0
