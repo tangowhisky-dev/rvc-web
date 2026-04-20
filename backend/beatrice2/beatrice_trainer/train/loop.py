@@ -233,7 +233,7 @@ def prepare_training():
     )
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
-        num_workers=min(32, os.cpu_count()),
+        num_workers=min(h.num_workers, os.cpu_count()),
         collate_fn=training_dataset.collate,
         shuffle=True,
         sampler=None,
