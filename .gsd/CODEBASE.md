@@ -1,7 +1,7 @@
 # Codebase Map
 
-Generated: 2026-04-20T05:08:23Z | Files: 233 | Described: 0/233
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-20T05:08:23Z","fingerprint":"07d5de1d32b135e162d0e0d63e0338f18556690f","fileCount":233,"truncated":false} -->
+Generated: 2026-04-20T09:09:04Z | Files: 234 | Described: 0/234
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-20T09:09:04Z","fingerprint":"bb5814e5eda56503c33fe490f2be97959b0ebd27","fileCount":234,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
@@ -10,6 +10,7 @@ Generated: 2026-04-20T05:08:23Z | Files: 233 | Described: 0/233
 - `install.bat`
 - `install.sh`
 - `pytest.ini`
+- `README.md`
 - `requirements.txt`
 - `RT-VC-ANALYSIS.md`
 - `start.bat`
