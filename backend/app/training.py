@@ -1150,38 +1150,33 @@ async def _run_pipeline(
         db_path,
     ]
 
-    train_proc = await asyncio.create_subprocess_exec(
-        *train_args,
-        stdout=asyncio_subprocess.PIPE,  # capture stdout — root logger writes here (basicConfig)
-        stderr=asyncio_subprocess.PIPE,  # capture stderr so crashes surface in job error
-        env=train_env,
-        cwd=rvc_pkg_dir,
-    )
-    job._proc = train_proc
-
-    # Tracks the last epoch_done seen in stdout — used for accurate DB epoch
-    # count on early-stop / cancel so we don't credit epochs that didn't run.
-    _last_completed_epoch: int = prior_epochs
-
-    # Persistent training log — written to profile_dir so it survives exp_dir
-    # wipes and is scoped per profile.  train.py's own FileHandler is broken
-    # (the file descriptor doesn't survive mp.Process pickling on macOS/Linux
-    # with the spawn start method), so we tee every stdout line here instead.
-    # Append mode so continuation runs accumulate into a single log file.
+    # Persistent training log — scoped per profile, append mode so continuation
+    # runs accumulate into a single file. Open before subprocess so we can pass
+    # the fd directly (no asyncio reader needed — epoch events come from DB).
     profile_log_path = os.path.join(profile_dir, "train.log") if profile_dir else None
+    _log_fh = None
     if profile_log_path:
         os.makedirs(profile_dir, exist_ok=True)
         try:
             import datetime as _dt
-            with open(profile_log_path, "a", encoding="utf-8") as _lf:
-                _lf.write(
-                    f"\n{'='*60}\n"
-                    f"Training session started: {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"Profile: {job.profile_id}  Prior epochs: {prior_epochs}  Target: +{total_epoch}\n"
-                    f"{'='*60}\n"
-                )
+            _log_fh = open(profile_log_path, "a", buffering=1, encoding="utf-8")
+            _log_fh.write(
+                f"\n{'='*60}\n"
+                f"Training session started: {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Profile: {job.profile_id}  Prior epochs: {prior_epochs}  Target: +{total_epoch}\n"
+                f"{'='*60}\n"
+            )
         except OSError:
-            pass
+            _log_fh = None
+
+    train_proc = await asyncio.create_subprocess_exec(
+        *train_args,
+        stdout=_log_fh if _log_fh else asyncio_subprocess.DEVNULL,
+        stderr=asyncio_subprocess.STDOUT,  # merge stderr into same log file
+        env=train_env,
+        cwd=rvc_pkg_dir,
+    )
+    job._proc = train_proc
 
     # proc_done event — set after train_proc.wait() so _poll_rvc_epochs
     # can do one final sweep and then stop cleanly.
@@ -1200,99 +1195,35 @@ async def _run_pipeline(
         )
     )
 
-    # Stream stdout into job queue for real-time frontend display.
-    # Responsibilities:
-    #   - Tee every line to the profile-scoped train.log
-    #   - Forward useful log lines to frontend (tracebacks, warnings, etc.)
-    #   - Log the best-epoch line so it appears in the UI log pane
-    # NOT responsible for: epoch detection, DB writes, OT detection
-    #   (all moved to _poll_rvc_epochs above).
-    async def _drain_stdout() -> None:
-        if train_proc.stdout is None:
-            return
-        import re as _re
-
-        nonlocal _last_completed_epoch
-
-        async for raw_line in train_proc.stdout:
-            line = raw_line.decode(errors="replace").rstrip()
-            # Tee raw line to persistent profile-scoped log file
-            if profile_log_path and line:
-                try:
-                    with open(profile_log_path, "a", encoding="utf-8") as _lf:
-                        _lf.write(line + "\n")
-                except OSError:
-                    pass
-            if not line:
-                continue
-
-            # Filter faiss loader spam
-            if line.startswith("DEBUG:faiss") or line.startswith("INFO:faiss"):
-                continue
-            # Strip logger prefix "INFO:name:" / "DEBUG:name:"
-            clean = _re.sub(r"^(INFO|DEBUG|WARNING|ERROR):[^:]+:", "", line).strip()
-            if not clean:
-                continue
-
-            # Per-batch loss lines — suppress (DB epoch averages are source of truth)
-            if "losses:" in clean:
-                continue
-            # "Train Epoch: N [pct%]" — suppress (fires every batch)
-            if "Train Epoch:" in clean:
-                continue
-            # "[step, lr]" list line — suppress
-            if clean.startswith("[") and "," in clean:
-                continue
-            # Epoch-done line — suppress; _poll_rvc_epochs handles this via DB
-            if "====> Epoch:" in clean:
-                m = _re.search(r"====> Epoch:\s*(\d+)", clean)
-                if m:
-                    _last_completed_epoch = int(m.group(1))
-                continue
-
-            # Best-epoch line — forward to UI log pane (informational)
-            await job.queue.put({"type": "log", "message": clean, "phase": "train"})
-
-    stdout_task = asyncio.create_task(_drain_stdout())
-
-    # Also stream stderr lines into the job queue so crash tracebacks are visible
-    # in the UI in real time (train.py child process errors go to stderr).
-    async def _drain_stderr() -> None:
-        if train_proc.stderr is None:
-            return
-        async for raw_line in train_proc.stderr:
-            line = raw_line.decode(errors="replace").rstrip()
-            if line:
-                if profile_log_path:
-                    try:
-                        with open(profile_log_path, "a", encoding="utf-8") as _lf:
-                            _lf.write(f"[stderr] {line}\n")
-                    except OSError:
-                        pass
-                await job.queue.put(
-                    {"type": "log", "message": f"[stderr] {line}", "phase": "train"}
-                )
-
-    stderr_task = asyncio.create_task(_drain_stderr())
-
     await train_proc.wait()
     job._proc = None
+    if _log_fh:
+        _log_fh.close()
 
     # Signal poller that subprocess has exited; it will do one final sweep
     _proc_done.set()
 
-    # Give stdout/stderr readers a moment to drain remaining buffered lines,
-    # and give the poller time to do its final sweep.
     await asyncio.sleep(_RVC_POLL_INTERVAL + 0.5)
 
-    stdout_task.cancel()
-    stderr_task.cancel()
     poll_task.cancel()
-    for task in (stdout_task, stderr_task, poll_task):
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    try:
+        await poll_task
+    except asyncio.CancelledError:
+        pass
+
+    # Determine actual completed epoch count from DB (authoritative source of truth).
+    # Previously tracked via stdout; now we read it directly.
+    try:
+        async with get_db() as _db:
+            _cur = await _db.execute(
+                "SELECT MAX(epoch) FROM epoch_losses WHERE profile_id = ?",
+                (job.profile_id,),
+            )
+            _row = await _cur.fetchone()
+            _last_completed_epoch: int = int(_row[0]) if _row and _row[0] is not None else prior_epochs
+    except Exception:
+        _last_completed_epoch = prior_epochs
+        pass
 
     if train_proc.returncode != 0:
         # SIGTERM from overtraining detection (returncode = -15 on Unix) is a
