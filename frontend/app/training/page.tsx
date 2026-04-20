@@ -659,7 +659,7 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
                 <ReferenceLine yAxisId="left" x={bestUtmosStep} stroke="#facc15" strokeOpacity={0.3} strokeDasharray="4 2" />
               )}
               <Line yAxisId="left" type="monotone" dataKey="utmos_raw" stroke="#facc15" strokeWidth={2}
-                dot={{ r: 3, fill: '#facc15', strokeWidth: 0 }} connectNulls={false}
+                dot={{ r: 3, fill: '#facc15', strokeWidth: 0 }} connectNulls={true}
                 isAnimationActive={false} />
             </ComposedChart>
           </ResponsiveContainer>
@@ -948,6 +948,7 @@ export default function TrainingPage() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [epochPoints, setEpochPoints] = useState<EpochPoint[]>([]);
   const [stepPoints, setStepPoints]   = useState<BeatriceStepPoint[]>([]);
+  const [historyKey, setHistoryKey]   = useState(0);  // increment to force history re-fetch
 
   const wsRef = useRef<WebSocket | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
@@ -996,7 +997,7 @@ export default function TrainingPage() {
       })
       .catch(() => { if (!cancelled) { setEpochPoints([]); setStepPoints([]); } });
     return () => { cancelled = true; };
-  }, [selectedId, profiles]);
+  }, [selectedId, profiles, historyKey]);
 
   // -------------------------------------------------------------------------
   // attachWs — wire up a WebSocket for profile_id and drive UI state from it.
@@ -1042,6 +1043,11 @@ export default function TrainingPage() {
 
     const ws = new WebSocket(`${WS_BASE}/ws/training/${profileId}`);
     wsRef.current = ws;
+
+    ws.onopen = () => {
+      // Refresh history so UTMOS and past steps are loaded from DB immediately
+      setHistoryKey(k => k + 1);
+    };
 
     ws.onmessage = (ev: MessageEvent) => {
       try {
