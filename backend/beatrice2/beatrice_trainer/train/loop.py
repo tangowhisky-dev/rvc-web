@@ -233,7 +233,7 @@ def prepare_training():
     )
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
-        num_workers=min(h.num_workers, os.cpu_count()),
+        num_workers=min(32, os.cpu_count()),
         collate_fn=training_dataset.collate,
         shuffle=True,
         sampler=None,
@@ -241,7 +241,7 @@ def prepare_training():
         pin_memory=True,
         drop_last=True,
         persistent_workers=True,
-        prefetch_factor=4
+        prefetch_factor=2
     )
 
     print("Computing mean F0s of target speakers...", end="")
