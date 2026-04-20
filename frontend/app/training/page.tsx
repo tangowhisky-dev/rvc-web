@@ -665,7 +665,7 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
           </ResponsiveContainer>
           <div className="text-[9px] font-mono text-yellow-700/80 mt-1 leading-tight">
             Evaluated every {utmosPoints.length > 1
-              ? (utmosPoints[utmosPoints.length - 1].step - utmosPoints[0].step) / (utmosPoints.length - 1)
+              ? Math.round(((utmosPoints[utmosPoints.length - 1].step - utmosPoints[0].step) / (utmosPoints.length - 1)) / 100) * 100
               : '—'} steps · plateau = training ceiling reached
           </div>
         </div>
