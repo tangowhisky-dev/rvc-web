@@ -88,7 +88,7 @@ dict_default_hparams = {
     "vq_topk": 4,
     "training_time_vq": "none",  # "none", "self" or "random"
     "floor_noise_level": 1e-3,
-    "record_metrics": False,
+    "record_metrics": True,
     # augmentation
     "augmentation_snr_candidates": [20.0, 25.0, 30.0, 35.0, 40.0, 45.0],
     "augmentation_formant_shift_probability": 0.5,
@@ -4213,15 +4213,16 @@ if __name__ == "__main__" and writer is not None:
             for k, v in gradient_balancer_stats.items():
                 dict_scalars[f"~gradient_balancer/{k}"].append(v)
 
-            if (iteration + 1) % 1000 == 0 or iteration == 0:
+            if (iteration + 1) % 10 == 0 or iteration == 0:
                 for name, scalars in dict_scalars.items():
                     if scalars:
                         writer.add_scalar(
                             name, sum(scalars) / len(scalars), iteration + 1
                         )
                         scalars.clear()
-                for name, param in net_g.named_parameters():
-                    writer.add_histogram(f"weight/{name}", param, iteration + 1)
+                if (iteration + 1) % 1000 == 0:
+                    for name, param in net_g.named_parameters():
+                        writer.add_histogram(f"weight/{name}", param, iteration + 1)
 
                 intermediate_feature_stats = {}
                 hook_handles = []

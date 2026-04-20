@@ -1,7 +1,7 @@
 # Codebase Map
 
-Generated: 2026-04-20T09:09:04Z | Files: 234 | Described: 0/234
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-20T09:09:04Z","fingerprint":"bb5814e5eda56503c33fe490f2be97959b0ebd27","fileCount":234,"truncated":false} -->
+Generated: 2026-04-20T09:21:22Z | Files: 234 | Described: 0/234
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-20T09:21:22Z","fingerprint":"40c238cbc3fecf0835b592b40ffadfde006e75f2","fileCount":234,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
@@ -262,10 +262,6 @@ Generated: 2026-04-20T09:09:04Z | Files: 234 | Described: 0/234
 - `backend/tests/test_training_integration.py`
 - `backend/tests/test_training.py`
 
-### beatrice/trainer/
-- `beatrice/trainer/.gitattributes`
-- `beatrice/trainer/pyproject.toml`
-
 ### data/samples/07d44be257194f168506323e6c4b4d16/
 - `data/samples/07d44be257194f168506323e6c4b4d16/v.wav`
 
@@ -364,3 +360,7 @@ Generated: 2026-04-20T09:09:04Z | Files: 234 | Described: 0/234
 
 ### logs/mute/3_feature768/
 - `logs/mute/3_feature768/mute.npy`
+
+### old_beatrice/
+- `old_beatrice/__init__.py`
+- `old_beatrice/__main__.py`
