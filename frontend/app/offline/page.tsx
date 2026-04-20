@@ -658,7 +658,8 @@ export default function OfflinePage() {
               </button>
             </div>
 
-            {/* SOLA Crossfade slider */}
+            {/* SOLA Crossfade slider — RVC only (Beatrice 2 uses full-file chunked inference, no block seams) */}
+            {selectedProfile?.pipeline !== 'beatrice2' && (
             <div className="flex-1 flex flex-col gap-1.5 px-1 py-2 rounded-lg bg-zinc-900/60 border border-zinc-800">
               <div className="flex items-center justify-between">
                 <span className="text-[11px] font-mono uppercase tracking-widest text-zinc-400">SOLA Crossfade</span>
@@ -679,6 +680,7 @@ export default function OfflinePage() {
                   : `${solaCrossfadeMs}ms overlap-add window. Longer = smoother joins, slightly more latency`}
               </span>
             </div>
+            )}
           </div>
 
           {/* Post-conversion analysis toggle */}

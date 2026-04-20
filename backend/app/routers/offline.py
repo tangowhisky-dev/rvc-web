@@ -564,7 +564,7 @@ async def convert_audio(
                     device = "cuda" if torch.cuda.is_available() else "cpu"
                     engine = get_or_load_engine(profile_id, b2_checkpoint, device)
                     _progress(0.1)
-                    result = engine.convert_long(
+                    result = engine.convert_offline(
                         audio_16k,
                         target_speaker_id=0,
                         pitch_shift_semitones=float(pitch_shift_semitones),

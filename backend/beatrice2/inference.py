@@ -170,7 +170,7 @@ class BeatriceInferenceEngine:
 
         return out.cpu().numpy().astype(np.float32)
 
-    def convert_long(
+    def convert_offline(
         self,
         audio_16k: np.ndarray,
         target_speaker_id: int = 0,
