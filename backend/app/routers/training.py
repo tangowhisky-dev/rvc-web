@@ -400,6 +400,7 @@ async def get_status(profile_id: str) -> StatusResponse:
             error=b2_job.error,
             pipeline="beatrice2",
             total_steps=b2_job.total_steps,
+            batch_size=b2_job.batch_size,
         )
 
     job = manager.get_job(profile_id)

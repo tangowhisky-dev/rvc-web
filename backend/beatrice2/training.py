@@ -46,6 +46,7 @@ class BeatriceTrainingJob:
     status: str = "training"
     error: Optional[str] = None
     total_steps: int = 10000
+    batch_size: int = 8
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     _proc: Optional[asyncio_subprocess.Process] = field(default=None, repr=False)
 
@@ -551,6 +552,7 @@ class BeatriceTrainingManager:
             job_id=job_id,
             profile_id=profile_id,
             total_steps=n_steps,
+            batch_size=batch_size,
         )
         self._jobs[profile_id] = job
 
