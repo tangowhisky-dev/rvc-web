@@ -979,7 +979,7 @@ async def patch_profile(profile_id: str, body: PatchProfileRequest):
 
 @router.delete("/{profile_id}", status_code=204)
 async def delete_profile(profile_id: str) -> Response:
-    """Delete a profile, all its audio_files rows, epoch_losses rows, and the entire profile_dir tree."""
+    """Delete a profile, all its audio_files, epoch_losses, beatrice_steps rows, and the entire profile_dir tree."""
     async with get_db() as db:
         cursor = await db.execute(
             "SELECT id, profile_dir FROM profiles WHERE id = ?", (profile_id,)
@@ -994,6 +994,7 @@ async def delete_profile(profile_id: str) -> Response:
         # doesn't enforce FK constraints by default — delete explicitly.
         await db.execute("DELETE FROM audio_files WHERE profile_id = ?", (profile_id,))
         await db.execute("DELETE FROM epoch_losses WHERE profile_id = ?", (profile_id,))
+        await db.execute("DELETE FROM beatrice_steps WHERE profile_id = ?", (profile_id,))
         await db.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
         await db.commit()
 
