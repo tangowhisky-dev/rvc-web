@@ -72,6 +72,7 @@ async def _poll_beatrice_steps(
     job: "BeatriceTrainingJob",
     profile_id: str,
     proc_done: asyncio.Event,
+    out_dir: str,
 ) -> None:
     """Poll beatrice_steps every 2s; emit step_done + progress events from DB.
 
@@ -81,9 +82,30 @@ async def _poll_beatrice_steps(
     """
     _seen_step: int = 0
     _last_log_step: int = 0  # emit a Step N/M log line every 100 steps
+    _last_phase: str = ""    # track last phase.txt value to emit phase events once
+
+    _PHASE_LABELS = {
+        "extract_f0":      ("extract_f0",      "Computing mean F0s of target speakers..."),
+        "extract_feature": ("extract_feature", "Building VQ codebooks..."),
+        "train":           ("train",            "Training started."),
+    }
 
     while True:
         await asyncio.sleep(_B2_POLL_INTERVAL)
+
+        # --- Phase file: emit phase + log events when loop.py advances phase ---
+        try:
+            phase_file = os.path.join(out_dir, "phase.txt")
+            if os.path.exists(phase_file):
+                current_phase = open(phase_file).read().strip()
+                if current_phase != _last_phase and current_phase in _PHASE_LABELS:
+                    phase_key, label = _PHASE_LABELS[current_phase]
+                    job.phase = phase_key
+                    job.queue.put_nowait({"type": "phase", "phase": phase_key, "message": label})
+                    job.queue.put_nowait({"type": "log",   "phase": phase_key, "message": label})
+                    _last_phase = current_phase
+        except Exception:
+            pass
 
         try:
             async with get_db() as db:
@@ -445,7 +467,7 @@ async def _run_beatrice_pipeline(
     # DB poller — emits step_done + progress events; stops after proc exits.
     _proc_done = asyncio.Event()
     poll_task = asyncio.create_task(
-        _poll_beatrice_steps(job, profile_id, _proc_done)
+        _poll_beatrice_steps(job, profile_id, _proc_done, out_dir)
     )
 
     await proc.wait()

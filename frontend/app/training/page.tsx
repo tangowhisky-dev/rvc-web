@@ -121,18 +121,20 @@ function nowStamp() {
 // ---------------------------------------------------------------------------
 
 const PHASES = ['preprocess', 'extract_f0', 'extract_feature', 'train', 'index', 'done'] as const;
+const PHASES_B2 = ['preprocess', 'extract_f0', 'extract_feature', 'train', 'done'] as const;
 const PHASE_LABELS: Record<string, string> = {
   preprocess: 'Preprocess', extract_f0: 'F0 Extract',
   extract_feature: 'Features', train: 'Train', index: 'Index', done: 'Done',
 };
 
-function PhaseBar({ currentPhase, jobDone }: { currentPhase: string | null; jobDone: boolean }) {
+function PhaseBar({ currentPhase, jobDone, pipeline }: { currentPhase: string | null; jobDone: boolean; pipeline?: string }) {
   if (!currentPhase) return null;
+  const phases = pipeline === 'beatrice2' ? PHASES_B2 : PHASES;
   const active = jobDone ? 'done' : currentPhase;
-  const activeIdx = PHASES.indexOf(active as (typeof PHASES)[number]);
+  const activeIdx = phases.indexOf(active as any);
   return (
     <div className="flex gap-1.5">
-      {PHASES.map((p, i) => {
+      {phases.map((p, i) => {
         let cls: string;
         if (p === active && p === 'done')
           cls = 'bg-emerald-700 text-emerald-100 shadow-[0_0_8px_rgba(16,185,129,0.4)]';
@@ -1702,7 +1704,7 @@ export default function TrainingPage() {
         {currentPhase !== null && (
           <section>
             <h2 className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500 mb-3">Progress</h2>
-            <PhaseBar currentPhase={currentPhase} jobDone={jobState === 'done'} />
+            <PhaseBar currentPhase={currentPhase} jobDone={jobState === 'done'} pipeline={profiles.find(p => p.id === selectedId)?.pipeline} />
           </section>
         )}
 

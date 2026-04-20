@@ -245,6 +245,7 @@ def prepare_training():
     )
 
     print("Computing mean F0s of target speakers...", end="")
+    (out_dir / "phase.txt").write_text("extract_f0")
     speaker_f0s = []
     for speaker, files in enumerate(speaker_audio_files):
         if len(files) > 10:
@@ -394,6 +395,7 @@ def prepare_training():
     if resume:
         net_g.enable_hook()
     else:
+        (out_dir / "phase.txt").write_text("extract_feature")
         net_g.initialize_vq([wav_iterator(files) for files in speaker_audio_files])
 
     # スケジューラ
@@ -553,6 +555,7 @@ def _run_main():
         if h.profile
         else nullcontext()
     ) as profiler:
+        (out_dir / "phase.txt").write_text("train")
         data_iter = iter(training_loader)
         for iteration in tqdm(range(initial_iteration, h.n_steps), desc="Training"):
             # === 1. データ前処理 ===
