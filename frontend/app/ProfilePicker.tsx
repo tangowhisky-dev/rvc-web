@@ -127,7 +127,9 @@ function ProfileRow({ profile, selected }: { profile: PickerProfile; selected?: 
   const pip     = profile.pipeline ?? 'rvc';
   const isB2    = pip === 'beatrice2';
   const locked  = profile.total_epochs_trained > 0;
-  const epochs  = locked ? `${profile.total_epochs_trained} epochs` : 'untrained';
+  const epochs  = isB2
+    ? (locked ? `${profile.total_epochs_trained} iters` : 'untrained')
+    : (locked ? `${profile.total_epochs_trained} epochs` : 'untrained');
 
   const statusIcon = profile.status === 'trained'  ? ' ✓'
                    : profile.status === 'training' ? ' ⟳'
