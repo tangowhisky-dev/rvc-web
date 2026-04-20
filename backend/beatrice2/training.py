@@ -256,7 +256,6 @@ def _write_beatrice_config(
             "n_steps": total_steps,
             "batch_size": batch_size,
             "use_amp": True,
-            "num_workers": min(4, os.cpu_count() or 2),
             # warmup = 50% of total steps, capped at 5000.
             # Must be based on total_steps (not per-run increment) because the
             # scheduler always counts from step 0 and is fast-forwarded on resume.
