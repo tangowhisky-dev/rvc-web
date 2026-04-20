@@ -90,9 +90,11 @@ async def _poll_beatrice_steps(
                     """SELECT step, loss_mel, loss_loud, loss_ap,
                               loss_adv, loss_fm, loss_d, utmos, is_best, elapsed_sec
                        FROM beatrice_steps
-                       WHERE profile_id = ? AND step > ?
+                       WHERE profile_id = ? AND step >= ?
                        ORDER BY step ASC""",
-                    (profile_id, _seen_step),
+                    # Look back 500 steps so a UTMOS write that arrives after
+                    # the loss write for the same eval step is always picked up.
+                    (profile_id, max(0, _seen_step - 500)),
                 )
                 rows = await cursor.fetchall()
         except Exception as _poll_exc:
