@@ -704,83 +704,91 @@ def _run_main():
                     "elapsed_sec": _time.monotonic() - _train_start,
                 })
 
-                # Histograms are expensive — only every 1000 iters
-                if (iteration + 1) % 1000 == 0 or iteration == 0:
-                    for name, param in net_g.named_parameters():
-                        writer.add_histogram(f"weight/{name}", param, iteration + 1)
+                # Histograms and intermediate feature hooks are only useful when
+                # record_metrics=true (TensorBoard diagnostics). Skip entirely when
+                # disabled — the hook pass is an extra full forward pass and causes
+                # a visible stall every _tb_interval steps.
+                if h.record_metrics:
+                    # Histograms — expensive, every 1000 iters
+                    if (iteration + 1) % 1000 == 0 or iteration == 0:
+                        for name, param in net_g.named_parameters():
+                            writer.add_histogram(f"weight/{name}", param, iteration + 1)
 
-                intermediate_feature_stats = {}
-                hook_handles = []
+                    # Intermediate feature stats — extra forward pass with hooks.
+                    # Every 100 iters (more frequent than original's 1000 but still cheap).
+                    if (iteration + 1) % 100 == 0 or iteration == 0:
+                        intermediate_feature_stats = {}
+                        hook_handles = []
 
-                def get_layer_hook(name):
-                    def compute_stats(module, x, suffix):
-                        if not isinstance(x, torch.Tensor):
-                            return
-                        if x.dtype not in [torch.float32, torch.float16]:
-                            return
-                        if isinstance(module, nn.Identity):
-                            return
-                        x = x.detach().float()
-                        var = x.var().item()
-                        if isinstance(module, (nn.Linear, nn.LayerNorm)):
-                            channel_var, channel_mean = torch.var_mean(
-                                x.reshape(-1, x.size(-1)), 0
+                        def get_layer_hook(name):
+                            def compute_stats(module, x, suffix):
+                                if not isinstance(x, torch.Tensor):
+                                    return
+                                if x.dtype not in [torch.float32, torch.float16]:
+                                    return
+                                if isinstance(module, nn.Identity):
+                                    return
+                                x = x.detach().float()
+                                var = x.var().item()
+                                if isinstance(module, (nn.Linear, nn.LayerNorm)):
+                                    channel_var, channel_mean = torch.var_mean(
+                                        x.reshape(-1, x.size(-1)), 0
+                                    )
+                                elif isinstance(module, nn.Conv1d):
+                                    channel_var, channel_mean = torch.var_mean(x, [0, 2])
+                                else:
+                                    return
+                                average_squared_channel_mean = (
+                                    channel_mean.square().mean().item()
+                                )
+                                average_channel_var = channel_var.mean().item()
+
+                                tensor_idx = len(intermediate_feature_stats) // 3
+                                intermediate_feature_stats[
+                                    f"var/{tensor_idx:02d}_{name}/{suffix}"
+                                ] = var
+                                intermediate_feature_stats[
+                                    f"avg_sq_ch_mean/{tensor_idx:02d}_{name}/{suffix}"
+                                ] = average_squared_channel_mean
+                                intermediate_feature_stats[
+                                    f"avg_ch_var/{tensor_idx:02d}_{name}/{suffix}"
+                                ] = average_channel_var
+
+                            def forward_pre_hook(module, input):
+                                for i, input_i in enumerate(input):
+                                    compute_stats(module, input_i, f"input_{i}")
+
+                            def forward_hook(module, input, output):
+                                if isinstance(output, tuple):
+                                    for i, output_i in enumerate(output):
+                                        compute_stats(module, output_i, f"output_{i}")
+                                else:
+                                    compute_stats(module, output, "output")
+
+                            return forward_pre_hook, forward_hook
+
+                        for name, layer in net_g.named_modules():
+                            forward_pre_hook, forward_hook = get_layer_hook(name)
+                            hook_handles.append(
+                                layer.register_forward_pre_hook(forward_pre_hook)
                             )
-                        elif isinstance(module, nn.Conv1d):
-                            channel_var, channel_mean = torch.var_mean(x, [0, 2])
-                        else:
-                            return
-                        average_squared_channel_mean = (
-                            channel_mean.square().mean().item()
-                        )
-                        average_channel_var = channel_var.mean().item()
-
-                        tensor_idx = len(intermediate_feature_stats) // 3
-                        intermediate_feature_stats[
-                            f"var/{tensor_idx:02d}_{name}/{suffix}"
-                        ] = var
-                        intermediate_feature_stats[
-                            f"avg_sq_ch_mean/{tensor_idx:02d}_{name}/{suffix}"
-                        ] = average_squared_channel_mean
-                        intermediate_feature_stats[
-                            f"avg_ch_var/{tensor_idx:02d}_{name}/{suffix}"
-                        ] = average_channel_var
-
-                    def forward_pre_hook(module, input):
-                        for i, input_i in enumerate(input):
-                            compute_stats(module, input_i, f"input_{i}")
-
-                    def forward_hook(module, input, output):
-                        if isinstance(output, tuple):
-                            for i, output_i in enumerate(output):
-                                compute_stats(module, output_i, f"output_{i}")
-                        else:
-                            compute_stats(module, output, "output")
-
-                    return forward_pre_hook, forward_hook
-
-                for name, layer in net_g.named_modules():
-                    forward_pre_hook, forward_hook = get_layer_hook(name)
-                    hook_handles.append(
-                        layer.register_forward_pre_hook(forward_pre_hook)
-                    )
-                    hook_handles.append(layer.register_forward_hook(forward_hook))
-                with torch.no_grad(), torch.amp.autocast(_amp_device, enabled=_use_amp):
-                    net_g.forward_and_compute_loss(
-                        noisy_wavs_16k[:, None, :],
-                        speaker_ids,
-                        formant_shift_semitone,
-                        slice_start_indices=slice_starts,
-                        slice_segment_length=h.segment_length,
-                        y_all=clean_wavs[:, None, :],
-                        enable_loss_ap=h.grad_weight_ap != 0.0,
-                    )
-                for handle in hook_handles:
-                    handle.remove()
-                for name, value in intermediate_feature_stats.items():
-                    writer.add_scalar(
-                        f"~intermediate_feature_{name}", value, iteration + 1
-                    )
+                            hook_handles.append(layer.register_forward_hook(forward_hook))
+                        with torch.no_grad(), torch.amp.autocast(_amp_device, enabled=_use_amp):
+                            net_g.forward_and_compute_loss(
+                                noisy_wavs_16k[:, None, :],
+                                speaker_ids,
+                                formant_shift_semitone,
+                                slice_start_indices=slice_starts,
+                                slice_segment_length=h.segment_length,
+                                y_all=clean_wavs[:, None, :],
+                                enable_loss_ap=h.grad_weight_ap != 0.0,
+                            )
+                        for handle in hook_handles:
+                            handle.remove()
+                        for name, value in intermediate_feature_stats.items():
+                            writer.add_scalar(
+                                f"~intermediate_feature_{name}", value, iteration + 1
+                            )
 
             # === 4. 検証 ===
             if (iteration + 1) % h.evaluation_interval == 0 or iteration + 1 in {
