@@ -875,7 +875,8 @@ def _run_main():
                 # Write UTMOS to DB and track best step — checkpoint copied in save block below
                 _utmos_now = dict_qualities.get("utmos")
                 if _utmos_now is not None:
-                    _is_new_best = _utmos_now > _best_utmos
+                    _warmup = (iteration + 1) <= 1000
+                    _is_new_best = (not _warmup) and (_utmos_now > _best_utmos)
                     _db_writer.insert_step_loss(iteration + 1, {"utmos": _utmos_now, "is_best": 1 if _is_new_best else 0})
                     if _is_new_best:
                         _best_utmos = _utmos_now
@@ -923,13 +924,15 @@ def _run_main():
                         f,
                     )
                 shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")
-                # Copy to checkpoint_best.pt.gz if UTMOS improved since last save.
-                # Done here (not in eval block) so we never do two torch.save calls
-                # in the same iteration — avoids double peak-RAM pressure.
+                # During warmup (≤1000 steps), latest IS best — keep checkpoint_best in sync.
+                # After warmup, only copy when UTMOS genuinely improves.
+                best_path = out_dir / "checkpoint_best.pt.gz"
                 if _needs_best_copy:
-                    shutil.copy(checkpoint_file_save, out_dir / "checkpoint_best.pt.gz")
+                    shutil.copy(checkpoint_file_save, best_path)
                     _needs_best_copy = False
                     print(f"[best] checkpoint_best.pt.gz updated (step {_best_utmos_step}, UTMOS {_best_utmos:.4f})", flush=True)
+                elif (iteration + 1) <= 1000:
+                    shutil.copy(checkpoint_file_save, best_path)
 
                 # 推論用
                 paraphernalia_dir = out_dir / f"paraphernalia_{name}"

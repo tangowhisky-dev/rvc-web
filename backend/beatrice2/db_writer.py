@@ -55,14 +55,14 @@ class BeatriceDBWriter:
                             trained_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(profile_id, step) DO UPDATE SET
-                           loss_mel   = excluded.loss_mel,
-                           loss_loud  = excluded.loss_loud,
-                           loss_ap    = excluded.loss_ap,
-                           loss_adv   = excluded.loss_adv,
-                           loss_fm    = excluded.loss_fm,
-                           loss_d     = excluded.loss_d,
-                           utmos      = COALESCE(excluded.utmos, utmos),
-                           is_best    = COALESCE(excluded.is_best, is_best),
+                           loss_mel   = COALESCE(excluded.loss_mel,  loss_mel),
+                           loss_loud  = COALESCE(excluded.loss_loud, loss_loud),
+                           loss_ap    = COALESCE(excluded.loss_ap,   loss_ap),
+                           loss_adv   = COALESCE(excluded.loss_adv,  loss_adv),
+                           loss_fm    = COALESCE(excluded.loss_fm,   loss_fm),
+                           loss_d     = COALESCE(excluded.loss_d,    loss_d),
+                           utmos      = COALESCE(excluded.utmos,     utmos),
+                           is_best    = COALESCE(excluded.is_best,   is_best),
                            trained_at = excluded.trained_at""",
                     (
                         row_id,
@@ -75,7 +75,7 @@ class BeatriceDBWriter:
                         losses.get("loss_fm"),
                         losses.get("loss_d"),
                         losses.get("utmos"),
-                        losses.get("is_best"),
+                        losses.get("is_best", 0),
                         trained_at,
                     ),
                 )
