@@ -1,12 +1,11 @@
 # Codebase Map
 
-Generated: 2026-04-20T04:30:48Z | Files: 232 | Described: 0/232
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-20T04:30:48Z","fingerprint":"a9fc636717f89bf4877d1486470e82d1034154e4","fileCount":232,"truncated":false} -->
+Generated: 2026-04-20T05:08:23Z | Files: 233 | Described: 0/233
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-20T05:08:23Z","fingerprint":"07d5de1d32b135e162d0e0d63e0338f18556690f","fileCount":233,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
 - `.gitignore`
-- `Archive.zip`
 - `convert_nemo_to_pt.py`
 - `install.bat`
 - `install.sh`
@@ -261,6 +260,10 @@ Generated: 2026-04-20T04:30:48Z | Files: 232 | Described: 0/232
 - `backend/tests/test_realtime.py`
 - `backend/tests/test_training_integration.py`
 - `backend/tests/test_training.py`
+
+### beatrice/trainer/
+- `beatrice/trainer/.gitattributes`
+- `beatrice/trainer/pyproject.toml`
 
 ### data/samples/07d44be257194f168506323e6c4b4d16/
 - `data/samples/07d44be257194f168506323e6c4b4d16/v.wav`
