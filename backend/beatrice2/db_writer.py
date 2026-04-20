@@ -31,14 +31,15 @@ class BeatriceDBWriter:
         """Upsert one row into beatrice_steps for this profile+step.
 
         Keys expected in losses (all optional — None stored as NULL):
-          loss_mel   — mel spectrogram reconstruction (primary quality signal)
-          loss_loud  — loudness matching
-          loss_ap    — aperiodicity
-          loss_adv   — adversarial (generator)
-          loss_fm    — feature matching
-          loss_d     — discriminator total
-          utmos      — UTMOS MOS score (1–5); only present at evaluation steps
-          is_best    — 1 if this step has the best UTMOS seen so far
+          loss_mel    — mel spectrogram reconstruction (primary quality signal)
+          loss_loud   — loudness matching
+          loss_ap     — aperiodicity
+          loss_adv    — adversarial (generator)
+          loss_fm     — feature matching
+          loss_d      — discriminator total
+          utmos       — UTMOS MOS score (1–5); only present at evaluation steps
+          is_best     — 1 if this step has the best UTMOS seen so far
+          elapsed_sec — seconds since training start; used by poller for ETA
         """
         if not self._enabled:
             return
@@ -51,19 +52,20 @@ class BeatriceDBWriter:
                            (id, profile_id, step,
                             loss_mel, loss_loud, loss_ap,
                             loss_adv, loss_fm, loss_d,
-                            utmos, is_best,
+                            utmos, is_best, elapsed_sec,
                             trained_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(profile_id, step) DO UPDATE SET
-                           loss_mel   = COALESCE(excluded.loss_mel,  loss_mel),
-                           loss_loud  = COALESCE(excluded.loss_loud, loss_loud),
-                           loss_ap    = COALESCE(excluded.loss_ap,   loss_ap),
-                           loss_adv   = COALESCE(excluded.loss_adv,  loss_adv),
-                           loss_fm    = COALESCE(excluded.loss_fm,   loss_fm),
-                           loss_d     = COALESCE(excluded.loss_d,    loss_d),
-                           utmos      = COALESCE(excluded.utmos,     utmos),
-                           is_best    = COALESCE(excluded.is_best,   is_best),
-                           trained_at = excluded.trained_at""",
+                           loss_mel    = COALESCE(excluded.loss_mel,    loss_mel),
+                           loss_loud   = COALESCE(excluded.loss_loud,   loss_loud),
+                           loss_ap     = COALESCE(excluded.loss_ap,     loss_ap),
+                           loss_adv    = COALESCE(excluded.loss_adv,    loss_adv),
+                           loss_fm     = COALESCE(excluded.loss_fm,     loss_fm),
+                           loss_d      = COALESCE(excluded.loss_d,      loss_d),
+                           utmos       = COALESCE(excluded.utmos,       utmos),
+                           is_best     = COALESCE(excluded.is_best,     is_best),
+                           elapsed_sec = COALESCE(excluded.elapsed_sec, elapsed_sec),
+                           trained_at  = excluded.trained_at""",
                     (
                         row_id,
                         self._profile_id,
@@ -76,6 +78,7 @@ class BeatriceDBWriter:
                         losses.get("loss_d"),
                         losses.get("utmos"),
                         losses.get("is_best", 0),
+                        losses.get("elapsed_sec"),
                         trained_at,
                     ),
                 )
@@ -90,12 +93,10 @@ class BeatriceDBWriter:
             return
         try:
             with sqlite3.connect(self._db_path, timeout=10) as conn:
-                # Clear previous best
                 conn.execute(
                     "UPDATE beatrice_steps SET is_best = 0 WHERE profile_id = ? AND is_best = 1",
                     (self._profile_id,),
                 )
-                # Set new best (upsert in case the step row doesn't exist yet)
                 conn.execute(
                     """UPDATE beatrice_steps SET is_best = 1, utmos = ?
                        WHERE profile_id = ? AND step = ?""",

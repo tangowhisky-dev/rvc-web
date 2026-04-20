@@ -151,14 +151,15 @@ _EPOCH_LOSSES_MIGRATIONS: list[tuple[str, str]] = [
 # New schema drops loss_g and uses the real component losses.
 # SQLite can't drop columns (pre-3.35), so we just ensure the real columns exist.
 _BEATRICE_STEPS_MIGRATIONS: list[tuple[str, str]] = [
-    ("loss_mel",  "REAL"),
-    ("loss_loud", "REAL"),
-    ("loss_ap",   "REAL"),
-    ("loss_adv",  "REAL"),
-    ("loss_fm",   "REAL"),
-    ("loss_d",    "REAL"),
-    ("utmos",     "REAL"),   # UTMOS MOS score (1–5); written at evaluation_interval steps only
-    ("is_best",   "INTEGER NOT NULL DEFAULT 0"),  # 1 if this step had best UTMOS so far
+    ("loss_mel",   "REAL"),
+    ("loss_loud",  "REAL"),
+    ("loss_ap",    "REAL"),
+    ("loss_adv",   "REAL"),
+    ("loss_fm",    "REAL"),
+    ("loss_d",     "REAL"),
+    ("utmos",      "REAL"),   # UTMOS MOS score (1–5); written at evaluation_interval steps only
+    ("is_best",    "INTEGER NOT NULL DEFAULT 0"),  # 1 if this step had best UTMOS so far
+    ("elapsed_sec","REAL"),   # seconds since training start; for ETA computation in poller
 ]
 
 

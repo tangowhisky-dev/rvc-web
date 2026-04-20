@@ -519,7 +519,9 @@ def _run_main():
 
     # Direct DB writer — same pattern as RVC's TrainingDBWriter
     from backend.beatrice2.db_writer import BeatriceDBWriter
+    import time as _time
     _db_writer = BeatriceDBWriter(db_path, profile_id)
+    _train_start: float = _time.monotonic()
 
     # Best-UTMOS tracking — checkpoint_best.pt.gz copied in save block
     _best_utmos: float = -float("inf")
@@ -693,12 +695,13 @@ def _run_main():
 
                 # Write step losses directly to DB — same pattern as RVC's TrainingDBWriter
                 _db_writer.insert_step_loss(iteration + 1, {
-                    "loss_mel":  scalar_avgs.get("loss_g/loss_mel"),
-                    "loss_loud": scalar_avgs.get("loss_g/loss_loudness"),
-                    "loss_adv":  scalar_avgs.get("loss_g/loss_adv"),
-                    "loss_fm":   scalar_avgs.get("loss_g/loss_fm"),
-                    "loss_ap":   scalar_avgs.get("loss_g/loss_ap"),
-                    "loss_d":    scalar_avgs.get("loss_d/loss_discriminator"),
+                    "loss_mel":   scalar_avgs.get("loss_g/loss_mel"),
+                    "loss_loud":  scalar_avgs.get("loss_g/loss_loudness"),
+                    "loss_adv":   scalar_avgs.get("loss_g/loss_adv"),
+                    "loss_fm":    scalar_avgs.get("loss_g/loss_fm"),
+                    "loss_ap":    scalar_avgs.get("loss_g/loss_ap"),
+                    "loss_d":     scalar_avgs.get("loss_d/loss_discriminator"),
+                    "elapsed_sec": _time.monotonic() - _train_start,
                 })
 
                 # Histograms are expensive — only every 1000 iters

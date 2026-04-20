@@ -17,7 +17,6 @@ import asyncio
 import json
 import math
 import os
-import re
 import sys
 import uuid
 from asyncio import subprocess as asyncio_subprocess
@@ -29,11 +28,6 @@ from backend.app.db import get_db, DB_PATH
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-_TQDM_RE = re.compile(
-    r"Training:\s+(\d+)%.*?\|\s*(\d+)/(\d+)"
-    r"(?:\s*\[(\d+:\d+)<(\S+),\s*([\d.]+)s/it)?"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -78,12 +72,14 @@ async def _poll_beatrice_steps(
     profile_id: str,
     proc_done: asyncio.Event,
 ) -> None:
-    """Poll beatrice_steps every 2s; emit step_done events with DB losses.
+    """Poll beatrice_steps every 2s; emit step_done + progress events from DB.
 
-    Mirrors _poll_rvc_epochs for the Beatrice 2 pipeline.
+    Replaces stdout parsing entirely — all timing/ETA is derived from
+    elapsed_sec written by the training loop at each _tb_interval.
     Stops one cycle after proc_done is set.
     """
     _seen_step: int = 0
+    _last_log_step: int = 0  # emit a Step N/M log line every 100 steps
 
     while True:
         await asyncio.sleep(_B2_POLL_INTERVAL)
@@ -92,7 +88,7 @@ async def _poll_beatrice_steps(
             async with get_db() as db:
                 cursor = await db.execute(
                     """SELECT step, loss_mel, loss_loud, loss_ap,
-                              loss_adv, loss_fm, loss_d, utmos, is_best
+                              loss_adv, loss_fm, loss_d, utmos, is_best, elapsed_sec
                        FROM beatrice_steps
                        WHERE profile_id = ? AND step > ?
                        ORDER BY step ASC""",
@@ -103,7 +99,8 @@ async def _poll_beatrice_steps(
             rows = []
 
         for row in rows:
-            step = int(row[0])
+            step        = int(row[0])
+            elapsed_sec = row[9]   # may be None for old rows
             losses = {
                 "loss_mel":  row[1],
                 "loss_loud": row[2],
@@ -114,7 +111,10 @@ async def _poll_beatrice_steps(
                 "utmos":     row[7],
                 "is_best":   row[8],
             }
+
+            # Progress from DB step — no tqdm needed
             pct = int(100 * step / job.total_steps) if job.total_steps else 0
+            job.progress_pct = pct
             job.queue.put_nowait({
                 "type": "step_done",
                 "step": step,
@@ -122,6 +122,33 @@ async def _poll_beatrice_steps(
                 "progress_pct": pct,
                 "losses": losses,
             })
+
+            # Emit a human-readable Step N/M  Xs/it  ETA log every 100 steps
+            if step - _last_log_step >= 100 and elapsed_sec:
+                secs_per_it = elapsed_sec / step if step > 0 else 0
+                remaining   = (job.total_steps - step) * secs_per_it
+                parts = [f"Step {step}/{job.total_steps}"]
+                if secs_per_it >= 1:
+                    parts.append(f"{secs_per_it:.1f}s/it")
+                else:
+                    parts.append(f"{secs_per_it*1000:.0f}ms/it")
+                # Format elapsed
+                e_h, e_rem = divmod(int(elapsed_sec), 3600)
+                e_m, e_s   = divmod(e_rem, 60)
+                if e_h:
+                    parts.append(f"elapsed {e_h}h{e_m:02d}m")
+                else:
+                    parts.append(f"elapsed {e_m}m{e_s:02d}s")
+                # Format ETA
+                r_h, r_rem = divmod(int(remaining), 3600)
+                r_m, r_s   = divmod(r_rem, 60)
+                if r_h:
+                    parts.append(f"ETA {r_h}h{r_m:02d}m")
+                else:
+                    parts.append(f"ETA {r_m}m{r_s:02d}s")
+                job.queue.put_nowait({"type": "log", "message": "  ".join(parts), "phase": "train"})
+                _last_log_step = step
+
             _seen_step = step
 
         if proc_done.is_set():
@@ -378,10 +405,15 @@ async def _run_beatrice_pipeline(
         )
 
     try:
+        # Redirect subprocess stdout+stderr to a log file for crash diagnosis.
+        # All progress/ETA/step data comes from DB via _poll_beatrice_steps —
+        # no stdout parsing needed.
+        log_path = os.path.join(out_dir, "train.log")
+        _log_file = open(log_path, "a", buffering=1)
         proc = await asyncio_subprocess.create_subprocess_exec(
             *cmd,
-            stdout=asyncio_subprocess.PIPE,
-            stderr=asyncio_subprocess.STDOUT,
+            stdout=_log_file.fileno(),
+            stderr=_log_file.fileno(),
             cwd=project_root,
             env=env,
         )
@@ -395,60 +427,14 @@ async def _run_beatrice_pipeline(
         await _update_db_status(profile_id, "failed")
         return
 
-    # DB poller — emits step_done events as BeatriceDBWriter inserts rows.
-    # Runs concurrently with stdout drain; stops after proc exits.
+    # DB poller — emits step_done + progress events; stops after proc exits.
     _proc_done = asyncio.Event()
     poll_task = asyncio.create_task(
         _poll_beatrice_steps(job, profile_id, _proc_done)
     )
 
-    # Drain stdout: forward log lines and parse tqdm for progress % display.
-    # step_done events are now entirely owned by _poll_beatrice_steps above.
-    assert proc.stdout is not None
-    async for raw_line in proc.stdout:
-        line = raw_line.decode("utf-8", errors="replace").rstrip()
-        if not line:
-            continue
-
-        # Parse tqdm progress: "Training:  20%|...| 2000/10000 [01:23<05:32,  3.21s/it]"
-        m = _TQDM_RE.search(line)
-        if m:
-            pct   = int(m.group(1))
-            step  = int(m.group(2))
-            total = int(m.group(3))
-            elapsed_str  = m.group(4) or ""   # e.g. "01:23"
-            eta_str      = m.group(5) or ""   # e.g. "05:32"
-            secs_per_it  = m.group(6) or ""   # e.g. "3.21"
-
-            job.progress_pct = pct
-            job.total_steps = total
-            job.queue.put_nowait(
-                {
-                    "type": "progress",
-                    "step": step,
-                    "total_steps": total,
-                    "progress_pct": pct,
-                    "phase": "train",
-                }
-            )
-            # Emit a human-readable log line every 100 iterations
-            if step > 0 and step % 100 == 0:
-                parts = [f"Step {step}/{total}"]
-                if secs_per_it:
-                    parts.append(f"{secs_per_it}s/it")
-                if elapsed_str:
-                    parts.append(f"elapsed {elapsed_str}")
-                if eta_str and eta_str != "?":
-                    parts.append(f"ETA {eta_str}")
-                job.queue.put_nowait(
-                    {"type": "log", "message": "  ".join(parts), "phase": "train"}
-                )
-        else:
-            job.queue.put_nowait(
-                {"type": "log", "message": line, "phase": "train"}
-            )
-
     await proc.wait()
+    _log_file.close()
 
     # Signal poller; wait for its final sweep before proceeding
     _proc_done.set()
