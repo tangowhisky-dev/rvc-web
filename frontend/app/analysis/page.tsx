@@ -265,10 +265,6 @@ function SimilarityGauge({ value, label, sub }: { value: number; label: string; 
 function EmbeddingCharts({ result }: { result: AnalysisResult }) {
   const dimCount = result.emb_a.length;
 
-  const barData = [
-    { name: 'A ↔ B (direct)', value: Math.round(result.ab_similarity * 100), fill: '#22d3ee' },
-  ];
-
   const diffData = result.emb_a.map((val, i) => ({ dim: i + 1, diff: val - result.emb_b[i] }));
 
   const allVals = [...result.emb_a, ...result.emb_b];
@@ -305,27 +301,14 @@ function EmbeddingCharts({ result }: { result: AnalysisResult }) {
   return (
     <div className="flex flex-col gap-8">
       <div>
-        <label className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-3 block">Speaker Similarity</label>
-        <ResponsiveContainer width="100%" height={80}>
-          <BarChart data={barData} layout="vertical" margin={{ left: 10, right: 30, top: 8, bottom: 8 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-            <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 10, fill: '#71717a' }} tickFormatter={v => `${v}%`} />
-            <YAxis type="category" dataKey="name" tick={{ fontSize: 10, fill: '#a1a1aa' }} width={120} />
-            <RechartsTooltip {...tooltip} formatter={(v: any) => `${v}%`} />
-            <Bar dataKey="value" fill="#22d3ee" radius={[0, 4, 4, 0]} barSize={22} />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-
-      <div>
         <label className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-1 block">Embedding Difference (A − B)</label>
-        <p className="text-[10px] font-mono text-zinc-600 mb-3">Above zero = A higher, below = B higher. Near zero = similar voices.</p>
+        <p className="text-[10px] font-mono text-zinc-600 mb-3">Above zero = A higher, below = B higher. Near zero = similar voices. Y-axis bounded ±1 (L2-normalised embedding range).</p>
         <ResponsiveContainer width="100%" height={200}>
           <BarChart data={diffData} margin={{ top: 8, right: 20, bottom: 28, left: 60 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
             <XAxis dataKey="dim" type="number" domain={[1, dimCount]} tick={{ fontSize: 9, fill: '#71717a' }}
               label={{ value: 'Dimension', position: 'bottom', offset: 0, fontSize: 10, fill: '#a1a1aa' }} />
-            <YAxis tick={{ fontSize: 9, fill: '#71717a' }} tickFormatter={(v: number) => v.toFixed(2)}
+            <YAxis domain={[-1, 1]} tick={{ fontSize: 9, fill: '#71717a' }} tickFormatter={(v: number) => v.toFixed(1)}
               label={{ value: 'Difference', angle: -90, position: 'insideLeft', style: { textAnchor: 'middle' }, fontSize: 10, fill: '#a1a1aa' }} />
             <RechartsTooltip {...tooltip} formatter={(v: any) => typeof v === 'number' ? v.toFixed(4) : v} />
             <Bar dataKey="diff" fill="#22d3ee" fillOpacity={0.65} barSize={2} />

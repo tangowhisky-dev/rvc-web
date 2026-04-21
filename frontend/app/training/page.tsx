@@ -589,7 +589,7 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
   const utmosPoints = sorted
     .map((p, i) => p.utmos != null ? { step: p.step, utmos_raw: p.utmos, i } : null)
     .filter((x): x is { step: number; utmos_raw: number; i: number } => x !== null);
-  const bestUtmosPoint = sorted.find(p => p.is_best === 1);
+  const bestUtmosPoint = sorted.filter(p => p.is_best === 1).at(-1);
   const bestUtmosStep  = bestUtmosPoint?.step ?? null;
   const bestUtmos      = bestUtmosPoint?.utmos ?? null;
   const latestUtmos    = utmosPoints[utmosPoints.length - 1]?.utmos_raw ?? null;
@@ -1003,6 +1003,16 @@ export default function TrainingPage() {
     return () => { cancelled = true; };
   }, [selectedId, profiles, historyKey]);
 
+  // Auto-snap steps to minB2Steps when a Beatrice 2 profile is selected or
+  // batch size changes. Only adjusts if current value is below the new minimum
+  // so the user can still choose a larger value freely.
+  useEffect(() => {
+    const sel = profiles.find(p => p.id === selectedId);
+    if (sel?.pipeline !== 'beatrice2') return;
+    const minB2Steps = Math.round(5000 * Math.sqrt(8 / batchSize));
+    setEpochs(prev => (prev < minB2Steps ? minB2Steps : prev));
+  }, [selectedId, batchSize, profiles]);
+
   // -------------------------------------------------------------------------
   // attachWs — wire up a WebSocket for profile_id and drive UI state from it.
   // Called both from handleStart (new job) and on mount (reconnect to in-progress).
@@ -1386,7 +1396,7 @@ export default function TrainingPage() {
                 {(() => {
                   const sel = profiles.find(p => p.id === selectedId);
                   const isB2 = sel?.pipeline === 'beatrice2';
-                  const minB2Steps = isB2 ? Math.round(10000 * Math.sqrt(8 / batchSize)) : 1;
+                  const minB2Steps = isB2 ? Math.round(5000 * Math.sqrt(8 / batchSize)) : 1;
                   return (
                     <>
                       <label className="text-[11px] font-mono uppercase tracking-widest text-zinc-400 flex items-center gap-2">
@@ -1807,7 +1817,7 @@ export default function TrainingPage() {
               {
                 icon: '🔢',
                 title: 'Minimum steps scale with batch size',
-                body: 'The reference recipe is 10 000 steps at batch size 8. For other batch sizes use: min_steps = 10 000 × √(8 ÷ batch_size). Examples: bs 4 → 14 142 steps, bs 8 → 10 000, bs 16 → 7 071, bs 32 → 5 000, bs 64 → 3 536. The UI enforces this minimum automatically as you change batch size.',
+                body: 'The reference recipe is 5 000 steps at batch size 8. For other batch sizes use: min_steps = 5 000 × √(8 ÷ batch_size). Examples: bs 4 → 7 071 steps, bs 8 → 5 000, bs 16 → 3 536, bs 32 → 2 500, bs 64 → 1 768. The UI enforces this minimum automatically as you change batch size.',
               },
               {
                 icon: '⚖️',
