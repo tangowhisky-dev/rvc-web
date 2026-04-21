@@ -510,7 +510,7 @@ export default function OfflinePage() {
     return () => { cancelled = true; };
   }, [autoPitch, profileId, inputFile]);
 
-
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (!f) return;
     setInputFile(f);
