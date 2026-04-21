@@ -478,8 +478,14 @@ async def convert_audio(
     index_path = None
     if pdir and os.path.isdir(pdir):
         if profile_pipeline == "beatrice2":
-            # Beatrice 2: checkpoint_latest.pt.gz; no FAISS index
-            b2_ckpt = os.path.join(pdir, "beatrice2_out", "checkpoint_latest.pt.gz")
+            # Beatrice 2: prefer checkpoint_best when use_best is set, else latest
+            b2_dir = os.path.join(pdir, "beatrice2_out")
+            if use_best:
+                best_ckpt = os.path.join(b2_dir, "checkpoint_best.pt.gz")
+                latest_ckpt = os.path.join(b2_dir, "checkpoint_latest.pt.gz")
+                b2_ckpt = best_ckpt if os.path.exists(best_ckpt) else latest_ckpt
+            else:
+                b2_ckpt = os.path.join(b2_dir, "checkpoint_latest.pt.gz")
             if os.path.exists(b2_ckpt):
                 model_path = b2_ckpt
         else:

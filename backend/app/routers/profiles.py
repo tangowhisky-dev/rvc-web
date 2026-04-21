@@ -245,12 +245,22 @@ def _resolve_index_path(row) -> Optional[str]:
 
 
 def _resolve_best_model_path(row) -> Optional[str]:
-    """Return path to model_best.pth if it exists on disk, else None."""
+    """Return path to best checkpoint if it exists on disk, else None.
+
+    RVC:       profile_dir/model_best.pth
+    Beatrice2: profile_dir/beatrice2_out/checkpoint_best.pt.gz
+    """
     pdir = row["profile_dir"]
-    if pdir:
-        candidate = os.path.join(pdir, "model_best.pth")
-        if os.path.exists(candidate):
-            return candidate
+    if not pdir:
+        return None
+    # RVC
+    candidate = os.path.join(pdir, "model_best.pth")
+    if os.path.exists(candidate):
+        return candidate
+    # Beatrice 2
+    candidate = os.path.join(pdir, "beatrice2_out", "checkpoint_best.pt.gz")
+    if os.path.exists(candidate):
+        return candidate
     return None
 
 
