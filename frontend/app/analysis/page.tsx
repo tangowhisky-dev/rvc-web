@@ -308,13 +308,13 @@ function EmbeddingCharts({ result }: { result: AnalysisResult }) {
     <div className="flex flex-col gap-8">
       <div>
         <label className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-1 block">Embedding Difference (A − B)</label>
-        <p className="text-[10px] font-mono text-zinc-600 mb-3">Above zero = A higher, below = B higher. <span className="text-green-400">Green</span> |diff| &lt; 0.1 · <span className="text-orange-400">Orange</span> &lt; 0.2 · <span className="text-red-400">Red</span> ≥ 0.2. Y-axis bounded ±1 (L2-normalised).</p>
+        <p className="text-[10px] font-mono text-zinc-600 mb-3">Above zero = A higher, below = B higher. <span className="text-green-400">Green</span> |diff| &lt; 0.1 · <span className="text-orange-400">Orange</span> &lt; 0.2 · <span className="text-red-400">Red</span> ≥ 0.2. Y-axis ±0.5 (values beyond clip).</p>
         <ResponsiveContainer width="100%" height={200}>
           <BarChart data={diffData} margin={{ top: 8, right: 20, bottom: 28, left: 60 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
             <XAxis dataKey="dim" type="number" domain={[1, dimCount]} tick={{ fontSize: 9, fill: '#71717a' }}
               label={{ value: 'Dimension', position: 'bottom', offset: 0, fontSize: 10, fill: '#a1a1aa' }} />
-            <YAxis domain={[-1, 1]} tick={{ fontSize: 9, fill: '#71717a' }} tickFormatter={(v: number) => v.toFixed(1)}
+            <YAxis domain={[-0.5, 0.5]} tick={{ fontSize: 9, fill: '#71717a' }} tickFormatter={(v: number) => v.toFixed(1)}
               label={{ value: 'Difference', angle: -90, position: 'insideLeft', style: { textAnchor: 'middle' }, fontSize: 10, fill: '#a1a1aa' }} />
             <RechartsTooltip {...tooltip} formatter={(v: any) => typeof v === 'number' ? v.toFixed(4) : v} />
             <Bar dataKey="diff" barSize={2} isAnimationActive={false}>
