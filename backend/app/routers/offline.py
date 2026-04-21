@@ -739,11 +739,12 @@ class _AnalyzeJobResponse(dict):
 
 
 @router.post("/analyze/{job_id}")
-async def analyze_job(job_id: str):
+async def analyze_job(job_id: str, profile_id: Optional[str] = None):
     """Run ECAPA-TDNN speaker-embedding comparison on a completed job.
 
     File A = profile reference audio (first cleaned audio file, or sample_path fallback).
     File B = converted output file.
+    profile_id may be passed as a query param to override what's stored in _jobs.
     Returns CompareResponse-shaped JSON.
     """
     from backend.app.voice_analysis import analyze_pair
@@ -758,16 +759,16 @@ async def analyze_job(job_id: str):
     if not out_path or not os.path.exists(out_path):
         raise HTTPException(status_code=404, detail="Output temp file not found or expired")
 
-    # Resolve reference audio from profile
-    profile_id = job.get("profile_id")
+    # Resolve reference audio from profile — prefer query param, fall back to _jobs
+    resolved_profile_id = profile_id or job.get("profile_id")
     ref_path: Optional[str] = None
-    if profile_id:
+    if resolved_profile_id:
         async with aiosqlite.connect(db.DB_PATH) as conn:
             conn.row_factory = aiosqlite.Row
             # Prefer a cleaned audio file
             cursor = await conn.execute(
                 "SELECT file_path FROM audio_files WHERE profile_id = ? AND is_cleaned = 1 ORDER BY created_at ASC LIMIT 1",
-                (profile_id,),
+                (resolved_profile_id,),
             )
             row = await cursor.fetchone()
             if row and os.path.exists(row["file_path"]):
@@ -776,7 +777,7 @@ async def analyze_job(job_id: str):
                 # Fallback: any audio file for this profile
                 cursor = await conn.execute(
                     "SELECT file_path FROM audio_files WHERE profile_id = ? ORDER BY created_at ASC LIMIT 1",
-                    (profile_id,),
+                    (resolved_profile_id,),
                 )
                 row = await cursor.fetchone()
                 if row and os.path.exists(row["file_path"]):
@@ -785,7 +786,7 @@ async def analyze_job(job_id: str):
                     # Last resort: sample_path on profile row
                     cursor = await conn.execute(
                         "SELECT sample_path FROM profiles WHERE id = ?",
-                        (profile_id,),
+                        (resolved_profile_id,),
                     )
                     row = await cursor.fetchone()
                     if row and row["sample_path"] and os.path.exists(row["sample_path"]):

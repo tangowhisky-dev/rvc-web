@@ -501,8 +501,8 @@ export default function OfflinePage() {
                   setOutputFilename(m[1]);
                 } else if (inputFile) {
                   const stem = inputFile.name.replace(/\.[^.]+$/, '');
-                  const ext  = inputFile.name.match(/\.[^.]+$/)?.[0] ?? '.wav';
-                  setOutputFilename(`${stem}_rvc${ext}`);
+                  const suffix = profiles.find(p => p.id === profileId)?.pipeline === 'beatrice2' ? '_b2' : '_rvc';
+                  setOutputFilename(`${stem}${suffix}.wav`);
                 } else {
                   setOutputFilename('output_rvc.wav');
                 }

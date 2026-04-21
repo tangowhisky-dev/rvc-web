@@ -473,7 +473,10 @@ function AnalysisPageInner() {
   async function runFromJob(jid: string) {
     setRunning(true); setError(null); setResult(null);
     try {
-      const res = await fetch(`${API}/api/offline/analyze/${jid}`, { method: 'POST' });
+      const url = offlineProfileId
+        ? `${API}/api/offline/analyze/${jid}?profile_id=${offlineProfileId}`
+        : `${API}/api/offline/analyze/${jid}`;
+      const res = await fetch(url, { method: 'POST' });
       if (!res.ok) {
         const d = await res.json().catch(() => ({}));
         throw new Error(d?.detail ?? `HTTP ${res.status}`);
