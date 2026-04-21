@@ -249,12 +249,13 @@ class BeatriceInferenceEngine:
                 if rem != 0:
                     chunk = F.pad(chunk, (0, _HOP - rem))
 
-                # net_g expects [batch, 1, T]
+                # net_g expects [batch, 1, T]. Use keyword arguments to avoid
+                # parameter order confusion (model expects formant then pitch).
                 out = self.net_g(
                     chunk.unsqueeze(0).unsqueeze(0),
-                    target_ids,
-                    formant_shift,
-                    pitch_shift,
+                    target_speaker_id=target_ids,
+                    formant_shift_semitone=formant_shift,
+                    pitch_shift_semitone=pitch_shift,
                 )  # [1, 1, T_out] or [1, T_out]
                 chunks_out.append(out.squeeze().cpu().float())
 
@@ -264,6 +265,11 @@ class BeatriceInferenceEngine:
         # per-chunk rounding drift)
         expected_samples = int(T * out_ratio)
         y_hat = y_hat[:expected_samples]
+
+        # Peak normalization to prevent clipping (matches convert.py)
+        peak = y_hat.abs().max()
+        if peak > 0.95:
+            y_hat = y_hat * (0.95 / peak)
 
         return y_hat.numpy().astype(np.float32)
 
