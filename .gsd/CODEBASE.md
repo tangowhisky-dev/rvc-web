@@ -1,7 +1,7 @@
 # Codebase Map
 
-Generated: 2026-04-20T09:21:22Z | Files: 234 | Described: 0/234
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-20T09:21:22Z","fingerprint":"40c238cbc3fecf0835b592b40ffadfde006e75f2","fileCount":234,"truncated":false} -->
+Generated: 2026-04-21T05:33:47Z | Files: 236 | Described: 0/236
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-21T05:33:47Z","fingerprint":"86a80865f12b42d3ccb42d49b8974ad1cef4a7d2","fileCount":236,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
@@ -293,6 +293,8 @@ Generated: 2026-04-20T09:21:22Z | Files: 234 | Described: 0/234
 - `docs/AMPHION-VEVO2-ANALYSIS.md`
 - `docs/BEATRICE-ANALYSIS.md`
 - `docs/BEATRICE2_INTEGRATION.md`
+- `docs/beatrice2-augmentation-precompute.md`
+- `docs/beatrice2-realtime-pipeline.md`
 - `docs/CROSS_PLATFORM_ANALYSIS.md`
 - `docs/DEITERIS-VC-ANALYSIS.md`
 - `docs/KNOWLEDGE.md`
