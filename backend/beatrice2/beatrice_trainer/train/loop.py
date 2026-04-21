@@ -85,7 +85,7 @@ def prepare_training():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    (h, in_wav_dataset_dir, out_dir, resume, skip_training, db_path, profile_id) = (
+    (h, in_wav_dataset_dir, out_dir, resume, skip_training, db_path, profile_id, _cli_test_dir) = (
         prepare_training_configs_for_experiment
         if is_notebook()
         else prepare_training_configs
@@ -120,7 +120,9 @@ def prepare_training():
 
     in_ir_wav_dir = repo_root() / h.in_ir_wav_dir
     in_noise_wav_dir = repo_root() / h.in_noise_wav_dir
-    in_test_wav_dir = repo_root() / h.in_test_wav_dir
+    # --test-dir from CLI takes priority over config; falls back to assets/beatrice2/test/
+    in_test_wav_dir = _cli_test_dir if (_cli_test_dir is not None and _cli_test_dir.is_dir()) \
+                      else repo_root() / h.in_test_wav_dir
 
     assert in_wav_dataset_dir.is_dir(), in_wav_dataset_dir
     assert out_dir.is_dir(), out_dir

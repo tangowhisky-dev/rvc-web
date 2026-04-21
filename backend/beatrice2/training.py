@@ -294,6 +294,50 @@ def _write_beatrice_config(
 # ---------------------------------------------------------------------------
 
 
+def _build_test_holdout(data_dir: str, test_dir: str, holdout_fraction: float = 0.1, max_files: int = 20) -> int:
+    """Copy a stratified holdout of preprocessed chunks to test_dir for UTMOS eval.
+
+    Picks the last ``holdout_fraction`` of chunks from each speaker subdir
+    (deterministic — same files every time) up to ``max_files`` total.
+    Files are *copied* not moved so training data is unaffected.
+    Returns the number of files in test_dir after the call.
+    """
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    data_path = _Path(data_dir)
+    test_path = _Path(test_dir)
+    test_path.mkdir(parents=True, exist_ok=True)
+
+    # Collect all chunk files across speaker subdirs, sorted for determinism
+    EXTS = {".wav", ".flac"}
+    all_chunks: list[_Path] = []
+    for speaker_dir in sorted(data_path.iterdir()):
+        if not speaker_dir.is_dir() or speaker_dir.name == "_originals":
+            continue
+        chunks = sorted(
+            f for f in speaker_dir.iterdir()
+            if f.suffix.lower() in EXTS and "_originals" not in f.parts
+        )
+        if not chunks:
+            continue
+        # Take last holdout_fraction of each speaker's chunks — these are
+        # unseen by training only if the dataset is large enough; for small
+        # datasets (<10 chunks) we still use the last 1 file so there's
+        # always something to eval on.
+        n_hold = max(1, int(len(chunks) * holdout_fraction))
+        all_chunks.extend(chunks[-n_hold:])
+
+    # Cap total and copy
+    selected = all_chunks[:max_files]
+    for src in selected:
+        dst = test_path / src.name
+        if not dst.exists():
+            _shutil.copy2(src, dst)
+
+    return len(list(test_path.iterdir()))
+
+
 def _preprocess_audio(
     audio_dir: str,
     data_dir: str,
@@ -410,6 +454,28 @@ async def _run_beatrice_pipeline(
         return
 
     # ------------------------------------------------------------------
+    # Phase 1b: Build in-domain UTMOS holdout from preprocessed chunks
+    # ------------------------------------------------------------------
+    test_dir = os.path.join(out_dir, "utmos_test")
+    try:
+        n_test = await loop.run_in_executor(
+            None, _build_test_holdout, data_dir, test_dir
+        )
+        job.queue.put_nowait(
+            {
+                "type": "log",
+                "message": f"UTMOS test holdout: {n_test} files in {test_dir}",
+                "phase": "preprocess",
+            }
+        )
+    except Exception as exc:
+        # Non-fatal — fallback to assets/beatrice2/test/ happens inside loop.py
+        test_dir = None
+        job.queue.put_nowait(
+            {"type": "log", "message": f"UTMOS holdout failed (will use default test set): {exc}", "phase": "preprocess"}
+        )
+
+    # ------------------------------------------------------------------
     # Phase 2: Write config
     # ------------------------------------------------------------------
     config_path, total_steps = _write_beatrice_config(
@@ -448,6 +514,8 @@ async def _run_beatrice_pipeline(
         "--profile-id",
         profile_id,
     ]
+    if test_dir and os.path.isdir(test_dir):
+        cmd += ["--test-dir", test_dir]
 
     # Check for existing checkpoint — resume automatically
     checkpoint = os.path.join(out_dir, "checkpoint_latest.pt.gz")

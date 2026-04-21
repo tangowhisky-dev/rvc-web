@@ -132,7 +132,7 @@ if __name__ == "__main__":
         warnings.warn("dafualt_config.json not found.")
 
 
-def prepare_training_configs_for_experiment() -> tuple[dict, Path, Path, bool, bool]:
+def prepare_training_configs_for_experiment() -> tuple[dict, Path, Path, bool, bool, str, str, None]:
     import ipynbname  # type: ignore[import]
     from IPython import get_ipython  # type: ignore[import]
 
@@ -145,7 +145,7 @@ def prepare_training_configs_for_experiment() -> tuple[dict, Path, Path, bool, b
     out_dir = repo_root() / "notebooks" / notebook_name.split(".")[0].split("_")[0]
     resume = False
     skip_training = False
-    return h, in_wav_dataset_dir, out_dir, resume, skip_training
+    return h, in_wav_dataset_dir, out_dir, resume, skip_training, "", "", None
 
 
 def prepare_training_configs() -> tuple[dict, Path, Path, bool, bool]:
@@ -163,6 +163,9 @@ def prepare_training_configs() -> tuple[dict, Path, Path, bool, bool]:
     parser.add_argument("-c", "--config", type=Path, help="path to the config file")
     parser.add_argument("--db", type=str, default="", help="path to rvc.db for direct loss writes")
     parser.add_argument("--profile-id", type=str, default="", help="profile ID for DB writes")
+    parser.add_argument("--test-dir", type=Path, default=None,
+                        help="flat directory of held-out WAV files for UTMOS eval; "
+                             "overrides in_test_wav_dir from config/default")
     # fmt: on
     args = parser.parse_args()
 
@@ -208,7 +211,8 @@ def prepare_training_configs() -> tuple[dict, Path, Path, bool, bool]:
     resume = args.resume
     db_path = args.db or ""
     profile_id = args.profile_id or ""
-    return h, in_wav_dataset_dir, out_dir, resume, False, db_path, profile_id
+    test_dir: Path | None = args.test_dir
+    return h, in_wav_dataset_dir, out_dir, resume, False, db_path, profile_id, test_dir
 
 
 class AttrDict(dict):
