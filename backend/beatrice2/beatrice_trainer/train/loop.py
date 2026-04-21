@@ -257,6 +257,18 @@ def prepare_training():
         print(f"  {speaker:3d}: {f0:.1f}Hz", end=",")
     print()
     print("Done.")
+
+    # Save speaker mean F0 for auto pitch-shift at inference time.
+    # speaker_f0s[0] is the target speaker (single-speaker fine-tune).
+    # Geometric mean (log-domain average) matches compute_mean_f0() above.
+    if speaker_f0s and math.isfinite(speaker_f0s[0]):
+        import json as _json
+        _f0_path = out_dir / "speaker_f0.json"
+        _f0_path.write_text(
+            _json.dumps({"mean_f0": round(speaker_f0s[0], 4), "method": "dio"})
+        )
+        print(f"Profile mean F0: {speaker_f0s[0]:.1f} Hz → saved to speaker_f0.json")
+
     print("Computing pitch shifts for test files...")
     test_pitch_shifts = []
     source_f0s = []

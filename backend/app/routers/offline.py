@@ -719,6 +719,136 @@ async def stream_input(job_id: str):
     return FileResponse(in_path, media_type=mime, headers={"Cache-Control": "no-cache"})
 
 
+@router.post("/speaker_f0/{profile_id}/compute")
+async def compute_speaker_f0(profile_id: str):
+    """Compute mean F0 from profile audio files and save to speaker_f0.json.
+
+    Works for both RVC (audio in profile_dir/audio/) and Beatrice 2
+    (audio in profile_dir/beatrice2_data/<speaker>/). Uses pyworld DIO.
+    Returns {"mean_f0": float, "method": "dio"}.
+    """
+    import json as _json
+    import math as _math
+    import numpy as _np
+    import torch as _torch
+    import torchaudio as _torchaudio
+
+    async with aiosqlite.connect(db.DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT profile_dir, pipeline FROM profiles WHERE id = ?", (profile_id,)
+        )
+        row = await cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    pdir = row["profile_dir"]
+    pipeline = row["pipeline"] or "rvc"
+    if not pdir or not os.path.isdir(pdir):
+        raise HTTPException(status_code=404, detail="Profile directory not found")
+
+    # Collect audio files
+    EXTS = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
+    audio_files: list[str] = []
+    if pipeline == "beatrice2":
+        data_dir = os.path.join(pdir, "beatrice2_data")
+        if os.path.isdir(data_dir):
+            for root, _, files in os.walk(data_dir):
+                for f in sorted(files):
+                    if os.path.splitext(f)[1].lower() in EXTS and "_originals" not in root:
+                        audio_files.append(os.path.join(root, f))
+    if not audio_files:
+        # RVC or fallback: profile_dir/audio/
+        audio_dir = os.path.join(pdir, "audio")
+        if os.path.isdir(audio_dir):
+            audio_files = sorted([
+                os.path.join(audio_dir, f) for f in os.listdir(audio_dir)
+                if os.path.splitext(f)[1].lower() in EXTS
+            ])
+
+    if not audio_files:
+        raise HTTPException(status_code=422, detail="No audio files found in profile")
+
+    # Compute geometric mean F0 in an executor (CPU-bound)
+    def _compute():
+        import pyworld as _pyworld
+        sum_log_f0 = 0.0
+        n_frames = 0
+        for af in audio_files:
+            try:
+                wav, sr = _torchaudio.load(af)
+                mono = wav.mean(0).numpy().astype(_np.float64)
+                if sr != 16000:
+                    mono = _torchaudio.functional.resample(
+                        _torch.from_numpy(mono), sr, 16000
+                    ).numpy().astype(_np.float64)
+                    sr = 16000
+                f0, _ = _pyworld.dio(mono, sr)
+                voiced = f0[f0 > 0]
+                if len(voiced):
+                    sum_log_f0 += float(_np.log(voiced).sum())
+                    n_frames += len(voiced)
+            except Exception:
+                pass
+        if n_frames == 0:
+            raise ValueError("No voiced frames found in audio files")
+        return _math.exp(sum_log_f0 / n_frames)
+
+    loop = asyncio.get_event_loop()
+    try:
+        mean_f0 = await loop.run_in_executor(None, _compute)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Save to appropriate location
+    if pipeline == "beatrice2":
+        out_dir = os.path.join(pdir, "beatrice2_out")
+        os.makedirs(out_dir, exist_ok=True)
+        save_path = os.path.join(out_dir, "speaker_f0.json")
+    else:
+        save_path = os.path.join(pdir, "speaker_f0.json")
+
+    payload = {"mean_f0": round(mean_f0, 4), "method": "dio"}
+    with open(save_path, "w") as f:
+        _json.dump(payload, f)
+
+    return payload
+
+
+@router.get("/speaker_f0/{profile_id}")
+async def get_speaker_f0(profile_id: str):
+    """Return the profile's stored mean F0 (Hz) for auto pitch-shift computation.
+
+    Looks for speaker_f0.json in:
+      - profile_dir/speaker_f0.json          (RVC)
+      - profile_dir/beatrice2_out/speaker_f0.json  (Beatrice 2)
+    Returns {"mean_f0": float, "method": str} or 404 if not computed yet.
+    """
+    async with aiosqlite.connect(db.DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT profile_dir, pipeline FROM profiles WHERE id = ?", (profile_id,)
+        )
+        row = await cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    pdir = row["profile_dir"]
+    pipeline = row["pipeline"] or "rvc"
+
+    candidates = [
+        os.path.join(pdir, "speaker_f0.json"),
+        os.path.join(pdir, "beatrice2_out", "speaker_f0.json"),
+    ]
+    import json as _json
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path) as f:
+                return _json.load(f)
+
+    raise HTTPException(status_code=404, detail="speaker_f0.json not found — train first")
+
+
 @router.get("/reference/{job_id}")
 async def stream_reference(job_id: str):
     """Stream the profile reference audio for a completed job (for waveform preview)."""

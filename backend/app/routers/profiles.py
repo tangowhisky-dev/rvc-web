@@ -109,6 +109,9 @@ class ProfileOut(BaseModel):
     best_epoch: Optional[int] = None
     best_avg_gen_loss: Optional[float] = None
     audio_files: list[AudioFileOut] = []
+    # Speaker mean F0 (Hz) — present when speaker_f0.json has been computed
+    has_speaker_f0: bool = False
+    speaker_mean_f0: Optional[float] = None
 
 
 class PreprocessResponse(BaseModel):
@@ -279,6 +282,25 @@ async def _row_to_out(row, db) -> ProfileOut:
     pdir = row["profile_dir"]
     keys = row.keys() if hasattr(row, "keys") else []
     audio_files = await _fetch_audio_files(db, row["id"])
+
+    # speaker_f0.json — RVC stores in profile_dir/, Beatrice 2 in beatrice2_out/
+    _has_f0 = False
+    _mean_f0 = None
+    if pdir:
+        import json as _json
+        for _f0_path in (
+            os.path.join(pdir, "speaker_f0.json"),
+            os.path.join(pdir, "beatrice2_out", "speaker_f0.json"),
+        ):
+            if os.path.exists(_f0_path):
+                try:
+                    _d = _json.loads(open(_f0_path).read())
+                    _has_f0 = True
+                    _mean_f0 = float(_d["mean_f0"])
+                except Exception:
+                    pass
+                break
+
     return ProfileOut(
         id=row["id"],
         name=row["name"],
@@ -316,6 +338,8 @@ async def _row_to_out(row, db) -> ProfileOut:
         if "best_avg_gen_loss" in keys and row["best_avg_gen_loss"] is not None
         else None,
         audio_files=audio_files,
+        has_speaker_f0=_has_f0,
+        speaker_mean_f0=_mean_f0,
     )
 
 

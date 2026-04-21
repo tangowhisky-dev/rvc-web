@@ -37,6 +37,8 @@ interface Profile {
   best_epoch: number | null;
   best_avg_gen_loss: number | null;
   audio_files: AudioFile[];
+  has_speaker_f0: boolean;
+  speaker_mean_f0: number | null;
 }
 
 interface HealthStatus {
@@ -909,6 +911,51 @@ function AudioFileRow({ profileId, audioFile, onDeleted, onCleaned }: AudioFileR
 }
 
 // ---------------------------------------------------------------------------
+// F0Button — compute / recalculate speaker mean F0 for a profile
+// ---------------------------------------------------------------------------
+function F0Button({ profileId, hasSpeakerF0, speakerMeanF0, onRefresh }: {
+  profileId: string;
+  hasSpeakerF0: boolean;
+  speakerMeanF0: number | null;
+  onRefresh: () => void;
+}) {
+  const [computing, setComputing] = useState(false);
+
+  async function handleCompute() {
+    setComputing(true);
+    try {
+      const res = await fetch(`${API}/api/offline/speaker_f0/${profileId}/compute`, { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ detail: res.statusText }));
+        alert(`F0 compute failed: ${body.detail ?? res.statusText}`);
+        return;
+      }
+      onRefresh();
+    } catch (err) {
+      alert(String(err));
+    } finally {
+      setComputing(false);
+    }
+  }
+
+  return (
+    <button
+      onClick={handleCompute}
+      disabled={computing}
+      title={hasSpeakerF0
+        ? `Recalculate profile mean F0 (current: ${speakerMeanF0?.toFixed(1)} Hz)`
+        : 'Calculate speaker mean F0 for auto pitch-shift at inference'}
+      className="px-3 py-1.5 rounded-md text-[11px] font-mono uppercase tracking-wider
+                 border transition-colors disabled:opacity-40
+                 text-cyan-400 border-cyan-900/50 bg-cyan-950/20
+                 hover:bg-cyan-900/30 hover:border-cyan-800/60">
+      {computing ? '⟳' : hasSpeakerF0
+        ? `F0 ${speakerMeanF0?.toFixed(0)}Hz ↺`
+        : 'Calc F0'}
+    </button>
+  );
+}
+
 // ProfileCard
 // ---------------------------------------------------------------------------
 
@@ -1168,6 +1215,7 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
                        disabled:opacity-40">
             {exporting ? '⟳' : '↑ Export'}
           </button>
+          <F0Button profileId={profile.id} hasSpeakerF0={profile.has_speaker_f0} speakerMeanF0={profile.speaker_mean_f0} onRefresh={onRefresh} />
           <button onClick={handleDelete} disabled={deleting}
             className="px-3 py-1.5 rounded-md text-[11px] font-mono uppercase tracking-wider
                        text-red-400 border border-red-900/50 bg-red-950/20

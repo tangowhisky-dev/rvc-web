@@ -878,6 +878,57 @@ async def _run_pipeline(
         await _fail("extract_f0", "F0 extraction phase failed (non-zero exit code)")
         return
 
+    # Compute and save mean F0 of profile audio for auto pitch-shift at inference.
+    # Uses geometric mean (log-domain average) over all voiced frames — same method
+    # as Beatrice 2 trainer. Saved to profile_dir/speaker_f0.json.
+    if profile_dir:
+        try:
+            import math as _math
+            import numpy as _np
+            import torch as _torch
+            import torchaudio as _torchaudio
+
+            _audio_files = sorted([
+                os.path.join(sample_dir, f) for f in os.listdir(sample_dir)
+                if f.lower().endswith((".wav", ".flac", ".mp3", ".ogg", ".m4a"))
+            ])
+            _sum_log_f0 = 0.0
+            _n_frames = 0
+            for _af in _audio_files:
+                try:
+                    import pyworld as _pyworld
+                    _wav, _sr = _torchaudio.load(_af)
+                    _mono = _wav.mean(0).numpy().astype(_np.float64)
+                    if _sr != 16000:
+                        import torchaudio.functional as _F
+                        _mono = _F.resample(
+                            _torch.from_numpy(_mono), _sr, 16000
+                        ).numpy().astype(_np.float64)
+                        _sr = 16000
+                    _f0, _ = _pyworld.dio(_mono, _sr)
+                    _voiced = _f0[_f0 > 0]
+                    if len(_voiced):
+                        _sum_log_f0 += float(_np.log(_voiced).sum())
+                        _n_frames += len(_voiced)
+                except Exception:
+                    pass
+            if _n_frames > 0:
+                _mean_f0 = _math.exp(_sum_log_f0 / _n_frames)
+                _f0_path = os.path.join(profile_dir, "speaker_f0.json")
+                with open(_f0_path, "w") as _fj:
+                    json.dump({"mean_f0": round(_mean_f0, 4), "method": "dio"}, _fj)
+                await job.queue.put({
+                    "type": "log",
+                    "message": f"Profile mean F0: {_mean_f0:.1f} Hz → saved to speaker_f0.json",
+                    "phase": "extract_f0",
+                })
+        except Exception as _e:
+            await job.queue.put({
+                "type": "log",
+                "message": f"[warn] Could not compute mean F0: {_e}",
+                "phase": "extract_f0",
+            })
+
     # ------------------------------------------------------------------
     # Phase 2b: Feature Extraction (embedder)
     # ------------------------------------------------------------------
