@@ -841,7 +841,7 @@ def _run_main():
                                 [float(p) for p in pitch_shift_semitones], device=device
                             ),
                         ).squeeze_(1)[:, : original_source_wav_length // 160 * 240]
-                        if i < 12:
+                        if i < 12 and writer is not None:
                             if iteration == 0:
                                 writer.add_audio(
                                     f"source/y_{i:02d}",
