@@ -238,7 +238,18 @@ function PlaybackWaveform({ url, duration, color = '#22d3ee' }: PlaybackWaveform
 
 function SimilarityGauge({ value, label, sub }: { value: number; label: string; sub?: string }) {
   const pct = Math.round(value * 100);
-  const color = value > 0.85 ? '#22c55e' : value > 0.65 ? '#f59e0b' : '#ef4444';
+  const color = value >= 0.80 ? '#22c55e'       // excellent — green
+              : value >= 0.70 ? '#4ade80'        // very good — light green
+              : value >= 0.60 ? '#22d3ee'        // good      — aqua
+              : value >= 0.50 ? '#fef08a'        // moderate  — light yellow
+              : value >= 0.40 ? '#fb923c'        // poor      — orange
+              : '#ef4444';                        // very poor — red
+  const tier  = value >= 0.80 ? 'Excellent'
+              : value >= 0.70 ? 'Very Good'
+              : value >= 0.60 ? 'Good'
+              : value >= 0.50 ? 'Moderate'
+              : value >= 0.40 ? 'Poor'
+              : 'Very Poor';
   const dashArray = 2 * Math.PI * 40;
   const dashOffset = dashArray * (1 - value);
   return (
@@ -249,8 +260,10 @@ function SimilarityGauge({ value, label, sub }: { value: number; label: string; 
           strokeDasharray={dashArray} strokeDashoffset={dashOffset}
           strokeLinecap="round" transform="rotate(-90 48 48)"
           style={{ transition: 'stroke-dashoffset 0.6s ease' }} />
-        <text x="48" y="52" textAnchor="middle" fill={color}
-          fontSize="18" fontFamily="monospace" fontWeight="bold">{pct}%</text>
+        <text x="48" y="48" textAnchor="middle" fill={color}
+          fontSize="18" fontFamily="monospace" fontWeight="bold" dy="0.15em">{pct}%</text>
+        <text x="48" y="66" textAnchor="middle" fill={color}
+          fontSize="8" fontFamily="monospace">{tier}</text>
       </svg>
       <span className="text-[11px] font-mono text-zinc-300">{label}</span>
       {sub && <span className="text-[10px] font-mono text-zinc-500">{sub}</span>}
