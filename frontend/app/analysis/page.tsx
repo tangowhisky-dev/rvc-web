@@ -3,7 +3,7 @@
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid,
+  BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid,
   Tooltip as RechartsTooltip, ResponsiveContainer,
   ScatterChart, Scatter, ReferenceLine, ZAxis,
   LineChart, Line, Legend,
@@ -284,6 +284,12 @@ function EmbeddingCharts({ result }: { result: AnalysisResult }) {
     return `rgb(${r},${g},${b})`;
   };
 
+  const diffBarColor = (absDiff: number) => {
+    if (absDiff < 0.1) return '#4ade80';   // green  — similar
+    if (absDiff < 0.2) return '#fb923c';   // orange — moderate
+    return '#f87171';                       // red    — divergent
+  };
+
   const ColoredDot = ({ cx, cy, payload }: any) => (
     <circle cx={cx} cy={cy} r={3.5} fill={diffToColor(payload.diff)} fillOpacity={0.8} />
   );
@@ -302,7 +308,7 @@ function EmbeddingCharts({ result }: { result: AnalysisResult }) {
     <div className="flex flex-col gap-8">
       <div>
         <label className="text-[10px] font-mono uppercase tracking-widest text-zinc-500 mb-1 block">Embedding Difference (A − B)</label>
-        <p className="text-[10px] font-mono text-zinc-600 mb-3">Above zero = A higher, below = B higher. Near zero = similar voices. Y-axis bounded ±1 (L2-normalised embedding range).</p>
+        <p className="text-[10px] font-mono text-zinc-600 mb-3">Above zero = A higher, below = B higher. <span className="text-green-400">Green</span> |diff| &lt; 0.1 · <span className="text-orange-400">Orange</span> &lt; 0.2 · <span className="text-red-400">Red</span> ≥ 0.2. Y-axis bounded ±1 (L2-normalised).</p>
         <ResponsiveContainer width="100%" height={200}>
           <BarChart data={diffData} margin={{ top: 8, right: 20, bottom: 28, left: 60 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
@@ -311,7 +317,11 @@ function EmbeddingCharts({ result }: { result: AnalysisResult }) {
             <YAxis domain={[-1, 1]} tick={{ fontSize: 9, fill: '#71717a' }} tickFormatter={(v: number) => v.toFixed(1)}
               label={{ value: 'Difference', angle: -90, position: 'insideLeft', style: { textAnchor: 'middle' }, fontSize: 10, fill: '#a1a1aa' }} />
             <RechartsTooltip {...tooltip} formatter={(v: any) => typeof v === 'number' ? v.toFixed(4) : v} />
-            <Bar dataKey="diff" fill="#22d3ee" fillOpacity={0.65} barSize={2} />
+            <Bar dataKey="diff" barSize={2} isAnimationActive={false}>
+              {diffData.map((entry, i) => (
+                <Cell key={i} fill={diffBarColor(Math.abs(entry.diff))} fillOpacity={0.75} />
+              ))}
+            </Bar>
           </BarChart>
         </ResponsiveContainer>
       </div>
