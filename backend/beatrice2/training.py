@@ -83,6 +83,7 @@ async def _poll_beatrice_steps(
     _seen_step: int = 0
     _last_log_step: int = 0  # emit a Step N/M log line every 100 steps
     _last_phase: str = ""    # track last phase.txt value to emit phase events once
+    _session_start_step: int = -1  # first step seen this process session (for resume ETA)
 
     _PHASE_LABELS = {
         "extract_f0":      ("extract_f0",      "Computing mean F0s of target speakers..."),
@@ -149,6 +150,11 @@ async def _poll_beatrice_steps(
         for step, losses in sorted(merged.items()):
             elapsed_sec = losses.pop("elapsed_sec")
 
+            # First step seen this session — record it so ETA is relative to
+            # steps done this run (not total steps, which breaks on resume).
+            if _session_start_step < 0:
+                _session_start_step = step
+
             # Progress from DB step — no tqdm needed
             pct = int(100 * step / job.total_steps) if job.total_steps else 0
             job.progress_pct = pct
@@ -162,7 +168,9 @@ async def _poll_beatrice_steps(
 
             # Emit a human-readable Step N/M  Xs/it  ETA log every 100 steps
             if step - _last_log_step >= 100 and elapsed_sec:
-                secs_per_it = elapsed_sec / step if step > 0 else 0
+                steps_this_session = step - _session_start_step
+                secs_per_it = (elapsed_sec / steps_this_session
+                               if steps_this_session > 0 else 0)
                 remaining   = (job.total_steps - step) * secs_per_it
                 parts = [f"Step {step}/{job.total_steps}"]
                 if secs_per_it >= 1:
@@ -227,15 +235,22 @@ def _write_beatrice_config(
     # Read completed steps from the existing config.json if present.
     existing_config_path = os.path.join(out_dir, "config.json")
     completed_steps = 0
-    if os.path.exists(existing_config_path):
+    checkpoint_path = os.path.join(out_dir, "checkpoint_latest.pt.gz")
+    if os.path.exists(checkpoint_path):
         try:
-            with open(existing_config_path, encoding="utf-8") as _f:
-                _existing = json.load(_f)
-            # The checkpoint stores iteration count; config.json n_steps is the
-            # previous target. Use it as the completed count for the resume case.
-            completed_steps = int(_existing.get("n_steps", 0))
-        except (json.JSONDecodeError, ValueError, KeyError):
-            completed_steps = 0
+            import gzip as _gzip
+            import torch as _torch
+            with _gzip.open(checkpoint_path, "rb") as _f:
+                _ckpt = _torch.load(_f, map_location="cpu", weights_only=True)
+            completed_steps = int(_ckpt.get("iteration", 0))
+        except Exception:
+            # Fallback: read previous n_steps from config.json as a rough estimate
+            if os.path.exists(existing_config_path):
+                try:
+                    with open(existing_config_path, encoding="utf-8") as _f:
+                        completed_steps = int(json.load(_f).get("n_steps", 0))
+                except Exception:
+                    completed_steps = 0
 
     total_steps = completed_steps + n_steps if completed_steps > 0 else n_steps
 
@@ -271,7 +286,7 @@ def _write_beatrice_config(
     os.makedirs(out_dir, exist_ok=True)
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
-    return config_path
+    return config_path, total_steps
 
 
 # ---------------------------------------------------------------------------
@@ -397,21 +412,23 @@ async def _run_beatrice_pipeline(
     # ------------------------------------------------------------------
     # Phase 2: Write config
     # ------------------------------------------------------------------
-    config_path = _write_beatrice_config(
+    config_path, total_steps = _write_beatrice_config(
         out_dir=out_dir,
         project_root=project_root,
         n_steps=n_steps,
         batch_size=batch_size,
     )
-
-    job.phase = "train"
-    job.queue.put_nowait(
-        {"type": "phase", "message": "Starting Beatrice 2 trainer...", "phase": "train"}
-    )
+    # Update job with the real total (completed + requested) so progress/ETA
+    # are correct when resuming from a prior checkpoint.
+    job.total_steps = total_steps
 
     # ------------------------------------------------------------------
     # Phase 3: Training subprocess
     # ------------------------------------------------------------------
+    # Do NOT pre-announce "train" phase here — the subprocess writes
+    # phase.txt (extract_f0 → extract_feature → train) and the poller
+    # picks those up in order.  Emitting "train" now causes the UI to
+    # jump forward then snap back to extract_f0.
     env = dict(os.environ)
     env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"

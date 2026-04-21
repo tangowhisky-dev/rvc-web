@@ -738,8 +738,8 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
             <span style={{ color: pctColor(fmRaw, ema(fmRaw)) }}>{pctChange(fmRaw, ema(fmRaw))}</span>
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#f59e0b' }} />
-            <span style={{ color: '#f59e0b' }}>Disc</span>
+            <span className="inline-block w-3 h-0.5 rounded-full" style={{ backgroundColor: '#22d3ee' }} />
+            <span style={{ color: '#22d3ee' }}>Disc</span>
             <span className="text-zinc-400">{dRaw[dRaw.length - 1].toFixed(3)}</span>
             <span className="text-zinc-600 text-[9px] ml-1">≈ flat = healthy</span>
           </span>
@@ -756,7 +756,7 @@ function BeatriceStepChart({ points }: { points: BeatriceStepPoint[] }) {
             <Tooltip content={<B2Tooltip />} />
             <Line yAxisId="left"  type="monotone" dataKey="adv_raw" stroke="#a78bfa" strokeWidth={1.5} dot={false} isAnimationActive={false} />
             <Line yAxisId="left"  type="monotone" dataKey="fm_raw"  stroke="#fb923c" strokeWidth={1.5} dot={false} isAnimationActive={false} />
-            <Line yAxisId="right" type="monotone" dataKey="d_raw"   stroke="#f59e0b" strokeWidth={1.5} dot={false} isAnimationActive={false} />
+            <Line yAxisId="right" type="monotone" dataKey="d_raw"   stroke="#22d3ee" strokeWidth={1.5} dot={false} isAnimationActive={false} />
           </ComposedChart>
         </ResponsiveContainer>
       </div>
