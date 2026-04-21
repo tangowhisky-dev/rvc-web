@@ -3168,7 +3168,7 @@ def compute_mean_f0(
     sum_log_f0 = 0.0
     n_frames = 0
     for file in files:
-        wav, sr = torchaudio.load(file, backend="soundfile")
+        wav, sr = torchaudio.load(file)
         if method == "dio":
             f0, _ = pyworld.dio(wav.ravel().numpy().astype(np.float64), sr)
         elif method == "harvest":
@@ -3302,7 +3302,7 @@ def get_noise(
     while current_length < n_samples:
         idx_files = torch.randint(0, len(files), ())
         file = files[idx_files]
-        wav, sr = torchaudio.load(file, backend="soundfile")
+        wav, sr = torchaudio.load(file)
         assert wav.size(0) == 1
         augmented_sample_rate = int(
             round(
@@ -3378,7 +3378,7 @@ def augment_audio(
     # clean, noise にリバーブをかける
     if torch.rand(()) < reverb_probability:
         ir_file = ir_files[torch.randint(0, len(ir_files), ())]
-        ir, sr = torchaudio.load(ir_file, backend="soundfile")
+        ir, sr = torchaudio.load(ir_file)
         assert ir.size() == (2, sr), ir.size()
         assert sr == sample_rate, (sr, sample_rate)
         signals = convolve(signals, ir)
@@ -3466,7 +3466,7 @@ class WavDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
         file, speaker_id = self.audio_files[index]
-        clean_wav, sample_rate = torchaudio.load(file, backend="soundfile")
+        clean_wav, sample_rate = torchaudio.load(file)
         if clean_wav.size(0) != 1:
             ch = torch.randint(0, clean_wav.size(0), ())
             clean_wav = clean_wav[ch : ch + 1]
@@ -3938,7 +3938,7 @@ def prepare_training():
 
     def wav_iterator(files):
         for file in files:
-            wav, sr = torchaudio.load(file, backend="soundfile")
+            wav, sr = torchaudio.load(file)
             wav = wav.to(device)
             if sr != h.in_sample_rate:
                 wav = get_resampler(sr, h.in_sample_rate, device)(wav)
@@ -4312,7 +4312,7 @@ if __name__ == "__main__" and writer is not None:
                     for i, ((file, target_ids), pitch_shift_semitones) in enumerate(
                         zip(test_filelist, test_pitch_shifts)
                     ):
-                        source_wav, sr = torchaudio.load(file, backend="soundfile")
+                        source_wav, sr = torchaudio.load(file)
                         source_wav = source_wav.to(device)
                         if sr != h.in_sample_rate:
                             source_wav = get_resampler(sr, h.in_sample_rate, device)(
