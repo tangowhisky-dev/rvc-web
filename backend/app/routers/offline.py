@@ -32,6 +32,8 @@ from pydantic import BaseModel
 
 from backend.app.db import get_db
 from backend.app.routers.profiles import ProfileOut
+import aiosqlite
+from backend.app import db
 
 # MIME types for common audio formats
 _AUDIO_MIME = {
@@ -505,6 +507,8 @@ async def convert_audio(
     audio_bytes = await file.read()
     orig_filename = file.filename or "input.wav"
     orig_ext = os.path.splitext(orig_filename)[1].lower() or ".wav"
+    # Always output WAV to preserve full quality regardless of input format.
+    out_ext = ".wav"
 
     try:
         buf = io.BytesIO(audio_bytes)
@@ -534,7 +538,7 @@ async def convert_audio(
     with open(in_path, "wb") as _f:
         _f.write(audio_bytes)
 
-    _jobs[job_id] = {"status": "running", "input_path": in_path}
+    _jobs[job_id] = {"status": "running", "input_path": in_path, "profile_id": profile_id}
 
     import json as _json
 
@@ -576,14 +580,15 @@ async def convert_audio(
                         result = result * (0.95 / peak)
                     _progress(0.9)
                     tgt_sr = engine.OUT_SR
-                    out_path = _output_path(job_id, orig_ext)
-                    _write_audio(out_path, result, tgt_sr, orig_ext)
+                    out_path = _output_path(job_id, out_ext)
+                    _write_audio(out_path, result, tgt_sr, out_ext)
                     _jobs[job_id] = {
                         "status": "done",
                         "input_path": in_path,
                         "result_path": out_path,
                         "sample_rate": tgt_sr,
                         "orig_filename": orig_filename,
+                        "pipeline": "beatrice2",
                     }
                     loop.call_soon_threadsafe(progress_queue.put_nowait, "done")
                 except Exception as exc:
@@ -609,14 +614,15 @@ async def convert_audio(
                         sola_crossfade_ms=sola_crossfade_ms,
                     )
                     # Write result to temp file preserving original format
-                    out_path = _output_path(job_id, orig_ext)
-                    _write_audio(out_path, result_audio, tgt_sr, orig_ext)
+                    out_path = _output_path(job_id, out_ext)
+                    _write_audio(out_path, result_audio, tgt_sr, out_ext)
                     _jobs[job_id] = {
                         "status": "done",
                         "input_path": in_path,
                         "result_path": out_path,
                         "sample_rate": tgt_sr,
                         "orig_filename": orig_filename,
+                        "pipeline": "rvc",
                     }
                     loop.call_soon_threadsafe(progress_queue.put_nowait, "done")
                 except Exception as exc:
@@ -675,7 +681,8 @@ async def download_result(job_id: str):
     orig = job.get("orig_filename", "output.wav")
     stem = os.path.splitext(orig)[0]
     ext = os.path.splitext(result_path)[1].lower() or ".wav"
-    download_name = f"{stem}_rvc{ext}"
+    suffix = "_b2" if job.get("pipeline") == "beatrice2" else "_rvc"
+    download_name = f"{stem}{suffix}{ext}"
     mime = _AUDIO_MIME.get(ext, "application/octet-stream")
 
     return FileResponse(
@@ -706,9 +713,20 @@ async def stream_input(job_id: str):
     return FileResponse(in_path, media_type=mime, headers={"Cache-Control": "no-cache"})
 
 
-# ---------------------------------------------------------------------------
-# ECAPA analysis on already-converted job
-# ---------------------------------------------------------------------------
+@router.get("/reference/{job_id}")
+async def stream_reference(job_id: str):
+    """Stream the profile reference audio for a completed job (for waveform preview)."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    ref_path = job.get("ref_path")
+    if not ref_path or not os.path.exists(ref_path):
+        raise HTTPException(status_code=404, detail="Reference audio not available")
+
+    ext = os.path.splitext(ref_path)[1].lower() or ".wav"
+    mime = _AUDIO_MIME.get(ext, "audio/wav")
+    return FileResponse(ref_path, media_type=mime, headers={"Cache-Control": "no-cache"})
 
 class _AnalyzeJobResponse(dict):
     pass
@@ -718,7 +736,8 @@ class _AnalyzeJobResponse(dict):
 async def analyze_job(job_id: str):
     """Run ECAPA-TDNN speaker-embedding comparison on a completed job.
 
-    Both input and output files are already on disk in temp/ — no upload needed.
+    File A = profile reference audio (first cleaned audio file, or sample_path fallback).
+    File B = converted output file.
     Returns CompareResponse-shaped JSON.
     """
     from backend.app.voice_analysis import analyze_pair
@@ -729,18 +748,56 @@ async def analyze_job(job_id: str):
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail=f"Job not done (status: {job['status']})")
 
-    in_path = job.get("input_path")
     out_path = job.get("result_path")
-
-    if not in_path or not os.path.exists(in_path):
-        raise HTTPException(status_code=404, detail="Input temp file not found or expired")
     if not out_path or not os.path.exists(out_path):
         raise HTTPException(status_code=404, detail="Output temp file not found or expired")
+
+    # Resolve reference audio from profile
+    profile_id = job.get("profile_id")
+    ref_path: Optional[str] = None
+    if profile_id:
+        async with aiosqlite.connect(db.DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            # Prefer a cleaned audio file
+            cursor = await conn.execute(
+                "SELECT file_path FROM audio_files WHERE profile_id = ? AND is_cleaned = 1 ORDER BY created_at ASC LIMIT 1",
+                (profile_id,),
+            )
+            row = await cursor.fetchone()
+            if row and os.path.exists(row["file_path"]):
+                ref_path = row["file_path"]
+            else:
+                # Fallback: any audio file for this profile
+                cursor = await conn.execute(
+                    "SELECT file_path FROM audio_files WHERE profile_id = ? ORDER BY created_at ASC LIMIT 1",
+                    (profile_id,),
+                )
+                row = await cursor.fetchone()
+                if row and os.path.exists(row["file_path"]):
+                    ref_path = row["file_path"]
+                else:
+                    # Last resort: sample_path on profile row
+                    cursor = await conn.execute(
+                        "SELECT sample_path FROM profiles WHERE id = ?",
+                        (profile_id,),
+                    )
+                    row = await cursor.fetchone()
+                    if row and row["sample_path"] and os.path.exists(row["sample_path"]):
+                        ref_path = row["sample_path"]
+
+    if not ref_path:
+        raise HTTPException(
+            status_code=404,
+            detail="No reference audio found for this profile. Upload training audio first.",
+        )
+
+    # Cache for waveform preview endpoint
+    job["ref_path"] = ref_path
 
     device = os.environ.get("RVC_DEVICE", "cpu")
 
     try:
-        result = analyze_pair(path_a=in_path, path_b=out_path, device=device)
+        result = analyze_pair(path_a=ref_path, path_b=out_path, device=device)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:

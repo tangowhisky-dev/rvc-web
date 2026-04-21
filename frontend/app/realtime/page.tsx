@@ -179,8 +179,8 @@ export default function RealtimePage() {
     // Ask backend for the user's Downloads directory as default
     fetch(`${API}/api/realtime/default-save-dir`)
       .then((r) => r.json())
-      .then((d) => setSavePath(d.path + '/rvc_output.mp3'))
-      .catch(() => setSavePath('~/Documents/audio/rvc_output.mp3'));
+      .then((d) => setSavePath(d.path + '/rvc_output.wav'))
+      .catch(() => setSavePath('~/Documents/audio/rvc_output.wav'));
   }, []);
 
   // The backend default-save-dir endpoint returns a full absolute path, so savePath
@@ -842,7 +842,7 @@ export default function RealtimePage() {
                     value={expandedSavePath}
                     disabled={isBusy || isActive}
                     onChange={(e) => setSavePath(e.target.value)}
-                    placeholder="/Users/tango16/Documents/audio/rvc_output.mp3"
+                    placeholder="/Users/tango16/Documents/audio/rvc_output.wav"
                     className="w-full bg-zinc-900 border border-zinc-700 rounded-md px-3 py-1.5
                                text-[12px] font-mono text-zinc-200 focus:outline-none
                                focus:border-cyan-600 disabled:opacity-40 disabled:cursor-not-allowed

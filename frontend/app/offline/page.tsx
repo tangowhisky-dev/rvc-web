@@ -540,7 +540,7 @@ export default function OfflinePage() {
 
   function goToAnalysis() {
     if (!jobId) return;
-    router.push(`/analysis?from=offline&job_id=${jobId}`);
+    router.push(`/analysis?from=offline&job_id=${jobId}&profile_id=${profileId}`);
   }
 
   const selectedProfile = profiles.find(p => p.id === profileId);
@@ -812,7 +812,7 @@ export default function OfflinePage() {
                 bg-violet-700/40 border border-violet-600/50 text-violet-300
                 hover:bg-violet-700/60 hover:border-violet-500/70 hover:text-violet-200 transition-all"
             >
-              <span>Run Analysis</span>
+              <span>Compare Output with Reference Audio</span>
               <span className="text-[14px]">→</span>
             </button>
           </div>

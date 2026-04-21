@@ -199,19 +199,14 @@ def _save_thread(audio_q: queue.Queue, save_path: str, sr: int,
         if peak > 1.0:
             pcm /= peak
 
-        from pydub import AudioSegment  # noqa: PLC0415
-        pcm_int16 = (pcm * 32767).clip(-32768, 32767).astype(np.int16)
-        seg = AudioSegment(
-            pcm_int16.tobytes(),
-            frame_rate=sr,
-            sample_width=2,
-            channels=1,
-        )
+        import soundfile as _sf
         parent_dir = os.path.dirname(os.path.abspath(save_path))
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
-        seg.export(save_path, format="mp3", bitrate="128k")
-        evt_q.put({"event": "save_complete", "path": save_path,
+        # Force .wav extension regardless of what save_path says
+        wav_path = os.path.splitext(save_path)[0] + ".wav"
+        _sf.write(wav_path, pcm, sr, format="WAV", subtype="PCM_16")
+        evt_q.put({"event": "save_complete", "path": wav_path,
                    "duration_s": round(total_samples / sr, 2)})
 
     except Exception as exc:

@@ -395,12 +395,17 @@ function AnalysisPageInner() {
   const searchParams = useSearchParams();
   const fromOffline = searchParams.get('from') === 'offline';
   const jobId       = searchParams.get('job_id');
+  const offlineProfileId = searchParams.get('profile_id');
 
   // Server-side refs — used for waveform URLs and analysis calls
   const [refA, setRefA] = useState<string | null>(null);  // analysis upload ref
   const [refB, setRefB] = useState<string | null>(null);
-  const [labelA, setLabelA] = useState('File A — Source / Input');
-  const [labelB, setLabelB] = useState('File B — Converted / Output');
+  const [labelA, setLabelA] = useState(
+    fromOffline ? 'File A — Reference (Training Audio)' : 'File A — Source / Input'
+  );
+  const [labelB, setLabelB] = useState(
+    fromOffline ? 'File B — Converted Output' : 'File B — Converted / Output'
+  );
 
   // Duration state (loaded from Audio element after URL is set)
   const [durA, setDurA] = useState(0);
@@ -417,7 +422,7 @@ function AnalysisPageInner() {
   // Waveform URLs — constructed from refs or job_id
   const urlA = refA
     ? `${API}/api/analysis/audio/${refA}?slot=a`
-    : (jobId ? `${API}/api/offline/input/${jobId}` : null);
+    : (jobId && fromOffline ? `${API}/api/offline/reference/${jobId}` : null);
 
   const urlB = refB
     ? `${API}/api/analysis/audio/${refB}?slot=b`
