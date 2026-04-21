@@ -42,6 +42,7 @@ wmic process where "commandline like '%train.py%'" delete >nul 2^&1
 wmic process where "commandline like '%extract_f0_print%'" delete >nul 2^&1
 wmic process where "commandline like '%extract_feature_print%'" delete >nul 2^&1
 wmic process where "commandline like '%preprocess.py%'" delete >nul 2^&1
+wmic process where "commandline like '%beatrice_trainer%'" delete >nul 2^&1
 
 REM ---------------------------------------------------------------------------
 REM 5. Clean up PID files
