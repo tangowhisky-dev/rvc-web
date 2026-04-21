@@ -437,16 +437,16 @@ def prepare_training():
     quality_tester = QualityTester().eval().to(device)
     if skip_training:
         writer = None
-    else:
+    elif h.record_metrics:
         writer = SummaryWriter(out_dir, flush_secs=10)
-        if not h.record_metrics:
-            writer.add_scalar = lambda *args, **kwargs: None
-            writer.add_histogram = lambda *args, **kwargs: None
         writer.add_text(
             "log",
             f"start training w/ {torch.cuda.get_device_name(device) if torch.cuda.is_available() else str(device)}.",
             initial_iteration,
         )
+    else:
+        # record_metrics=False — no TensorBoard writer, no tfevents file created.
+        writer = None
     if not resume:
         with open(out_dir / "config.json", "w", encoding="utf-8") as f:
             json.dump(dict(h), f, indent=4)
@@ -692,9 +692,11 @@ def _run_main():
                     if vals
                 }
                 for name, avg in scalar_avgs.items():
-                    writer.add_scalar(name, avg, iteration + 1)
+                    if writer is not None:
+                        writer.add_scalar(name, avg, iteration + 1)
                     dict_scalars[name].clear()
-                writer.flush()
+                if writer is not None:
+                    writer.flush()
 
                 # Write step losses directly to DB — same pattern as RVC's TrainingDBWriter
                 _db_writer.insert_step_loss(iteration + 1, {
@@ -879,12 +881,14 @@ def _run_main():
                     if len(values)
                 }
                 for metric_name, value in dict_qualities.items():
-                    writer.add_scalar(f"validation/{metric_name}", value, iteration + 1)
+                    if writer is not None:
+                        writer.add_scalar(f"validation/{metric_name}", value, iteration + 1)
                 for metric_name, values in dict_qualities_all.items():
                     for i, value in enumerate(values):
-                        writer.add_scalar(
-                            f"~validation_{metric_name}/{i:03d}", value, iteration + 1
-                        )
+                        if writer is not None:
+                            writer.add_scalar(
+                                f"~validation_{metric_name}/{i:03d}", value, iteration + 1
+                            )
 
                 # Write UTMOS to DB and track best step — checkpoint copied in save block below
                 _utmos_now = dict_qualities.get("utmos")
