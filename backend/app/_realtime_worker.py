@@ -67,7 +67,9 @@ _SR_16K = 16000
 _SR_48K = 48000
 _WINDOW = 160              # HuBERT/RMVPE hop size in samples at 16kHz
 _BLOCK_48K = 9600          # 200ms output block at 48kHz (matches offline; better gate hold coverage)
-_EXTRA_TIME = 2.0          # seconds of historical context fed to the model
+_EXTRA_TIME = 2.0          # seconds of historical context fed to the model (RVC — HuBERT needs it)
+_EXTRA_TIME_B2 = 0.5       # Beatrice 2: causal conv + local attention; 0.5s is sufficient.
+                           # 0.3s is likely fine too — see docs/beatrice2-realtime-pipeline.md
 _ZC = _SR_48K // 100       # zero-crossing unit = 10ms at 48kHz = 480 samples
 _SOLA_BUF_MS_DEFAULT = 20  # ms — default SOLA crossfade buffer length (configurable at runtime)
 _SOLA_SEARCH_48K = _ZC     # 10ms search window for best alignment offset (fixed)
@@ -253,7 +255,13 @@ def _run_beatrice2_realtime(
     sola_buf    = block_params["sola_buf_48k"]  # SOLA overlap in 48k samples
 
     _BLOCK_48K_LOCAL = int(block_params["block_48k"])
-    _EXTRA_48K       = int(_EXTRA_TIME * _SR_48K)  # history context in 48k samples
+    _EXTRA_48K       = int(_EXTRA_TIME_B2 * _SR_48K)  # match B2 context window, not RVC's 2.0s
+
+    # Pre-build resamplers — reused every callback, not reconstructed each time
+    import torch as _torch
+    from torchaudio.transforms import Resample as _R
+    _resamp_48_16 = _R(orig_freq=48000, new_freq=16000)
+    _resamp_b2_48 = _R(orig_freq=tgt_sr, new_freq=48000)
 
     # Rolling RMS estimation
     _ewma_alpha = 0.05
@@ -263,7 +271,6 @@ def _run_beatrice2_realtime(
     _rms_window  = collections.deque(maxlen=3)
 
     # SOLA state
-    import torch as _torch
     sola_buffer = _torch.zeros(sola_buf, dtype=_torch.float32)
     input_buffer_16k = np.zeros(extra_16k + block_16k, dtype=np.float32)
     input_buffer_48k = np.zeros(_EXTRA_48K + _BLOCK_48K_LOCAL, dtype=np.float32)
@@ -309,9 +316,8 @@ def _run_beatrice2_realtime(
             denoised = input_48k
 
         # ---- Resample 48k → 16k ----
-        from torchaudio.transforms import Resample as _R
         t_in = _torch.from_numpy(denoised).unsqueeze(0)
-        t_16k = _R(orig_freq=48000, new_freq=16000)(t_in).squeeze(0)
+        t_16k = _resamp_48_16(t_in).squeeze(0)
         block_new_16k = t_16k.numpy()
 
         input_buffer_16k = np.roll(input_buffer_16k, -block_16k)
@@ -339,7 +345,7 @@ def _run_beatrice2_realtime(
 
         # ---- Resample to 48k ----
         t_out = _torch.from_numpy(converted).unsqueeze(0)
-        t_48k = _R(orig_freq=tgt_sr, new_freq=48000)(t_out).squeeze(0)
+        t_48k = _resamp_b2_48(t_out).squeeze(0)
         out_full_48k = t_48k.numpy()
 
         # The engine processed the full history window; take only the tail
@@ -526,6 +532,7 @@ def run_worker(
             tgt_sr = _B2_OUT_SR
 
             block_params = _compute_block_params(_BLOCK_48K, tgt_sr=tgt_sr,
+                                                 extra_time=_EXTRA_TIME_B2,
                                                  sola_buf_ms=sola_crossfade_ms)
 
             # Use the same SOLA/gate/RMS machinery but swap out the infer step
