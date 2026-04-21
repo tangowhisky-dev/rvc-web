@@ -867,14 +867,17 @@ def _run_main():
                         quality = quality_tester.test(converted, source_wav)
                         for metric_name, values in quality.items():
                             dict_qualities_all[metric_name].extend(values)
-                assert n_added_wavs == min(
-                    12, len(test_filelist) * len(test_filelist[0][1])
-                ), (
-                    n_added_wavs,
-                    len(test_filelist),
-                    len(speakers),
-                    len(test_filelist[0][1]),
-                )
+                # Only assert audio was added when writer is active (record_metrics=True).
+                # When writer=None, n_added_wavs stays 0 and the assertion would fail.
+                if writer is not None:
+                    assert n_added_wavs == min(
+                        12, len(test_filelist) * len(test_filelist[0][1])
+                    ), (
+                        n_added_wavs,
+                        len(test_filelist),
+                        len(speakers),
+                        len(test_filelist[0][1]),
+                    )
                 dict_qualities = {
                     metric_name: sum(values) / len(values)
                     for metric_name, values in dict_qualities_all.items()
