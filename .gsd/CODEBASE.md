@@ -1,7 +1,7 @@
 # Codebase Map
 
-Generated: 2026-04-21T05:33:47Z | Files: 236 | Described: 0/236
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-21T05:33:47Z","fingerprint":"86a80865f12b42d3ccb42d49b8974ad1cef4a7d2","fileCount":236,"truncated":false} -->
+Generated: 2026-04-21T05:41:18Z | Files: 237 | Described: 0/237
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-21T05:41:18Z","fingerprint":"8a2ad0b8ab204fcd41f90f40d490a7f9293f18a7","fileCount":237,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
@@ -366,3 +366,4 @@ Generated: 2026-04-21T05:33:47Z | Files: 236 | Described: 0/236
 ### old_beatrice/
 - `old_beatrice/__init__.py`
 - `old_beatrice/__main__.py`
+- `old_beatrice/convert.py`

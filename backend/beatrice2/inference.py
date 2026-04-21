@@ -57,17 +57,25 @@ class BeatriceInferenceEngine:
         n_speakers = h.get("n_speakers", 1)
         pitch_bins = h.get("pitch_bins", 448)
         hidden_channels = h.get("hidden_channels", 256)
+        vq_topk = h.get("vq_topk", 4)
+        phone_noise_ratio = h.get("phone_noise_ratio", 0.5)
+        floor_noise_level = h.get("floor_noise_level", 1e-3)
 
         self.phone_extractor = PhoneExtractor()
         self.pitch_estimator = PitchEstimator()
 
-        # ConverterNetwork needs architectural hyperparams from h
+        # ConverterNetwork: pass all architectural hyperparams from h so the
+        # model matches the trained configuration exactly.
         self.net_g = ConverterNetwork(
             phone_extractor=self.phone_extractor,
             pitch_estimator=self.pitch_estimator,
             n_speakers=n_speakers,
             pitch_bins=pitch_bins,
             hidden_channels=hidden_channels,
+            vq_topk=vq_topk,
+            training_time_vq="none",
+            phone_noise_ratio=phone_noise_ratio,
+            floor_noise_level=floor_noise_level,
         )
 
         # Load weights
@@ -80,7 +88,7 @@ class BeatriceInferenceEngine:
                 checkpoint["pitch_estimator"]
             )
         if "net_g" in checkpoint:
-            self.net_g.load_state_dict(checkpoint["net_g"], strict=False)
+            self.net_g.load_state_dict(checkpoint["net_g"], strict=True)
 
         # Move to device and set eval
         self.phone_extractor = (
@@ -90,6 +98,10 @@ class BeatriceInferenceEngine:
             self.pitch_estimator.to(self._device).eval().requires_grad_(False)
         )
         self.net_g = self.net_g.to(self._device).eval().requires_grad_(False)
+
+        # Install VQ hook so phone_extractor.head output is routed through
+        # the VQ codebooks at inference time (same as during training eval).
+        self.net_g.enable_hook()
 
         # Cache hyperparams
         self._in_sample_rate: int = checkpoint.get("in_sample_rate", self.IN_SR)
