@@ -314,7 +314,7 @@ function EmbeddingCharts({ result }: { result: AnalysisResult }) {
             <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
             <XAxis dataKey="dim" type="number" domain={[1, dimCount]} tick={{ fontSize: 9, fill: '#71717a' }}
               label={{ value: 'Dimension', position: 'bottom', offset: 0, fontSize: 10, fill: '#a1a1aa' }} />
-            <YAxis domain={[-0.5, 0.5]} tick={{ fontSize: 9, fill: '#71717a' }} tickFormatter={(v: number) => v.toFixed(1)}
+            <YAxis domain={[-0.5, 0.5]} ticks={[-0.5, -0.4, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.4, 0.5]} tick={{ fontSize: 9, fill: '#71717a' }} tickFormatter={(v: number) => v.toFixed(1)}
               label={{ value: 'Difference', angle: -90, position: 'insideLeft', style: { textAnchor: 'middle' }, fontSize: 10, fill: '#a1a1aa' }} />
             <RechartsTooltip {...tooltip} formatter={(v: any) => typeof v === 'number' ? v.toFixed(4) : v} />
             <Bar dataKey="diff" barSize={2} isAnimationActive={false}>
