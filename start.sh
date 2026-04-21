@@ -295,7 +295,16 @@ if [ ! -d "frontend/node_modules" ]; then
   echo "[start] Installing frontend dependencies..."
   (cd frontend && pnpm install)
 fi
-(cd frontend && pnpm dev) &
+
+# Extract hostname from NEXT_PUBLIC_API_URL (strip http:// and :8000)
+# Pass it to Next.js so the dev server treats it as its canonical origin —
+# prevents "Cross origin request detected" warnings when accessing via LAN IP.
+_NEXT_HOSTNAME=$(echo "$NEXT_PUBLIC_API_URL" | sed 's|http://||' | sed 's|:8000||')
+if [ "$_NEXT_HOSTNAME" = "localhost" ]; then
+  (cd frontend && pnpm dev) &
+else
+  (cd frontend && pnpm dev --hostname "$_NEXT_HOSTNAME") &
+fi
 FRONTEND_PID=$!
 echo "$FRONTEND_PID" > .pids/frontend.pid
 echo "[start] Frontend PID $FRONTEND_PID"
