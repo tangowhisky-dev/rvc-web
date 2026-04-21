@@ -251,28 +251,27 @@ def analyze_conversion(
     # 6. Summary text
     if improvement > 0.1:
         verdict = (
-            f"✅ Excellent voice conversion! The output voice is {sim_profile_output:.0%} "
-            f"similar to the target profile, up from {sim_profile_input:.0%} in the input. "
-            f"This is a {improvement_pct:.0f}% improvement in speaker similarity."
+            f"✅ Strong conversion — output is {sim_profile_output:.0%} similar to target "
+            f"(up from {sim_profile_input:.0%}, +{improvement_pct:.0f}%). "
+            f"{quality_label(sim_profile_output)}."
         )
     elif improvement > 0.0:
         verdict = (
-            f"👍 Good voice conversion. The output voice is {sim_profile_output:.0%} "
-            f"similar to the target profile, slightly better than the input's "
-            f"{sim_profile_input:.0%} similarity."
+            f"👍 Modest improvement — output is {sim_profile_output:.0%} similar to target "
+            f"(source was {sim_profile_input:.0%}). "
+            f"{quality_label(sim_profile_output)}."
         )
     elif improvement > -0.1:
         verdict = (
-            f"⚠️ Moderate conversion. The output voice is {sim_profile_output:.0%} "
-            f"similar to the target profile, close to the input's "
-            f"{sim_profile_input:.0%} similarity. The voice character hasn't "
-            f"changed significantly."
+            f"⚠️ Negligible change — output {sim_profile_output:.0%} vs source "
+            f"{sim_profile_input:.0%}. Voice character hasn't shifted significantly. "
+            f"{quality_label(sim_profile_output)}."
         )
     else:
         verdict = (
-            f"❌ Poor conversion. The output voice ({sim_profile_output:.0%} similarity) "
-            f"is actually less similar to the target than the input "
-            f"({sim_profile_input:.0%}). Try adjusting index_rate or retraining."
+            f"❌ Weak conversion — output ({sim_profile_output:.0%}, "
+            f"{quality_label(sim_profile_output)}) is less similar to target than "
+            f"source ({sim_profile_input:.0%}). Try adjusting index_rate or retraining."
         )
 
     return {
@@ -371,31 +370,39 @@ def analyze_pair(
         if improvement > 0.1:
             summary = (
                 f"✅ Strong conversion — output is {sim_pb:.0%} similar to target "
-                f"(up from {sim_pa:.0%}, +{improvement_pct:.0f}%)."
+                f"(up from {sim_pa:.0%}, +{improvement_pct:.0f}%). {quality_label(sim_pb)}."
             )
         elif improvement > 0.0:
             summary = (
-                f"👍 Good conversion — output is {sim_pb:.0%} similar to target "
-                f"(source was {sim_pa:.0%})."
+                f"👍 Modest improvement — output is {sim_pb:.0%} similar to target "
+                f"(source was {sim_pa:.0%}). {quality_label(sim_pb)}."
             )
         elif improvement > -0.1:
             summary = (
-                f"⚠️ Moderate conversion — output {sim_pb:.0%} vs source {sim_pa:.0%}. "
-                f"Voice character hasn't changed significantly."
+                f"⚠️ Negligible change — output {sim_pb:.0%} vs source {sim_pa:.0%}. "
+                f"Voice character hasn't shifted significantly. {quality_label(sim_pb)}."
             )
         else:
             summary = (
-                f"❌ Weak conversion — output ({sim_pb:.0%}) is less similar to target "
-                f"than source ({sim_pa:.0%}). Try adjusting index_rate or retraining."
+                f"❌ Weak conversion — output ({sim_pb:.0%}, {quality_label(sim_pb)}) is less "
+                f"similar to target than source ({sim_pa:.0%}). "
+                f"Try adjusting index_rate or retraining."
             )
     else:
         pct = round(sim_ab * 100)
-        if pct > 85:
-            summary = f"🔊 Files are very similar speakers ({pct}% similarity)."
-        elif pct > 65:
-            summary = f"🔊 Files share moderate speaker characteristics ({pct}% similarity)."
+        tier = quality_label(sim_ab)
+        if pct >= 80:
+            summary = f"✅ Excellent match — files are very likely the same speaker ({pct}% similarity)."
+        elif pct >= 70:
+            summary = f"👍 Very good match — strong speaker similarity ({pct}%)."
+        elif pct >= 60:
+            summary = f"🔊 Good match — recognisable speaker similarity ({pct}%)."
+        elif pct >= 50:
+            summary = f"⚠️ Moderate match — partial speaker similarity ({pct}%). Audible differences present."
+        elif pct >= 40:
+            summary = f"⚠️ Poor match — low speaker similarity ({pct}%). Significant voice character difference."
         else:
-            summary = f"🔊 Files are from different speakers ({pct}% similarity)."
+            summary = f"❌ Very poor match — files are likely different speakers ({pct}% similarity)."
 
     return {
         "ab_similarity": round(sim_ab, 4),
