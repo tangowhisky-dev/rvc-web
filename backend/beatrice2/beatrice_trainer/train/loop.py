@@ -948,101 +948,74 @@ def _run_main():
                 elif (iteration + 1) <= 1000:
                     shutil.copy(checkpoint_file_save, best_path)
 
-                # 推論用
-                paraphernalia_dir = out_dir / f"paraphernalia_{name}"
-                if paraphernalia_dir.exists():
-                    paraphernalia_dir = paraphernalia_dir.with_name(
-                        f"{paraphernalia_dir.name}_{hash(None):x}"
-                    )
-                paraphernalia_dir.mkdir()
-                phone_extractor_fp16 = PhoneExtractor()
-                phone_extractor_fp16.load_state_dict(phone_extractor.state_dict())
-                phone_extractor_fp16.remove_weight_norm()
-                phone_extractor_fp16.merge_weights()
-                phone_extractor_fp16.half()
-                phone_extractor_fp16.dump(paraphernalia_dir / "phone_extractor.bin")
-                del phone_extractor_fp16
-                pitch_estimator_fp16 = PitchEstimator()
-                pitch_estimator_fp16.load_state_dict(pitch_estimator.state_dict())
-                pitch_estimator_fp16.merge_weights()
-                pitch_estimator_fp16.half()
-                pitch_estimator_fp16.dump(paraphernalia_dir / "pitch_estimator.bin")
-                del pitch_estimator_fp16
-                net_g_fp16 = ConverterNetwork(
-                    nn.Module(),
-                    nn.Module(),
-                    len(speakers),
-                    h.pitch_bins,
-                    h.hidden_channels,
-                    h.vq_topk,
-                    h.training_time_vq,
-                    h.phone_noise_ratio,
-                    h.floor_noise_level,
-                )
-                net_g_fp16.load_state_dict(net_g.state_dict())
-                net_g_fp16.merge_weights()
-                net_g_fp16.half()
-                net_g_fp16.dump(paraphernalia_dir / "waveform_generator.bin")
-                net_g_fp16.dump_speaker_embeddings(
-                    paraphernalia_dir / "speaker_embeddings.bin"
-                )
-                net_g_fp16.dump_embedding_setter(
-                    paraphernalia_dir / "embedding_setter.bin"
-                )
-                del net_g_fp16
-                _noimage_src = repo_root() / "assets/images/noimage.png"
-                if not _noimage_src.exists():
-                    _noimage_src.parent.mkdir(parents=True, exist_ok=True)
-                    # Create a minimal 1x1 white PNG (no external deps needed)
-                    import struct, zlib
-                    def _make_1x1_png():
-                        def chunk(name, data):
-                            c = struct.pack(">I", len(data)) + name + data
-                            return c + struct.pack(">I", zlib.crc32(name + data) & 0xFFFFFFFF)
-                        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
-                        idat = zlib.compress(b"\x00\xFF\xFF\xFF")
-                        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
-                    _noimage_src.write_bytes(_make_1x1_png())
-                shutil.copy(
-                    _noimage_src, paraphernalia_dir
-                )
-                with open(
-                    paraphernalia_dir / f"beatrice_paraphernalia_{name}.toml",
-                    "w",
-                    encoding="utf-8",
-                ) as f:
-                    f.write(
-                        f'''[model]
-    version = "{PARAPHERNALIA_VERSION}"
-    name = "{name}"
-    description = """
-    No description for this model.
-    このモデルの説明はありません。
-    """
-    '''
-                    )
-                    for speaker_id, (speaker, speaker_f0) in enumerate(
-                        zip(speakers, speaker_f0s)
-                    ):
-                        average_pitch = 69.0 + 12.0 * math.log2(speaker_f0 / 440.0)
-                        average_pitch = round(average_pitch * 8.0) / 8.0
-                        f.write(
-                            f'''
-    [voice.{speaker_id}]
-    name = "{speaker}"
-    description = """
-    No description for this voice.
-    この声の説明はありません。
-    """
-    average_pitch = {average_pitch}
+                # Delete the numbered checkpoint — we only need latest and best.
+                checkpoint_file_save.unlink(missing_ok=True)
 
-    [voice.{speaker_id}.portrait]
-    path = "noimage.png"
-    description = """
-    """
-    '''
-                        )
-                del paraphernalia_dir
+                # --- paraphernalia (.bin format for original Beatrice app) ---
+                # Not needed by rvc-web inference which loads .pt.gz directly.
+                # Commented out to avoid wasted I/O and disk space.
+                #
+                # paraphernalia_dir = out_dir / f"paraphernalia_{name}"
+                # if paraphernalia_dir.exists():
+                #     paraphernalia_dir = paraphernalia_dir.with_name(
+                #         f"{paraphernalia_dir.name}_{hash(None):x}"
+                #     )
+                # paraphernalia_dir.mkdir()
+                # phone_extractor_fp16 = PhoneExtractor()
+                # phone_extractor_fp16.load_state_dict(phone_extractor.state_dict())
+                # phone_extractor_fp16.remove_weight_norm()
+                # phone_extractor_fp16.merge_weights()
+                # phone_extractor_fp16.half()
+                # phone_extractor_fp16.dump(paraphernalia_dir / "phone_extractor.bin")
+                # del phone_extractor_fp16
+                # pitch_estimator_fp16 = PitchEstimator()
+                # pitch_estimator_fp16.load_state_dict(pitch_estimator.state_dict())
+                # pitch_estimator_fp16.merge_weights()
+                # pitch_estimator_fp16.half()
+                # pitch_estimator_fp16.dump(paraphernalia_dir / "pitch_estimator.bin")
+                # del pitch_estimator_fp16
+                # net_g_fp16 = ConverterNetwork(
+                #     nn.Module(),
+                #     nn.Module(),
+                #     len(speakers),
+                #     h.pitch_bins,
+                #     h.hidden_channels,
+                #     h.vq_topk,
+                #     h.training_time_vq,
+                #     h.phone_noise_ratio,
+                #     h.floor_noise_level,
+                # )
+                # net_g_fp16.load_state_dict(net_g.state_dict())
+                # net_g_fp16.merge_weights()
+                # net_g_fp16.half()
+                # net_g_fp16.dump(paraphernalia_dir / "waveform_generator.bin")
+                # net_g_fp16.dump_speaker_embeddings(
+                #     paraphernalia_dir / "speaker_embeddings.bin"
+                # )
+                # net_g_fp16.dump_embedding_setter(
+                #     paraphernalia_dir / "embedding_setter.bin"
+                # )
+                # del net_g_fp16
+                # _noimage_src = repo_root() / "assets/images/noimage.png"
+                # if not _noimage_src.exists():
+                #     _noimage_src.parent.mkdir(parents=True, exist_ok=True)
+                #     import struct, zlib
+                #     def _make_1x1_png():
+                #         def chunk(name, data):
+                #             c = struct.pack(">I", len(data)) + name + data
+                #             return c + struct.pack(">I", zlib.crc32(name + data) & 0xFFFFFFFF)
+                #         ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+                #         idat = zlib.compress(b"\x00\xFF\xFF\xFF")
+                #         return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+                #     _noimage_src.write_bytes(_make_1x1_png())
+                # shutil.copy(_noimage_src, paraphernalia_dir)
+                # with open(
+                #     paraphernalia_dir / f"beatrice_paraphernalia_{name}.toml",
+                #     "w",
+                #     encoding="utf-8",
+                # ) as f:
+                #     f.write(...)  # TOML metadata — omitted
+                # del paraphernalia_dir
 
             # TODO: phone_extractor, pitch_estimator が既知のモデルであれば dump を省略
 
