@@ -75,7 +75,7 @@ case "$PLATFORM" in
         info "Platform: macOS ($ARCH)"
         TORCH_INDEX=""   # PyTorch ships MPS support in the default PyPI index
         FAISS_PKG="faiss-cpu"
-        ONNX_PKG="onnxruntime"
+        ONNX_PKG=""      # onnxruntime only needed on Windows DirectML; skip on macOS
         ;;
     Linux)
         info "Platform: Linux ($ARCH)"
@@ -109,10 +109,10 @@ case "$PLATFORM" in
         fi
         if [ "$CUDA_DEVICE" = "cuda" ]; then
             FAISS_PKG="faiss-cpu"   # faiss-gpu has no cp311+ wheels on PyPI; faiss-cpu works for index building
-            ONNX_PKG="onnxruntime-gpu"
+            ONNX_PKG=""             # onnxruntime only needed on Windows DirectML; skip on Linux
         else
             FAISS_PKG="faiss-cpu"
-            ONNX_PKG="onnxruntime"
+            ONNX_PKG=""             # onnxruntime only needed on Windows DirectML; skip on Linux
         fi
         ;;
     *)
@@ -216,9 +216,13 @@ grep -vE "^\s*#|^$" requirements.txt \
 $UV -r "$TMPFILE"
 rm -f "$TMPFILE"
 
-# onnxruntime — correct variant for this platform
-info "Installing $ONNX_PKG..."
-$UV "$ONNX_PKG"
+# onnxruntime — Windows DirectML only; skipped on Linux and macOS
+if [ -n "$ONNX_PKG" ]; then
+    info "Installing $ONNX_PKG..."
+    $UV "$ONNX_PKG"
+else
+    info "Skipping onnxruntime (only needed on Windows DirectML)"
+fi
 
 # ---------------------------------------------------------------------------
 # 8. Install frontend dependencies
