@@ -47,8 +47,6 @@ _AUDIO_MIME = {
     ".aif": "audio/aiff",
 }
 
-# Formats soundfile can write natively (no ffmpeg needed)
-_SF_WRITE_EXTS = {".wav", ".flac", ".ogg", ".aiff", ".aif"}
 
 
 # ---------------------------------------------------------------------------
@@ -79,37 +77,27 @@ def _output_path(job_id: str, ext: str) -> str:
 def _write_audio(path: str, audio: np.ndarray, sr: int, ext: str) -> None:
     """Write audio to *path* in the format implied by *ext*.
 
-    Uses soundfile for lossless formats; pydub+ffmpeg for everything else
-    (MP3, M4A, AAC, …).
+    Offline inference always outputs WAV PCM-16 (out_ext=".wav"), matching
+    the realtime save format. Non-WAV formats are left as a fallback in case
+    the caller ever changes out_ext, but pydub/ffmpeg are not required.
     """
     ext = ext.lower()
-    if ext in _SF_WRITE_EXTS:
-        fmt_map = {
-            ".wav": "WAV",
-            ".flac": "FLAC",
-            ".ogg": "OGG",
-            ".aiff": "AIFF",
-            ".aif": "AIFF",
-        }
-        sf.write(path, audio, sr, format=fmt_map.get(ext, "WAV"))
+    fmt_map = {
+        ".wav": "WAV",
+        ".flac": "FLAC",
+        ".ogg": "OGG",
+        ".aiff": "AIFF",
+        ".aif": "AIFF",
+    }
+    if ext in fmt_map:
+        sf.write(path, audio, sr, format=fmt_map[ext], subtype="PCM_16")
     else:
-        # Write to a temporary WAV first, then convert with pydub
-        from pydub import AudioSegment
-        import tempfile as _tmp
-
-        with _tmp.NamedTemporaryFile(suffix=".wav", delete=False) as t:
-            wav_path = t.name
-        try:
-            sf.write(wav_path, audio, sr, format="WAV")
-            seg = AudioSegment.from_wav(wav_path)
-            fmt_map = {".mp3": "mp3", ".m4a": "mp4", ".aac": "adts"}
-            fmt = fmt_map.get(ext, ext.lstrip("."))
-            seg.export(path, format=fmt)
-        finally:
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
+        # Unsupported extension — fall back to WAV at the same path.
+        # pydub is no longer a dependency; if lossy output is ever needed,
+        # use torchaudio.save() with the appropriate encoder.
+        import warnings
+        warnings.warn(f"Unsupported audio extension '{ext}', writing as WAV instead.")
+        sf.write(path, audio, sr, format="WAV", subtype="PCM_16")
 
 
 logger = logging.getLogger("rvc_web.offline")

@@ -1,5 +1,0 @@
-BaseURL: https://huggingface.co/fumiama/RVC-Pretrained-Models/resolve/main
-Targets:
-  - Folder: assets/hubert
-    Copy:
-      - hubert/hubert_base.pt

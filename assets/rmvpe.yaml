@@ -1,6 +1,0 @@
-BaseURL: https://huggingface.co/fumiama/RVC-Pretrained-Models/resolve/main
-Targets:
-  - Folder: assets/rmvpe
-    Copy:
-      - rmvpe/rmvpe.pt
-      - rmvpe/rmvpe.onnx

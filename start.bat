@@ -21,7 +21,101 @@ if "!RVC_DEVICE!"=="" set RVC_DEVICE=cpu
 echo [start] Compute device: !RVC_DEVICE!
 
 REM ---------------------------------------------------------------------------
-REM 2. Universal threading env vars
+REM 2. Asset pre-check
+REM    Verify all required model weights are present before launching anything.
+REM ---------------------------------------------------------------------------
+echo [start] Checking assets...
+echo.
+
+set ASSET_ERRORS=0
+
+REM Helper: check a single file exists
+REM Usage: call :check_file path label
+goto :asset_checks
+
+:check_file
+  if not exist "%~1" (
+    echo   [MISSING] %~2
+    echo             ^-> %~1
+    set /a ASSET_ERRORS+=1
+  ) else (
+    echo   [OK]      %~2
+  )
+goto :eof
+
+REM Helper: check a directory has at least N files matching a pattern
+REM Usage: call :check_dir dir pattern label min
+:check_dir
+  if not exist "%~1\" (
+    echo   [MISSING] %~3 ^(directory not found^)
+    echo             ^-> %~1
+    set /a ASSET_ERRORS+=1
+    goto :eof
+  )
+  set _COUNT=0
+  for %%f in ("%~1\%~2") do set /a _COUNT+=1
+  if !_COUNT! LSS %~4 (
+    echo   [MISSING] %~3 ^(found !_COUNT!/%~4 files matching %~2^)
+    echo             ^-> %~1
+    set /a ASSET_ERRORS+=1
+  ) else (
+    echo   [OK]      %~3 ^(!_COUNT! files^)
+  )
+goto :eof
+
+:asset_checks
+echo   -- RVC core (required for all inference + training) --
+call :check_file "assets\hubert\hubert_base.pt"      "HuBERT base model"
+call :check_file "assets\rmvpe\rmvpe.pt"             "RMVPE F0 estimator (PyTorch)"
+call :check_file "assets\rmvpe\rmvpe.onnx"           "RMVPE F0 estimator (ONNX)"
+call :check_dir  "assets\pretrained_v2" "*.pth" "RVC v2 pretrained weights" 12
+call :check_dir  "assets\pretrained"   "*.pth" "RVC v1 pretrained weights" 12
+
+echo.
+echo   -- Embedder (default: spin-v2) --
+call :check_file "assets\spin-v2\config.json"        "SPIN-v2 embedder config"
+call :check_file "assets\spin-v2\pytorch_model.bin"  "SPIN-v2 embedder weights"
+
+echo.
+echo   -- Speaker analysis (ECAPA-TDNN) --
+call :check_file "assets\ecapa\ecapa_tdnn.pt"        "ECAPA-TDNN speaker encoder"
+
+echo.
+echo   -- Beatrice 2 (required for B2 pipeline) --
+call :check_file "assets\beatrice2\pretrained\122_checkpoint_03000000.pt"                    "B2 phone extractor checkpoint"
+call :check_file "assets\beatrice2\pretrained\104_3_checkpoint_00300000.pt"                  "B2 pitch estimator checkpoint"
+call :check_file "assets\beatrice2\pretrained\151_checkpoint_libritts_r_200_02750000.pt.gz"  "B2 base model (LibriTTS-R 200)"
+call :check_file "assets\beatrice2\utmos\utmos22_strong_step7459_v1.pt"                      "UTMOS MOS scorer"
+call :check_dir  "assets\beatrice2\ir"    "*.flac" "Beatrice 2 impulse responses (IR)"  20
+call :check_dir  "assets\beatrice2\noise" "*.flac" "Beatrice 2 background noise files"  20
+
+echo.
+if !ASSET_ERRORS! GTR 0 (
+    echo   +-----------------------------------------------------------------+
+    echo   ^|  !ASSET_ERRORS! required asset^(s^) missing -- cannot start          ^|
+    echo   +-----------------------------------------------------------------+
+    echo.
+    echo   To fix:
+    echo.
+    echo     RVC weights ^(manual download^):
+    echo       https://huggingface.co/lj1995/VoiceConversionWebUI
+    echo       hubert_base.pt          -^> assets\hubert\
+    echo       rmvpe.pt + rmvpe.onnx   -^> assets\rmvpe\
+    echo       pretrained\*.pth        -^> assets\pretrained\
+    echo       pretrained_v2\*.pth     -^> assets\pretrained_v2\
+    echo       spin-v2\ directory      -^> assets\spin-v2\
+    echo       ecapa_tdnn.pt           -^> assets\ecapa\
+    echo.
+    echo     Beatrice 2 weights ^(automated, downloads 20 IR + 20 noise files^):
+    echo       conda run -n %RVC_CONDA_ENV% python -m backend.beatrice2.download_assets
+    echo.
+    exit /b 1
+)
+echo   All assets present -- proceeding.
+echo.
+
+REM ---------------------------------------------------------------------------
+REM 3. Universal threading env vars (renumbered from 2)
 REM ---------------------------------------------------------------------------
 set KMP_DUPLICATE_LIB_OK=TRUE
 set OMP_NUM_THREADS=1

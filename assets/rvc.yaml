@@ -1,7 +1,0 @@
-BaseURL: https://huggingface.co/fumiama/RVC-Pretrained-Models/resolve/main
-Targets:
-  - Refer: hubert
-  - Refer: rmvpe
-  - Refer: v1
-  - Refer: v2
-  - Refer: uvr5

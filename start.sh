@@ -19,11 +19,103 @@ esac
 echo "[start] Platform: $PLATFORM ($OS_TYPE)"
 
 # ---------------------------------------------------------------------------
-# 2. Detect available compute device
+# 2. Asset pre-check
+#    Verify all required model weights are present before launching anything.
+#    Missing assets cause cryptic errors deep in Python — catch them here.
+# ---------------------------------------------------------------------------
+echo "[start] Checking assets..."
+
+ASSET_ERRORS=0
+
+check_file() {
+  local path="$1"
+  local label="$2"
+  if [ ! -f "$path" ]; then
+    echo "  [MISSING] $label"
+    echo "            -> $path"
+    ASSET_ERRORS=$((ASSET_ERRORS + 1))
+  else
+    echo "  [OK]      $label"
+  fi
+}
+
+check_dir_nonempty() {
+  local dir="$1"
+  local pattern="$2"   # glob pattern to count, e.g. "*.pth"
+  local label="$3"
+  local min="${4:-1}"
+  if [ ! -d "$dir" ]; then
+    echo "  [MISSING] $label (directory not found)"
+    echo "            -> $dir"
+    ASSET_ERRORS=$((ASSET_ERRORS + 1))
+    return
+  fi
+  local count
+  count=$(find "$dir" -maxdepth 1 -name "$pattern" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$count" -lt "$min" ]; then
+    echo "  [MISSING] $label (found $count/$min files matching $pattern)"
+    echo "            -> $dir"
+    ASSET_ERRORS=$((ASSET_ERRORS + 1))
+  else
+    echo "  [OK]      $label ($count files)"
+  fi
+}
+
+echo ""
+echo "  -- RVC core (required for all inference + training) --"
+check_file "assets/hubert/hubert_base.pt"      "HuBERT base model"
+check_file "assets/rmvpe/rmvpe.pt"             "RMVPE F0 estimator (PyTorch)"
+check_file "assets/rmvpe/rmvpe.onnx"           "RMVPE F0 estimator (ONNX)"
+check_dir_nonempty "assets/pretrained_v2" "*.pth" "RVC v2 pretrained weights" 12
+check_dir_nonempty "assets/pretrained"   "*.pth" "RVC v1 pretrained weights" 12
+
+echo ""
+echo "  -- Embedder (default: spin-v2) --"
+check_file "assets/spin-v2/config.json"        "SPIN-v2 embedder config"
+check_file "assets/spin-v2/pytorch_model.bin"  "SPIN-v2 embedder weights"
+
+echo ""
+echo "  -- Speaker analysis (ECAPA-TDNN) --"
+check_file "assets/ecapa/ecapa_tdnn.pt"        "ECAPA-TDNN speaker encoder"
+
+echo ""
+echo "  -- Beatrice 2 (required for B2 pipeline) --"
+check_file "assets/beatrice2/pretrained/122_checkpoint_03000000.pt"                    "B2 phone extractor checkpoint"
+check_file "assets/beatrice2/pretrained/104_3_checkpoint_00300000.pt"                  "B2 pitch estimator checkpoint"
+check_file "assets/beatrice2/pretrained/151_checkpoint_libritts_r_200_02750000.pt.gz"  "B2 base model (LibriTTS-R 200)"
+check_file "assets/beatrice2/utmos/utmos22_strong_step7459_v1.pt"                      "UTMOS MOS scorer"
+check_dir_nonempty "assets/beatrice2/ir"    "*.flac" "Beatrice 2 impulse responses (IR)"  20
+check_dir_nonempty "assets/beatrice2/noise" "*.flac" "Beatrice 2 background noise files"  20
+
+echo ""
+if [ "$ASSET_ERRORS" -gt 0 ]; then
+  echo "  +-----------------------------------------------------------------+"
+  echo "  |  $ASSET_ERRORS required asset(s) missing -- cannot start          |"
+  echo "  +-----------------------------------------------------------------+"
+  echo ""
+  echo "  To fix:"
+  echo ""
+  echo "    RVC weights (manual download):"
+  echo "      https://huggingface.co/lj1995/VoiceConversionWebUI"
+  echo "      hubert_base.pt          -> assets/hubert/"
+  echo "      rmvpe.pt + rmvpe.onnx   -> assets/rmvpe/"
+  echo "      pretrained/*.pth        -> assets/pretrained/"
+  echo "      pretrained_v2/*.pth     -> assets/pretrained_v2/"
+  echo "      spin-v2/ directory      -> assets/spin-v2/"
+  echo "      ecapa_tdnn.pt           -> assets/ecapa/"
+  echo ""
+  echo "    Beatrice 2 weights (automated, downloads 20 IR + 20 noise files):"
+  echo "      conda run -n \${RVC_CONDA_ENV:-rvc} python -m backend.beatrice2.download_assets"
+  echo ""
+  exit 1
+fi
+
+echo "  All assets present -- proceeding."
+echo ""
+
+# ---------------------------------------------------------------------------
+# 3. Detect available compute device
 #    Priority: CUDA > MPS > CPU
-#    Exports RVC_DEVICE so Python subprocesses can read it.
-#    Use conda env's Python — system Python may not have torch or may be
-#    CPU-only.
 # ---------------------------------------------------------------------------
 CONDA_ENV="${RVC_CONDA_ENV:-rvc}"
 if conda run -n "$CONDA_ENV" python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
@@ -36,8 +128,7 @@ fi
 echo "[start] Compute device: $RVC_DEVICE"
 
 # ---------------------------------------------------------------------------
-# 3. Universal threading env vars (all platforms)
-#    Prevents faiss + fairseq OpenMP collision.
+# 4. Universal threading env vars
 # ---------------------------------------------------------------------------
 export KMP_DUPLICATE_LIB_OK=TRUE
 export OMP_NUM_THREADS=1
@@ -45,17 +136,14 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
 # ---------------------------------------------------------------------------
-# 4. Platform-specific PyTorch tuning
+# 5. Platform-specific PyTorch tuning
 # ---------------------------------------------------------------------------
 if [ "$RVC_DEVICE" = "mps" ]; then
-  # MPS: disable memory cap so unified memory is fully usable;
-  # prefer shared memory for cheaper host-device transfers
   export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
   export PYTORCH_MPS_PREFER_SHARED_MEMORY=1
   export PYTORCH_ENABLE_MPS_FALLBACK=1
   echo "[start] MPS tuning applied"
 elif [ "$RVC_DEVICE" = "cuda" ]; then
-  # CUDA: set visible devices if not already set by caller
   if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
     export CUDA_VISIBLE_DEVICES=0
     echo "[start] CUDA_VISIBLE_DEVICES defaulted to 0 (set externally to override)"
@@ -66,11 +154,10 @@ elif [ "$RVC_DEVICE" = "cuda" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Kill stale processes — cross-platform
+# 6. Kill stale processes
 # ---------------------------------------------------------------------------
 kill_port() {
   local port=$1
-  # Try lsof first (macOS, most Linux)
   if command -v lsof >/dev/null 2>&1; then
     local pids
     pids=$(lsof -ti:"$port" 2>/dev/null) || true
@@ -81,7 +168,6 @@ kill_port() {
       return
     fi
   fi
-  # Try fuser (Linux)
   if command -v fuser >/dev/null 2>&1; then
     local pids
     pids=$(fuser "$port/tcp" 2>/dev/null) || true
@@ -92,7 +178,6 @@ kill_port() {
       return
     fi
   fi
-  # Fallback: Python-based port kill (works on Windows Git Bash)
   python - "$port" <<'PYEOF' 2>/dev/null || true
 import sys, subprocess
 port = sys.argv[1]
@@ -105,8 +190,7 @@ try:
             parts = line.split()
             pid = parts[-1]
             if pid.isdigit():
-                subprocess.run(["taskkill", "/F", "/PID", pid],
-                               capture_output=True)
+                subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
 except Exception:
     pass
 PYEOF
@@ -145,24 +229,23 @@ kill_dangling
 mkdir -p .pids logs data/profiles
 
 # ---------------------------------------------------------------------------
-# 5b. Sweep temp/ — delete files older than 1 hour
+# 6b. Sweep temp/ — delete files older than 1 hour
 # ---------------------------------------------------------------------------
 mkdir -p temp
 echo "[start] Sweeping temp/ (files older than 1h)..."
 find temp/ -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 6. PROJECT_ROOT — single source of truth for all path resolution
+# 7. PROJECT_ROOT
 # ---------------------------------------------------------------------------
 export PROJECT_ROOT="$(pwd)"
 echo "[start] PROJECT_ROOT=$PROJECT_ROOT"
 
 # ---------------------------------------------------------------------------
-# 7. Detect all IP addresses and let user choose
+# 8. Detect all IP addresses and let user choose
 # ---------------------------------------------------------------------------
 echo "[start] Detecting network interfaces..."
 
-# Collect IPs into a newline-separated string (avoids bash array issues with set -u)
 IP_LIST="localhost"
 
 if [ "$PLATFORM" = "mac" ]; then
@@ -186,7 +269,6 @@ elif [ "$PLATFORM" = "windows" ]; then
   fi
 fi
 
-# Count entries (trim whitespace from wc output)
 IP_COUNT=$(printf '%s\n' "$IP_LIST" | wc -l | tr -d ' ')
 
 if [ "$IP_COUNT" -le 1 ]; then
@@ -197,7 +279,6 @@ else
   echo "  Available network interfaces for frontend access:"
   echo ""
 
-  # Display options
   IDX=1
   while IFS= read -r ip; do
     if [ "$ip" = "localhost" ]; then
@@ -209,7 +290,6 @@ else
   done <<< "$IP_LIST"
   echo ""
 
-  # Default to first non-localhost IP
   DEFAULT_CHOICE=1
   IDX=1
   while IFS= read -r ip; do
@@ -226,7 +306,7 @@ else
   if echo "$CHOICE" | grep -qE '^[0-9]+$' && [ "$CHOICE" -ge 1 ] && [ "$CHOICE" -le "$IP_COUNT" ]; then
     SELECTED_IP=$(echo "$IP_LIST" | sed -n "${CHOICE}p")
     export NEXT_PUBLIC_API_URL="http://${SELECTED_IP}:8000"
-    echo "[start] Selected: $SELECTED_IP → NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL"
+    echo "[start] Selected: $SELECTED_IP -> NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL"
   else
     echo "[start] Invalid selection — falling back to localhost"
     export NEXT_PUBLIC_API_URL="http://localhost:8000"
@@ -235,7 +315,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Print device summary banner
+# 9. Print device summary banner
 # ---------------------------------------------------------------------------
 echo "[start] -----------------------------------------------"
 echo "[start] Device summary"
@@ -243,23 +323,19 @@ echo "[start]   OS:      $PLATFORM"
 echo "[start]   Device:  $RVC_DEVICE"
 python - <<'PYEOF' 2>/dev/null || true
 import torch, sys
-d = ""
 if torch.cuda.is_available():
     props = torch.cuda.get_device_properties(0)
-    vram  = props.total_memory / 1024**3
-    d = f"  GPU:     {props.name}  ({vram:.1f} GB VRAM)"
+    vram = props.total_memory / 1024**3
+    print(f"[start]   GPU:     {props.name}  ({vram:.1f} GB VRAM)")
 elif torch.backends.mps.is_available():
-    d = "  MPS:     Apple Silicon  (unified memory)"
+    print("[start]   MPS:     Apple Silicon  (unified memory)")
 else:
-    d = f"  CPU:     {torch.get_num_threads()} threads"
-print(f"[start] {d}")
+    print(f"[start]   CPU:     {torch.get_num_threads()} threads")
 PYEOF
 echo "[start] -----------------------------------------------"
 
 # ---------------------------------------------------------------------------
-# 9. Start backend
-#    Respects RVC_CONDA_ENV (default: rvc) or falls back to plain python
-#    if conda is not in use.
+# 10. Start backend
 # ---------------------------------------------------------------------------
 RVC_CONDA_ENV="${RVC_CONDA_ENV:-rvc}"
 
@@ -268,7 +344,6 @@ if command -v conda >/dev/null 2>&1; then
   KMP_DUPLICATE_LIB_OK=TRUE conda run --no-capture-output -n "$RVC_CONDA_ENV" \
     uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 &
 else
-  # Plain venv / system python — assumes dependencies are already installed
   python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 &
 fi
 BACKEND_PID=$!
@@ -276,7 +351,7 @@ echo "$BACKEND_PID" > .pids/backend.pid
 echo "[start] Backend PID $BACKEND_PID"
 
 # ---------------------------------------------------------------------------
-# 10. Wait for backend to be ready (up to 30s)
+# 11. Wait for backend to be ready (up to 30s)
 # ---------------------------------------------------------------------------
 echo "[start] Waiting for backend to be ready..."
 for i in $(seq 1 30); do
@@ -288,7 +363,7 @@ for i in $(seq 1 30); do
 done
 
 # ---------------------------------------------------------------------------
-# 11. Start frontend
+# 12. Start frontend
 # ---------------------------------------------------------------------------
 echo "[start] Starting frontend..."
 if [ ! -d "frontend/node_modules" ]; then
@@ -296,9 +371,6 @@ if [ ! -d "frontend/node_modules" ]; then
   (cd frontend && pnpm install)
 fi
 
-# Extract hostname from NEXT_PUBLIC_API_URL (strip http:// and :8000)
-# Pass it to Next.js so the dev server treats it as its canonical origin —
-# prevents "Cross origin request detected" warnings when accessing via LAN IP.
 _NEXT_HOSTNAME=$(echo "$NEXT_PUBLIC_API_URL" | sed 's|http://||' | sed 's|:8000||')
 if [ "$_NEXT_HOSTNAME" = "localhost" ]; then
   (cd frontend && pnpm dev) &
@@ -310,7 +382,7 @@ echo "$FRONTEND_PID" > .pids/frontend.pid
 echo "[start] Frontend PID $FRONTEND_PID"
 
 # ---------------------------------------------------------------------------
-# 12. Wait for frontend (up to 60s)
+# 13. Wait for frontend (up to 60s)
 # ---------------------------------------------------------------------------
 echo "[start] Waiting for frontend to compile..."
 FRONTEND_URL=""

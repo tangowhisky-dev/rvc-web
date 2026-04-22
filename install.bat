@@ -24,7 +24,6 @@ REM Node.js check
 where node >nul 2>&1
 if !errorlevel!==0 (
     for /f "tokens=1 delims=v." %%v in ('node --version') do set NODE_MAJOR=%%v
-    REM strip leading v if present
     set NODE_MAJOR=!NODE_MAJOR:v=!
     if !NODE_MAJOR! LSS !NODE_MIN! (
         echo [install] WARNING: Node.js !NODE_MAJOR! found but ^>=%NODE_MIN% required.
@@ -55,25 +54,21 @@ if !errorlevel!==0 (
     for /f "tokens=9" %%v in ('nvidia-smi ^| findstr "CUDA Version"') do set CUDA_VER=%%v
     if not "!CUDA_VER!"=="" (
         echo [install] CUDA !CUDA_VER! detected
-        REM Parse major and minor versions
         for /f "tokens=1 delims=." %%m in ("!CUDA_VER!") do set CUDA_MAJOR=%%m
         for /f "tokens=2 delims=." %%n in ("!CUDA_VER!") do set CUDA_MINOR=%%n
         if !CUDA_MAJOR! GEQ 13 (
             set TORCH_INDEX=https://download.pytorch.org/whl/cu130
-            set FAISS_PKG=faiss-cpu
             set ONNX_PKG=onnxruntime-gpu
             set CUDA_DEVICE=cuda
             echo [install] Using cu130 index ^(CUDA 13.x^)
         ) else if !CUDA_MAJOR! EQU 12 (
             if !CUDA_MINOR! GEQ 8 (
                 set TORCH_INDEX=https://download.pytorch.org/whl/cu128
-                set FAISS_PKG=faiss-cpu
                 set ONNX_PKG=onnxruntime-gpu
                 set CUDA_DEVICE=cuda
                 echo [install] Using cu128 index ^(CUDA 12.8^)
             ) else if !CUDA_MINOR! GEQ 6 (
                 set TORCH_INDEX=https://download.pytorch.org/whl/cu126
-                set FAISS_PKG=faiss-cpu
                 set ONNX_PKG=onnxruntime-gpu
                 set CUDA_DEVICE=cuda
                 echo [install] Using cu126 index ^(CUDA 12.6^)
@@ -89,13 +84,16 @@ if !errorlevel!==0 (
 )
 
 REM ---------------------------------------------------------------------------
-REM 2b. Install system audio libraries + ffmpeg via conda
-REM     On Windows the sounddevice wheel bundles PortAudio, but conda's
-REM     libsndfile package is needed for soundfile to link correctly.
-REM     ffmpeg is required by torchaudio for audio I/O.
+REM 2b. Install system audio libraries via conda
+REM
+REM     NOTE: ffmpeg is NOT required as a system package.
+REM       - The `av` Python package bundles its own FFmpeg shared libs.
+REM       - pydub has been removed (offline output is always WAV now).
+REM     sounddevice on Windows bundles PortAudio in the wheel, so only
+REM     libsndfile is needed via conda for soundfile to link correctly.
 REM ---------------------------------------------------------------------------
-echo [install] Installing system audio libraries + ffmpeg (conda)...
-call conda install -n !ENV_NAME! -c conda-forge libsndfile ffmpeg -y -q
+echo [install] Installing libsndfile via conda...
+call conda install -n !ENV_NAME! -c conda-forge libsndfile -y -q
 
 REM ---------------------------------------------------------------------------
 REM 3. Create / update conda environment
@@ -114,15 +112,11 @@ call conda activate !ENV_NAME!
 if !errorlevel! NEQ 0 (
     echo [install] Trying conda init approach...
     call conda run -n !ENV_NAME! python --version >nul 2>&1 || (echo [install] ERROR: Could not activate conda env && exit /b 1)
-    REM Use conda run for remaining steps
     set USE_CONDA_RUN=1
 )
 
 REM ---------------------------------------------------------------------------
-REM 4. Resolve uv — prefer standalone binary over python -m uv
-REM    so the conda env's Python doesn't need uv installed inside it.
-REM    When using the global binary we must pass --python so uv targets
-REM    the conda env's interpreter, not the system Python.
+REM 4. Resolve uv
 REM ---------------------------------------------------------------------------
 set UV_BIN=
 where uv >nul 2>&1
@@ -136,14 +130,12 @@ if exist "%USERPROFILE%\.cargo\bin\uv.exe"  set UV_BIN=%USERPROFILE%\.cargo\bin\
 if exist "%USERPROFILE%\.local\bin\uv.exe"  set UV_BIN=%USERPROFILE%\.local\bin\uv.exe & goto :uv_found
 if exist "%LOCALAPPDATA%\uv\bin\uv.exe"     set UV_BIN=%LOCALAPPDATA%\uv\bin\uv.exe    & goto :uv_found
 
-REM Not found anywhere — install into conda env and use python -m uv
 echo [install] uv not found globally — installing into conda env...
 call conda run -n !ENV_NAME! pip install uv -q
 set UV=conda run -n !ENV_NAME! python -m uv pip
 goto :uv_done
 
 :uv_found
-REM Resolve the conda env's Python path so we can pass it to --python
 for /f "delims=" %%p in ('conda run -n !ENV_NAME! python -c "import sys; print(sys.executable)"') do set CONDA_PYTHON=%%p
 echo [install] uv found: !UV_BIN! ^(targeting !CONDA_PYTHON!^)
 set UV=!UV_BIN! pip --python !CONDA_PYTHON!
@@ -181,12 +173,10 @@ REM 8. Install remaining requirements
 REM ---------------------------------------------------------------------------
 echo [install] Installing remaining Python dependencies...
 
-REM Write a filtered requirements file (exclude already-handled packages)
 set TMPFILE=%TEMP%\rvc_req_%RANDOM%.txt
 type nul > !TMPFILE!
 for /f "usebackq tokens=* delims=" %%L in (requirements.txt) do (
     set LINE=%%L
-    REM Skip comments, blank lines, and platform-handled packages
     echo !LINE! | findstr /r "^#" >nul && goto :skip_line
     echo !LINE! | findstr /r "^$" >nul && goto :skip_line
     echo !LINE! | findstr /i "^torch ^torchaudio ^faiss ^fairseq ^onnxruntime sys_platform platform_machine" >nul && goto :skip_line
@@ -197,7 +187,6 @@ for /f "usebackq tokens=* delims=" %%L in (requirements.txt) do (
 call !UV! install -r !TMPFILE! -q
 del !TMPFILE! 2>nul
 
-REM onnxruntime — platform-specific
 echo [install] Installing !ONNX_PKG!...
 call !UV! install !ONNX_PKG! -q
 
@@ -216,7 +205,14 @@ echo [install] Verifying key imports...
 call conda run -n !ENV_NAME! python -c "
 import sys
 failures = []
-checks = ['torch','torchaudio','fairseq','faiss','fastapi','uvicorn','librosa','sounddevice','soundfile','numpy','scipy','sklearn','torchcrepe','torchfcpe']
+checks = [
+    'torch','torchaudio','fairseq','faiss',
+    'fastapi','uvicorn','librosa','sounddevice',
+    'soundfile','numpy','scipy','sklearn',
+    'torchcrepe','torchfcpe','av',
+    'noisereduce','parselmouth','pyworld',
+    'tensorboard','psutil',
+]
 for mod in checks:
     try:
         __import__(mod)

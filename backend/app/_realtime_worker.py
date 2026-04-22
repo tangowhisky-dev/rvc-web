@@ -177,7 +177,7 @@ _SAVE_SENTINEL = None
 
 def _save_thread(audio_q: queue.Queue, save_path: str, sr: int,
                  evt_q: multiprocessing.Queue) -> None:
-    """Accumulate PCM blocks from audio_q, encode to MP3 on sentinel."""
+    """Accumulate PCM blocks from audio_q, write WAV-PCM16 on sentinel."""
     chunks = []
     total_samples = 0
     save_path = os.path.expanduser(save_path)
@@ -468,17 +468,17 @@ def run_worker(
         save_t = threading.Thread(
             target=_save_thread,
             args=(audio_save_q, save_path, _SR_48K, evt_q),
-            daemon=True, name="mp3-save",
+            daemon=True, name="wav-save",
         )
         save_t.start()
 
         _save_dir = os.path.dirname(os.path.abspath(os.path.expanduser(save_path)))
-        input_save_path = os.path.join(_save_dir, "rvc_input.mp3")
+        input_save_path = os.path.join(_save_dir, "rvc_input.wav")
         audio_in_save_q = queue.Queue(maxsize=0)
         save_in_t = threading.Thread(
             target=_save_thread,
             args=(audio_in_save_q, input_save_path, _SR_48K, evt_q),
-            daemon=True, name="mp3-save-input",
+            daemon=True, name="wav-save-input",
         )
         save_in_t.start()
 

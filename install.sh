@@ -75,7 +75,7 @@ case "$PLATFORM" in
                 CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
                 info "CUDA $CUDA_VER detected"
                 if [ "$CUDA_MAJOR" -ge 13 ]; then
-                    TORCH_INDEX=""      # PyPI default wheel ships with CUDA 13 support
+                    TORCH_INDEX=""
                     CUDA_DEVICE="cuda"
                 elif [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -ge 8 ]; then
                     TORCH_INDEX="https://download.pytorch.org/whl/cu128"
@@ -109,29 +109,34 @@ case "$PLATFORM" in
 esac
 
 # ---------------------------------------------------------------------------
-# 2b. Install system audio libraries (PortAudio, libsndfile) + ffmpeg
-#     sounddevice and soundfile link against these at runtime.
-#     ffmpeg is required by torchaudio for audio I/O.
-#     Must be installed before pip wheels are built/verified.
+# 2b. Install system audio libraries (PortAudio, libsndfile)
+#     sounddevice links against PortAudio at runtime.
+#     soundfile links against libsndfile at runtime.
+#
+#     NOTE: ffmpeg is NOT required as a system package.
+#       - The `av` Python package bundles its own FFmpeg shared libs.
+#       - pydub has been removed (offline output is always WAV now).
+#     If you want to play/convert audio files manually with the ffmpeg CLI,
+#     install it separately — but it is not needed for rvc-web to run.
 # ---------------------------------------------------------------------------
-info "Installing system audio libraries + ffmpeg..."
+info "Installing system audio libraries (PortAudio, libsndfile)..."
 case "$PLATFORM" in
     Linux)
         if command -v apt-get &>/dev/null; then
-            sudo apt-get install -y libportaudio2 libsndfile1 ffmpeg > /dev/null
+            sudo apt-get install -y libportaudio2 libsndfile1 > /dev/null
         elif command -v dnf &>/dev/null; then
-            sudo dnf install -y portaudio libsndfile ffmpeg > /dev/null
+            sudo dnf install -y portaudio libsndfile > /dev/null
         elif command -v pacman &>/dev/null; then
-            sudo pacman -S --noconfirm portaudio libsndfile ffmpeg > /dev/null
+            sudo pacman -S --noconfirm portaudio libsndfile > /dev/null
         else
-            warn "Unknown package manager — install libportaudio2, libsndfile1, and ffmpeg manually before running start.sh"
+            warn "Unknown package manager — install libportaudio2 and libsndfile1 manually before running start.sh"
         fi
         ;;
     Darwin)
         if command -v brew &>/dev/null; then
-            brew install portaudio libsndfile ffmpeg --quiet
+            brew install portaudio libsndfile --quiet
         else
-            warn "Homebrew not found — install portaudio, libsndfile, and ffmpeg manually: brew install portaudio libsndfile ffmpeg"
+            warn "Homebrew not found — install portaudio and libsndfile manually: brew install portaudio libsndfile"
         fi
         ;;
 esac
@@ -159,11 +164,6 @@ info "Python: $(python --version)"
 # 4. Resolve uv — prefer the standalone binary over python -m uv
 #    so the conda env's Python doesn't need uv installed inside it.
 # ---------------------------------------------------------------------------
-# Search order:
-#   1. uv already on PATH (global install, brew, cargo, etc.)
-#   2. ~/.cargo/bin/uv   (cargo install uv)
-#   3. ~/.local/bin/uv   (pip install --user uv or uv's own installer)
-#   4. conda env's pip   (install uv into the env as a last resort)
 UV_BIN=""
 for candidate in \
     "$(command -v uv 2>/dev/null)" \
@@ -181,7 +181,6 @@ if [ -n "$UV_BIN" ]; then
     info "uv found: $UV_BIN"
     UV="$UV_BIN pip"
 else
-    # Fall back: install uv into the conda env, then use python -m uv
     info "uv not found globally — installing into conda env..."
     pip install uv --quiet
     UV="python -m uv pip"
@@ -206,7 +205,7 @@ $UV install "$FAISS_PKG" --quiet
 
 # ---------------------------------------------------------------------------
 # 7. Install fairseq from One-sixth fork
-# (must be after torch; build needs Cython + numpy already present)
+#    Must be after torch; build needs Cython + numpy already present.
 # ---------------------------------------------------------------------------
 info "Installing build prerequisites for fairseq..."
 $UV install Cython numpy --quiet
@@ -215,14 +214,15 @@ info "Installing fairseq (One-sixth fork — Python 3.10+ compatible)..."
 $UV install "fairseq @ git+https://github.com/One-sixth/fairseq.git" --quiet
 
 # ---------------------------------------------------------------------------
-# 8. Install remaining requirements (excluding torch, faiss, fairseq, onnx
-#    — already handled above or platform-specific)
+# 8. Install remaining requirements
+#    Excludes: torch/torchaudio, faiss, fairseq, onnxruntime (platform-specific)
+#    and lines with sys_platform/platform_machine markers (handled below).
 # ---------------------------------------------------------------------------
 info "Installing remaining Python dependencies..."
 
-# Build a filtered requirements list on the fly
 TMPFILE="$(mktemp /tmp/rvc_req_XXXXXX.txt)"
-grep -vE "^\s*#|^$|^torch$|^torchaudio|^faiss|^fairseq|^onnxruntime|^torch " requirements.txt \
+grep -vE "^\s*#|^$" requirements.txt \
+    | grep -vE "^torch$|^torchaudio|^faiss|^fairseq|^onnxruntime" \
     | grep -v "sys_platform\|platform_machine" \
     > "$TMPFILE"
 
@@ -252,7 +252,9 @@ checks = [
     "torch", "torchaudio", "fairseq", "faiss",
     "fastapi", "uvicorn", "librosa", "sounddevice",
     "soundfile", "numpy", "scipy", "sklearn",
-    "torchcrepe", "torchfcpe",
+    "torchcrepe", "torchfcpe", "av",
+    "noisereduce", "parselmouth", "pyworld",
+    "tensorboard", "psutil",
 ]
 for mod in checks:
     try:

@@ -14,8 +14,8 @@ fastapi
 uvicorn[standard]
 python-multipart          # FastAPI file upload support
 websockets
-httpx
-aiofiles
+httpx                     # test client (httpx.AsyncClient + ASGITransport)
+aiofiles                  # async file writes in profiles router
 aiosqlite
 python-dotenv
 pydantic
@@ -23,30 +23,43 @@ pydantic
 # ---------------------------------------------------------------------------
 # Audio processing
 # ---------------------------------------------------------------------------
+# librosa — kept despite torchaudio overlap for three specific uses:
+#   1. librosa.filters.mel() in mel_processing.py + speaker_encoder.py
+#      (must match NeMo's exact filterbank; torchaudio.functional.melscale_fbanks
+#       uses a different normalisation that would break loaded checkpoints)
+#   2. librosa.feature.rms() in pipeline.py (protect-consonants logic)
+#   3. librosa.resample() in onnx/infer.py + voice_analysis.py
+#   All three are shallow calls; the rest of librosa is unused.
+#   Replacing them with torchaudio/scipy equivalents is possible but risky —
+#   checkpoint-trained weights depend on exact filterbank values.
 librosa
-soundfile
-sounddevice
-pydub
-resampy
-audioread                 # transitive: required by librosa
-noisereduce
-av
-praat-parselmouth
-pyworld==0.3.2            # pinned — API changed in 0.3.3+
+soundfile                 # sf.write / sf.read used throughout
+sounddevice               # realtime mic/speaker I/O
+av                        # audio I/O in rvc/infer/lib/audio.py; bundles its own FFmpeg — no system ffmpeg needed
+noisereduce               # audio_preprocessing.py noise removal
+praat-parselmouth         # F0 extraction via PM method in rvc/rvc/f0/pm.py
+pyworld==0.3.2            # pinned — API changed in 0.3.3+; DIO/Harvest F0
+
+# REMOVED: pydub — was used only for MP3/M4A output in offline router.
+#   Offline inference now forces WAV output (out_ext=".wav"), so pydub is dead code.
+#   Also removes the system ffmpeg dependency (av bundles its own).
+# REMOVED: resampy — not imported anywhere in the codebase; was a transitive dep of librosa
+#   but pip resolves it automatically if librosa needs it.
+# REMOVED: audioread — same story; librosa pulls it in transitively if needed.
 
 # ---------------------------------------------------------------------------
 # Machine learning / inference
 # ---------------------------------------------------------------------------
 numpy
-scipy
-scikit-learn
-joblib                    # transitive: required by scikit-learn, librosa, noisereduce
-numba
-llvmlite
+scipy                     # signal processing, FFT, wavfile I/O
+scikit-learn              # FAISS preprocessing, speaker encoder helpers
+joblib                    # required by scikit-learn; also used by noisereduce
+numba                     # JIT-compiled hot paths in RVC
+llvmlite                  # required by numba
 faiss-cpu                 # replaced by faiss-gpu on CUDA installs — see install.sh
-torchcrepe
-torchfcpe
-pybase16384
+torchcrepe                # CREPE F0 estimator (rvc/rvc/f0/crepe.py)
+torchfcpe                 # FCPE F0 estimator (rvc/rvc/f0/fcpe.py)
+pybase16384               # model hash encoding/decoding (rvc/infer/modules/vc/hash.py)
 
 # onnxruntime: CPU build on macOS/CPU-only, GPU build on CUDA Linux/Windows
 onnxruntime; sys_platform == "darwin"
@@ -57,12 +70,12 @@ onnxruntime-gpu; sys_platform == "win32"
 # ---------------------------------------------------------------------------
 # Training utilities
 # ---------------------------------------------------------------------------
-tensorboard               # used directly: torch.utils.tensorboard.SummaryWriter
-tensorboardX
-matplotlib
+tensorboard               # torch.utils.tensorboard.SummaryWriter — used in RVC + Beatrice 2 trainers
+# REMOVED: tensorboardX — zero imports anywhere; tensorboard itself is sufficient
+matplotlib                # spectrogram/alignment plots in RVC train utils (plot_spectrogram_to_numpy)
 Pillow                    # transitive: required by matplotlib, tensorboard
-tqdm                      # transitive: required by fairseq, torchcrepe, transformers
-psutil
+tqdm                      # progress bars; transitive dep of fairseq, torchcrepe, transformers
+psutil                    # process tree kill on training stop/cancel
 sympy                     # transitive: required by torch, onnxruntime
 PyYAML                    # transitive: required by omegaconf (fairseq), transformers
 Cython                    # build dep for fairseq + pyworld
@@ -70,8 +83,8 @@ absl-py                   # transitive: required by tensorboard
 Jinja2                    # transitive: required by torch
 fsspec                    # transitive: required by torch, huggingface_hub
 colorama                  # transitive: required by sacrebleu (fairseq dep)
-transformers              # used directly: HubertModel in rtrvc.py + extract_feature_print.py
-huggingface_hub           # used directly: model weight downloads; transitive dep of transformers
+transformers              # HubertModel in rtrvc.py + extract_feature_print.py
+huggingface_hub           # model weight downloads; transitive dep of transformers
 Markdown                  # transitive: required by tensorboard
 pyasn1                    # transitive: required by pyasn1-modules chain
 
