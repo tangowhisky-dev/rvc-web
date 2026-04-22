@@ -87,7 +87,7 @@ case "$PLATFORM" in
                 CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
                 info "CUDA $CUDA_VER detected"
                 if [ "$CUDA_MAJOR" -ge 13 ]; then
-                    TORCH_INDEX="https://download.pytorch.org/whl/cu130"
+                    TORCH_INDEX=""   # PyPI now ships native CUDA 13 builds
                     CUDA_DEVICE="cuda"
                 elif [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -ge 8 ]; then
                     TORCH_INDEX="https://download.pytorch.org/whl/cu128"
@@ -168,8 +168,11 @@ RVC_PYTHON="${ENV_DIR}/bin/python"
 [ -x "$RVC_PYTHON" ] || die "Python interpreter not found at ${RVC_PYTHON}"
 info "Python: $($RVC_PYTHON --version)"
 
-# Short alias — all package installs target this interpreter
-UV="uv pip --python $RVC_PYTHON"
+# Activate the venv for uv — setting VIRTUAL_ENV is the correct way to
+# point `uv pip install` at a specific venv without the --python flag.
+export VIRTUAL_ENV="$ENV_DIR"
+export PATH="$ENV_DIR/bin:$PATH"
+UV="uv pip install"
 
 # ---------------------------------------------------------------------------
 # 4. Install PyTorch (must come before other packages that depend on torch)
@@ -177,26 +180,26 @@ UV="uv pip --python $RVC_PYTHON"
 info "Installing PyTorch..."
 if [ -n "${TORCH_INDEX:-}" ]; then
     info "  Using index: $TORCH_INDEX"
-    $UV install torch torchaudio --index-url "$TORCH_INDEX"
+    $UV torch torchaudio --index-url "$TORCH_INDEX"
 else
-    $UV install torch torchaudio
+    $UV torch torchaudio
 fi
 
 # ---------------------------------------------------------------------------
 # 5. Install faiss (platform-specific)
 # ---------------------------------------------------------------------------
 info "Installing $FAISS_PKG..."
-$UV install "$FAISS_PKG"
+$UV "$FAISS_PKG"
 
 # ---------------------------------------------------------------------------
 # 6. Install fairseq from One-sixth fork
 #    Must be after torch; build needs Cython + numpy already present.
 # ---------------------------------------------------------------------------
 info "Installing build prerequisites for fairseq..."
-$UV install Cython numpy
+$UV Cython numpy
 
 info "Installing fairseq (One-sixth fork — Python 3.10+ compatible)..."
-$UV install "fairseq @ git+https://github.com/One-sixth/fairseq.git"
+$UV "fairseq @ git+https://github.com/One-sixth/fairseq.git"
 
 # ---------------------------------------------------------------------------
 # 7. Install remaining requirements
@@ -210,12 +213,12 @@ grep -vE "^\s*#|^$" requirements.txt \
     | grep -v "sys_platform\|platform_machine" \
     > "$TMPFILE"
 
-$UV install -r "$TMPFILE"
+$UV -r "$TMPFILE"
 rm -f "$TMPFILE"
 
 # onnxruntime — correct variant for this platform
 info "Installing $ONNX_PKG..."
-$UV install "$ONNX_PKG"
+$UV "$ONNX_PKG"
 
 # ---------------------------------------------------------------------------
 # 8. Install frontend dependencies

@@ -68,10 +68,10 @@ if !errorlevel!==0 (
         for /f "tokens=1 delims=." %%m in ("!CUDA_VER!") do set CUDA_MAJOR=%%m
         for /f "tokens=2 delims=." %%n in ("!CUDA_VER!") do set CUDA_MINOR=%%n
         if !CUDA_MAJOR! GEQ 13 (
-            set TORCH_INDEX=https://download.pytorch.org/whl/cu130
+            set TORCH_INDEX=
             set ONNX_PKG=onnxruntime-gpu
             set CUDA_DEVICE=cuda
-            echo [install] Using cu130 index ^(CUDA 13.x^)
+            echo [install] CUDA 13.x -- PyPI now ships native CUDA 13 builds
         ) else if !CUDA_MAJOR! EQU 12 (
             if !CUDA_MINOR! GEQ 8 (
                 set TORCH_INDEX=https://download.pytorch.org/whl/cu128
@@ -126,17 +126,17 @@ if not exist "!RVC_PYTHON!" (
 )
 for /f "tokens=*" %%v in ('"!RVC_PYTHON!" --version') do echo [install] %%v
 
-set UV=uv pip --python "!RVC_PYTHON!"
+set UV=uv pip install --python "!RVC_PYTHON!"
 
 REM ---------------------------------------------------------------------------
 REM 4. Install PyTorch
 REM ---------------------------------------------------------------------------
 echo [install] Installing PyTorch...
 if "!TORCH_INDEX!"=="" (
-    call !UV! install torch torchaudio
+    call !UV! torch torchaudio
 ) else (
     echo [install]   Using index: !TORCH_INDEX!
-    call !UV! install torch torchaudio --index-url !TORCH_INDEX!
+    call !UV! torch torchaudio --index-url !TORCH_INDEX!
 )
 if !errorlevel! NEQ 0 (echo [install] ERROR: PyTorch install failed && exit /b 1)
 
@@ -144,18 +144,18 @@ REM ---------------------------------------------------------------------------
 REM 5. Install faiss
 REM ---------------------------------------------------------------------------
 echo [install] Installing !FAISS_PKG!...
-call !UV! install !FAISS_PKG!
+call !UV! !FAISS_PKG!
 if !errorlevel! NEQ 0 (echo [install] ERROR: faiss install failed && exit /b 1)
 
 REM ---------------------------------------------------------------------------
 REM 6. Install fairseq (One-sixth fork)
 REM ---------------------------------------------------------------------------
 echo [install] Installing build prerequisites for fairseq...
-call !UV! install Cython numpy
+call !UV! Cython numpy
 if !errorlevel! NEQ 0 (echo [install] ERROR: Cython/numpy install failed && exit /b 1)
 
 echo [install] Installing fairseq ^(One-sixth fork^)...
-call !UV! install "fairseq @ git+https://github.com/One-sixth/fairseq.git"
+call !UV! "fairseq @ git+https://github.com/One-sixth/fairseq.git"
 if !errorlevel! NEQ 0 (echo [install] ERROR: fairseq install failed && exit /b 1)
 
 REM ---------------------------------------------------------------------------
@@ -180,12 +180,12 @@ for /f "usebackq tokens=* delims=" %%L in (requirements.txt) do (
     :skip_line
 )
 
-call !UV! install -r "!TMPFILE!"
+call !UV! -r "!TMPFILE!"
 if !errorlevel! NEQ 0 (echo [install] ERROR: requirements install failed && exit /b 1)
 del "!TMPFILE!" 2>nul
 
 echo [install] Installing !ONNX_PKG!...
-call !UV! install !ONNX_PKG!
+call !UV! !ONNX_PKG!
 if !errorlevel! NEQ 0 (echo [install] ERROR: onnxruntime install failed && exit /b 1)
 
 REM ---------------------------------------------------------------------------
