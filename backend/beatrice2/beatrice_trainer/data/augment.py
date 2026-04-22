@@ -183,6 +183,12 @@ def random_formant_shift(
 
 def random_filter(audio: torch.Tensor) -> torch.Tensor:
     assert audio.ndim == 2
+    # torchaudio.functional.lfilter -> F.conv1d triggers a Xbyak JIT bug on
+    # aarch64 (PyTorch <=2.x): "bad err=15 / illegal immediate parameter".
+    # Skip the filter on aarch64 — it's a minor augmentation, not critical.
+    import platform
+    if platform.machine() in ("aarch64", "arm64"):
+        return audio
     ab = torch.rand(audio.size(0), 6) * 0.75 - 0.375
     a, b = ab[:, :3], ab[:, 3:]
     a[:, 0] = 1.0

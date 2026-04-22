@@ -59,6 +59,7 @@ llvmlite                  # required by numba
 faiss-cpu                 # replaced by faiss-gpu on CUDA installs — see install.sh
 torchcrepe                # CREPE F0 estimator (rvc/rvc/f0/crepe.py)
 torchfcpe                 # FCPE F0 estimator (rvc/rvc/f0/fcpe.py)
+torchcodec                # torchaudio media decoder backend (required on aarch64 Linux)
 pybase16384               # model hash encoding/decoding (rvc/infer/modules/vc/hash.py)
 
 # onnxruntime: CPU build on macOS/CPU-only, GPU build on CUDA Linux/Windows
