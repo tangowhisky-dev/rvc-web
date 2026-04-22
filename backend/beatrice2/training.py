@@ -355,6 +355,9 @@ def _preprocess_audio(
 
     warnings.filterwarnings("ignore", category=UserWarning)
 
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
     speaker_out = os.path.join(data_dir, speaker_name)
     os.makedirs(speaker_out, exist_ok=True)
 
@@ -362,14 +365,28 @@ def _preprocess_audio(
     chunk_samples = int(chunk_duration * sample_rate)
     total_chunks = 0
     chunk_idx = 0
+    load_errors: list[str] = []
 
-    for fname in sorted(os.listdir(audio_dir)):
-        if os.path.splitext(fname)[1].lower() not in audio_suffixes:
-            continue
+    files_found = [
+        fname for fname in sorted(os.listdir(audio_dir))
+        if os.path.splitext(fname)[1].lower() in audio_suffixes
+    ]
+
+    if not files_found:
+        _log.warning(
+            "_preprocess_audio: no audio files found in %s (suffixes checked: %s)",
+            audio_dir, sorted(audio_suffixes),
+        )
+        return 0
+
+    for fname in files_found:
         src = os.path.join(audio_dir, fname)
         try:
             wav, sr = torchaudio.load(src)
-        except Exception:
+        except Exception as exc:
+            msg = f"failed to load {fname}: {type(exc).__name__}: {exc}"
+            _log.error("_preprocess_audio: %s", msg)
+            load_errors.append(msg)
             continue
 
         # Resample to 24 kHz
@@ -392,6 +409,12 @@ def _preprocess_audio(
             torchaudio.save(out_path, chunk, sample_rate)
             chunk_idx += 1
             total_chunks += 1
+
+    if load_errors and total_chunks == 0:
+        raise RuntimeError(
+            f"All {len(load_errors)} audio file(s) failed to load. "
+            f"First error: {load_errors[0]}"
+        )
 
     return total_chunks
 
@@ -444,6 +467,16 @@ async def _run_beatrice_pipeline(
                 "phase": "preprocess",
             }
         )
+        if n_chunks == 0:
+            job.status = "failed"
+            job.error = (
+                f"Preprocessing produced 0 chunks from {audio_dir}. "
+                "Check that the audio/ directory contains valid WAV files and that "
+                "libsndfile/torchaudio can load them. See train.log for per-file errors."
+            )
+            job.queue.put_nowait({"type": "error", "message": job.error, "phase": "preprocess"})
+            await _update_db_status(profile_id, "failed")
+            return
     except Exception as exc:
         job.status = "failed"
         job.error = f"Preprocessing failed: {exc}"
