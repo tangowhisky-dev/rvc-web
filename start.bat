@@ -14,7 +14,48 @@ REM 1. Detect compute device
 REM ---------------------------------------------------------------------------
 echo [start] Platform: Windows
 
-python -c "import torch; print('cuda' if torch.cuda.is_available() else 'cpu')" > .tmp_device.txt 2>nul
+REM ---------------------------------------------------------------------------
+REM 1. Resolve Python interpreter
+REM    Priority: conda env 'rvc' -> uv venv %USERPROFILE%\.rvc
+REM ---------------------------------------------------------------------------
+set ENV_NAME=%RVC_ENV_NAME%
+if "!ENV_NAME!"=="" set ENV_NAME=rvc
+
+set RVC_PYTHON=
+set RVC_ENV_SOURCE=
+
+REM Try conda first
+where conda >nul 2>&1
+if !errorlevel! equ 0 (
+    for /f "delims=" %%b in ('conda info --base 2^>nul') do set CONDA_BASE=%%b
+    if defined CONDA_BASE (
+        if exist "!CONDA_BASE!\envs\!ENV_NAME!\python.exe" (
+            set "RVC_PYTHON=!CONDA_BASE!\envs\!ENV_NAME!\python.exe"
+            set "RVC_ENV_SOURCE=conda env '!ENV_NAME!'"
+        )
+    )
+)
+
+REM Fall back to uv venv at %USERPROFILE%\.rvc
+if not defined RVC_PYTHON (
+    if exist "%USERPROFILE%\.!ENV_NAME!\Scripts\python.exe" (
+        set "RVC_PYTHON=%USERPROFILE%\.!ENV_NAME!\Scripts\python.exe"
+        set "RVC_ENV_SOURCE=uv venv '%USERPROFILE%\.!ENV_NAME!'"
+    )
+)
+
+if not defined RVC_PYTHON (
+    echo [start] ERROR: No Python environment named '!ENV_NAME!' found.
+    echo [start]        Tried:
+    echo [start]          conda: ^(conda base^)\envs\!ENV_NAME!\python.exe
+    echo [start]          uv:    %USERPROFILE%\.!ENV_NAME!\Scripts\python.exe
+    echo [start]        Run install.bat to create the environment.
+    exit /b 1
+)
+echo [start] Python: !RVC_PYTHON!  ^(via !RVC_ENV_SOURCE!^)
+
+REM Detect compute device using the resolved interpreter
+"!RVC_PYTHON!" -c "import torch; print('cuda' if torch.cuda.is_available() else 'cpu')" > .tmp_device.txt 2>nul
 set /p RVC_DEVICE=<.tmp_device.txt
 if exist ".tmp_device.txt" del .tmp_device.txt 2>nul
 if "!RVC_DEVICE!"=="" set RVC_DEVICE=cpu
@@ -107,7 +148,7 @@ if !ASSET_ERRORS! GTR 0 (
     echo       ecapa_tdnn.pt           -^> assets\ecapa\
     echo.
     echo     Beatrice 2 weights ^(automated, downloads 20 IR + 20 noise files^):
-    echo       conda run -n %RVC_CONDA_ENV% python -m backend.beatrice2.download_assets
+    echo       "!RVC_PYTHON!" -m backend.beatrice2.download_assets
     echo.
     exit /b 1
 )
@@ -256,7 +297,7 @@ echo [start] -----------------------------------------------
 echo [start] Device summary
 echo [start]   OS:      Windows
 echo [start]   Device:  !RVC_DEVICE!
-python -c "
+"!RVC_PYTHON!" -c "
 import torch
 if torch.cuda.is_available():
     p = torch.cuda.get_device_properties(0)
@@ -275,16 +316,8 @@ echo [start] -----------------------------------------------
 REM ---------------------------------------------------------------------------
 REM 8. Start backend
 REM ---------------------------------------------------------------------------
-if "!RVC_CONDA_ENV!"=="" set RVC_CONDA_ENV=rvc
-
-where conda >nul 2^&1
-if !errorlevel! equ 0 (
-    echo [start] Starting backend via conda env !RVC_CONDA_ENV!...
-    start "rvc-backend" /b conda run --no-capture-output -n !RVC_CONDA_ENV! python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
-) else (
-    echo [start] Starting backend via python...
-    start "rvc-backend" /b python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
-)
+echo [start] Starting backend via !RVC_ENV_SOURCE!...
+start "rvc-backend" /b "!RVC_PYTHON!" -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 
 REM Get backend PID
 for /f %%a in ('powershell -Command "Get-Process | Where-Object {$_.ProcessName -eq 'python'} | Select-Object -First 1 -ExpandProperty Id"') do (

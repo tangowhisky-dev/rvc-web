@@ -2,13 +2,15 @@
 REM =============================================================================
 REM install.bat — rvc-web environment setup for Windows
 REM Supports: Windows 10/11, NVIDIA GPU (CUDA) or CPU fallback
-REM Requires: conda (Miniconda/Anaconda), Git, Node.js >=18 in PATH
+REM Requires: uv (https://github.com/astral-sh/uv), Git, Node.js >=18 in PATH
+REM   Install uv:  powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 REM =============================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-set ENV_NAME=%RVC_CONDA_ENV%
+set ENV_NAME=%RVC_ENV_NAME%
 if "!ENV_NAME!"=="" set ENV_NAME=rvc
+set ENV_DIR=%USERPROFILE%\.!ENV_NAME!
 set PYTHON_VERSION=3.11
 set NODE_MIN=18
 
@@ -17,8 +19,17 @@ echo [install] Platform: Windows
 REM ---------------------------------------------------------------------------
 REM 1. Check prerequisites
 REM ---------------------------------------------------------------------------
-where conda >nul 2>&1 || (echo [install] ERROR: conda not found. Install Miniconda: https://docs.conda.io/en/latest/miniconda.html && exit /b 1)
-where git   >nul 2>&1 || (echo [install] ERROR: git not found. Install Git for Windows: https://git-scm.com && exit /b 1)
+where uv >nul 2>&1
+if !errorlevel! NEQ 0 (
+    echo [install] ERROR: uv not found.
+    echo [install] Install it with:
+    echo [install]   powershell -c "irm https://astral.sh/uv/install.ps1 ^| iex"
+    echo [install] Then restart your terminal and re-run install.bat.
+    exit /b 1
+)
+for /f "tokens=*" %%v in ('uv --version') do echo [install] %%v ^✓
+
+where git >nul 2>&1 || (echo [install] ERROR: git not found. Install Git for Windows: https://git-scm.com && exit /b 1)
 
 REM Node.js check
 where node >nul 2>&1
@@ -73,136 +84,124 @@ if !errorlevel!==0 (
                 set CUDA_DEVICE=cuda
                 echo [install] Using cu126 index ^(CUDA 12.6^)
             ) else (
-                echo [install] CUDA !CUDA_VER! not supported ^(need 12.6+, 12.8, or 13.x^) — using CPU build
+                echo [install] CUDA !CUDA_VER! not supported ^(need 12.6+, 12.8, or 13.x^) -- using CPU build
             )
         ) else (
-            echo [install] CUDA !CUDA_VER! not supported ^(need 12.6+, 12.8, or 13.x^) — using CPU build
+            echo [install] CUDA !CUDA_VER! not supported ^(need 12.6+, 12.8, or 13.x^) -- using CPU build
         )
     )
 ) else (
-    echo [install] No NVIDIA GPU detected — using CPU build
+    echo [install] No NVIDIA GPU detected -- using CPU build
 )
 
 REM ---------------------------------------------------------------------------
-REM 2b. Install system audio libraries via conda
-REM
-REM     NOTE: ffmpeg is NOT required as a system package.
-REM       - The `av` Python package bundles its own FFmpeg shared libs.
-REM       - pydub has been removed (offline output is always WAV now).
-REM     sounddevice on Windows bundles PortAudio in the wheel, so only
-REM     libsndfile is needed via conda for soundfile to link correctly.
+REM 2b. System audio notes (Windows)
+REM     sounddevice bundles PortAudio in its wheel on Windows -- no extra install.
+REM     soundfile bundles libsndfile in its wheel on Windows -- no extra install.
+REM     ffmpeg is NOT required -- `av` bundles its own FFmpeg shared libs.
 REM ---------------------------------------------------------------------------
-echo [install] Installing libsndfile via conda...
-call conda install -n !ENV_NAME! -c conda-forge libsndfile -y -q
+echo [install] Note: PortAudio and libsndfile are bundled in their wheels on Windows -- no system install needed.
 
 REM ---------------------------------------------------------------------------
-REM 3. Create / update conda environment
+REM 3. Create / update uv virtual environment at %USERPROFILE%\.rvc
 REM ---------------------------------------------------------------------------
-conda env list | findstr /C:"!ENV_NAME!" >nul 2>&1
-if !errorlevel!==0 (
-    echo [install] Conda env '!ENV_NAME!' already exists — updating...
-    call conda install -n !ENV_NAME! python=!PYTHON_VERSION! -y -q
+echo [install] Setting up uv environment '!ENV_NAME!' at !ENV_DIR!...
+
+if exist "!ENV_DIR!\Scripts\python.exe" (
+    echo [install] Environment already exists -- reusing
+    echo [install] ^(Delete !ENV_DIR! to start fresh^)
 ) else (
-    echo [install] Creating conda env '!ENV_NAME!' with Python !PYTHON_VERSION!...
-    call conda create -n !ENV_NAME! python=!PYTHON_VERSION! -y -q
-)
-
-REM Activate environment
-call conda activate !ENV_NAME!
-if !errorlevel! NEQ 0 (
-    echo [install] Trying conda init approach...
-    call conda run -n !ENV_NAME! python --version >nul 2>&1 || (echo [install] ERROR: Could not activate conda env && exit /b 1)
-    set USE_CONDA_RUN=1
-)
-
-REM ---------------------------------------------------------------------------
-REM 4. Resolve uv
-REM ---------------------------------------------------------------------------
-set UV_BIN=
-where uv >nul 2>&1
-if !errorlevel!==0 (
-    for /f "delims=" %%p in ('where uv') do (
-        set UV_BIN=%%p
-        goto :uv_found
+    uv venv "!ENV_DIR!" --python !PYTHON_VERSION!
+    if !errorlevel! NEQ 0 (
+        echo [install] ERROR: uv venv creation failed
+        exit /b 1
     )
+    echo [install] Created uv venv at !ENV_DIR!
 )
-if exist "%USERPROFILE%\.cargo\bin\uv.exe"  set UV_BIN=%USERPROFILE%\.cargo\bin\uv.exe & goto :uv_found
-if exist "%USERPROFILE%\.local\bin\uv.exe"  set UV_BIN=%USERPROFILE%\.local\bin\uv.exe & goto :uv_found
-if exist "%LOCALAPPDATA%\uv\bin\uv.exe"     set UV_BIN=%LOCALAPPDATA%\uv\bin\uv.exe    & goto :uv_found
 
-echo [install] uv not found globally — installing into conda env...
-call conda run -n !ENV_NAME! pip install uv -q
-set UV=conda run -n !ENV_NAME! python -m uv pip
-goto :uv_done
+set RVC_PYTHON=!ENV_DIR!\Scripts\python.exe
+if not exist "!RVC_PYTHON!" (
+    echo [install] ERROR: Python interpreter not found at !RVC_PYTHON!
+    exit /b 1
+)
+for /f "tokens=*" %%v in ('"!RVC_PYTHON!" --version') do echo [install] %%v
 
-:uv_found
-for /f "delims=" %%p in ('conda run -n !ENV_NAME! python -c "import sys; print(sys.executable)"') do set CONDA_PYTHON=%%p
-echo [install] uv found: !UV_BIN! ^(targeting !CONDA_PYTHON!^)
-set UV=!UV_BIN! pip --python !CONDA_PYTHON!
-
-:uv_done
+set UV=uv pip --python "!RVC_PYTHON!"
 
 REM ---------------------------------------------------------------------------
-REM 5. Install PyTorch
+REM 4. Install PyTorch
 REM ---------------------------------------------------------------------------
 echo [install] Installing PyTorch...
 if "!TORCH_INDEX!"=="" (
-    call !UV! install torch torchaudio -q
+    call !UV! install torch torchaudio
 ) else (
     echo [install]   Using index: !TORCH_INDEX!
-    call !UV! install torch torchaudio --index-url !TORCH_INDEX! -q
+    call !UV! install torch torchaudio --index-url !TORCH_INDEX!
 )
+if !errorlevel! NEQ 0 (echo [install] ERROR: PyTorch install failed && exit /b 1)
 
 REM ---------------------------------------------------------------------------
-REM 6. Install faiss
+REM 5. Install faiss
 REM ---------------------------------------------------------------------------
 echo [install] Installing !FAISS_PKG!...
-call !UV! install !FAISS_PKG! -q
+call !UV! install !FAISS_PKG!
+if !errorlevel! NEQ 0 (echo [install] ERROR: faiss install failed && exit /b 1)
 
 REM ---------------------------------------------------------------------------
-REM 7. Install fairseq (One-sixth fork)
+REM 6. Install fairseq (One-sixth fork)
 REM ---------------------------------------------------------------------------
 echo [install] Installing build prerequisites for fairseq...
-call !UV! install Cython numpy -q
+call !UV! install Cython numpy
+if !errorlevel! NEQ 0 (echo [install] ERROR: Cython/numpy install failed && exit /b 1)
 
 echo [install] Installing fairseq ^(One-sixth fork^)...
-call !UV! install "fairseq @ git+https://github.com/One-sixth/fairseq.git" -q
+call !UV! install "fairseq @ git+https://github.com/One-sixth/fairseq.git"
+if !errorlevel! NEQ 0 (echo [install] ERROR: fairseq install failed && exit /b 1)
 
 REM ---------------------------------------------------------------------------
-REM 8. Install remaining requirements
+REM 7. Install remaining requirements
 REM ---------------------------------------------------------------------------
 echo [install] Installing remaining Python dependencies...
 
 set TMPFILE=%TEMP%\rvc_req_%RANDOM%.txt
-type nul > !TMPFILE!
+type nul > "!TMPFILE!"
 for /f "usebackq tokens=* delims=" %%L in (requirements.txt) do (
     set LINE=%%L
-    echo !LINE! | findstr /r "^#" >nul && goto :skip_line
-    echo !LINE! | findstr /r "^$" >nul && goto :skip_line
-    echo !LINE! | findstr /i "^torch ^torchaudio ^faiss ^fairseq ^onnxruntime sys_platform platform_machine" >nul && goto :skip_line
-    echo !LINE! >> !TMPFILE!
+    if not "!LINE!"=="" (
+        echo !LINE! | findstr /r "^#" >nul 2>&1 && goto :skip_line
+        echo !LINE! | findstr /i "^torch " >nul 2>&1 && goto :skip_line
+        echo !LINE! | findstr /i "^torchaudio" >nul 2>&1 && goto :skip_line
+        echo !LINE! | findstr /i "^faiss" >nul 2>&1 && goto :skip_line
+        echo !LINE! | findstr /i "^fairseq" >nul 2>&1 && goto :skip_line
+        echo !LINE! | findstr /i "^onnxruntime" >nul 2>&1 && goto :skip_line
+        echo !LINE! | findstr /i "sys_platform platform_machine" >nul 2>&1 && goto :skip_line
+        echo !LINE! >> "!TMPFILE!"
+    )
     :skip_line
 )
 
-call !UV! install -r !TMPFILE! -q
-del !TMPFILE! 2>nul
+call !UV! install -r "!TMPFILE!"
+if !errorlevel! NEQ 0 (echo [install] ERROR: requirements install failed && exit /b 1)
+del "!TMPFILE!" 2>nul
 
 echo [install] Installing !ONNX_PKG!...
-call !UV! install !ONNX_PKG! -q
+call !UV! install !ONNX_PKG!
+if !errorlevel! NEQ 0 (echo [install] ERROR: onnxruntime install failed && exit /b 1)
 
 REM ---------------------------------------------------------------------------
-REM 9. Install frontend dependencies
+REM 8. Install frontend dependencies
 REM ---------------------------------------------------------------------------
 echo [install] Installing frontend dependencies...
 cd frontend
 pnpm install
+if !errorlevel! NEQ 0 (echo [install] ERROR: pnpm install failed && exit /b 1)
 cd ..
 
 REM ---------------------------------------------------------------------------
-REM 10. Verify
+REM 9. Verify key imports
 REM ---------------------------------------------------------------------------
 echo [install] Verifying key imports...
-call conda run -n !ENV_NAME! python -c "
+"!RVC_PYTHON!" -c "
 import sys
 failures = []
 checks = [
@@ -216,7 +215,7 @@ checks = [
 for mod in checks:
     try:
         __import__(mod)
-        print(f'  OK  {mod}')
+        print(f'  ok  {mod}')
     except ImportError as e:
         print(f'  ERR {mod}: {e}')
         failures.append(mod)
@@ -227,6 +226,10 @@ if failures:
     print(f'FAILED: {failures}', file=sys.stderr)
     sys.exit(1)
 "
+if !errorlevel! NEQ 0 (
+    echo [install] ERROR: import verification failed -- check output above
+    exit /b 1
+)
 
 REM ---------------------------------------------------------------------------
 REM Done
@@ -234,8 +237,9 @@ REM ---------------------------------------------------------------------------
 echo.
 echo [install] =====================================================
 echo [install]   Installation complete
-echo [install]   Conda env : !ENV_NAME!
-echo [install]   Device    : !CUDA_DEVICE!
+echo [install]   venv   : !ENV_DIR!
+echo [install]   Python : !RVC_PYTHON!
+echo [install]   Device : !CUDA_DEVICE!
 echo [install]   Run:  start.bat
 echo [install] =====================================================
 

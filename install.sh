@@ -2,14 +2,16 @@
 # =============================================================================
 # install.sh — rvc-web environment setup
 # Supports: macOS (MPS), Linux + CUDA, Linux CPU-only
-# Requires: conda (Miniconda or Anaconda) in PATH
+# Requires: uv (https://github.com/astral-sh/uv) in PATH
+#           Install uv:  curl -LsSf https://astral.sh/uv/install.sh | sh
 # =============================================================================
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Configuration — override with environment variables before running
 # ---------------------------------------------------------------------------
-ENV_NAME="${RVC_CONDA_ENV:-rvc}"
+ENV_NAME="${RVC_ENV_NAME:-rvc}"
+ENV_DIR="$HOME/.${ENV_NAME}"
 PYTHON_VERSION="3.11"
 NODE_MIN="18"
 
@@ -29,18 +31,25 @@ need_cmd() { command -v "$1" &>/dev/null || die "'$1' not found — install it f
 # 1. Check prerequisites
 # ---------------------------------------------------------------------------
 info "Checking prerequisites..."
-need_cmd conda
+
+# uv
+if ! command -v uv &>/dev/null; then
+    die "uv not found. Install it with:
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+  Then restart your shell and re-run install.sh."
+fi
+info "uv $(uv --version) ✓"
 
 # Node.js — needed for frontend
 if command -v node &>/dev/null; then
     NODE_VER=$(node --version | sed 's/v//' | cut -d. -f1)
     if [ "$NODE_VER" -lt "$NODE_MIN" ]; then
-        warn "Node.js $NODE_VER found but ≥$NODE_MIN required. Upgrade before running start.sh."
+        warn "Node.js $NODE_VER found but >=$NODE_MIN required. Upgrade before running start.sh."
     else
         info "Node.js $(node --version) ✓"
     fi
 else
-    warn "Node.js not found — install Node ≥$NODE_MIN before running start.sh."
+    warn "Node.js not found — install Node >=$NODE_MIN before running start.sh."
 fi
 
 # pnpm
@@ -50,6 +59,9 @@ if ! command -v pnpm &>/dev/null; then
 else
     info "pnpm $(pnpm --version) ✓"
 fi
+
+# git (needed for fairseq install from GitHub)
+need_cmd git
 
 # ---------------------------------------------------------------------------
 # 2. Detect platform + compute device
@@ -75,7 +87,7 @@ case "$PLATFORM" in
                 CUDA_MINOR=$(echo "$CUDA_VER" | cut -d. -f2)
                 info "CUDA $CUDA_VER detected"
                 if [ "$CUDA_MAJOR" -ge 13 ]; then
-                    TORCH_INDEX=""
+                    TORCH_INDEX="https://download.pytorch.org/whl/cu130"
                     CUDA_DEVICE="cuda"
                 elif [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -ge 8 ]; then
                     TORCH_INDEX="https://download.pytorch.org/whl/cu128"
@@ -116,8 +128,6 @@ esac
 #     NOTE: ffmpeg is NOT required as a system package.
 #       - The `av` Python package bundles its own FFmpeg shared libs.
 #       - pydub has been removed (offline output is always WAV now).
-#     If you want to play/convert audio files manually with the ffmpeg CLI,
-#     install it separately — but it is not needed for rvc-web to run.
 # ---------------------------------------------------------------------------
 info "Installing system audio libraries (PortAudio, libsndfile)..."
 case "$PLATFORM" in
@@ -142,81 +152,55 @@ case "$PLATFORM" in
 esac
 
 # ---------------------------------------------------------------------------
-# 3. Create / update conda environment
+# 3. Create / update uv virtual environment at ~/.rvc
 # ---------------------------------------------------------------------------
-if conda env list | grep -qE "^${ENV_NAME}\s"; then
-    info "Conda env '${ENV_NAME}' already exists — updating..."
-    conda install -n "$ENV_NAME" python="$PYTHON_VERSION" -y --quiet
+info "Setting up uv environment '${ENV_NAME}' at ${ENV_DIR}..."
+
+if [ -d "$ENV_DIR" ]; then
+    info "Environment already exists — reusing (run 'rm -rf ${ENV_DIR}' to start fresh)"
 else
-    info "Creating conda env '${ENV_NAME}' with Python $PYTHON_VERSION..."
-    conda create -n "$ENV_NAME" python="$PYTHON_VERSION" -y --quiet
+    uv venv "$ENV_DIR" --python "$PYTHON_VERSION"
+    info "Created uv venv at ${ENV_DIR}"
 fi
 
-# Activate for subsequent steps
-# shellcheck disable=SC1091
-CONDA_BASE="$(conda info --base)"
-source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate "$ENV_NAME"
+# Resolve the Python interpreter inside the venv
+RVC_PYTHON="${ENV_DIR}/bin/python"
+[ -x "$RVC_PYTHON" ] || die "Python interpreter not found at ${RVC_PYTHON}"
+info "Python: $($RVC_PYTHON --version)"
 
-info "Python: $(python --version)"
-
-# ---------------------------------------------------------------------------
-# 4. Resolve uv — prefer the standalone binary over python -m uv
-#    so the conda env's Python doesn't need uv installed inside it.
-# ---------------------------------------------------------------------------
-UV_BIN=""
-for candidate in \
-    "$(command -v uv 2>/dev/null)" \
-    "$HOME/.cargo/bin/uv" \
-    "$HOME/.local/bin/uv" \
-    "/usr/local/bin/uv"
-do
-    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-        UV_BIN="$candidate"
-        break
-    fi
-done
-
-if [ -n "$UV_BIN" ]; then
-    info "uv found: $UV_BIN"
-    UV="$UV_BIN pip"
-else
-    info "uv not found globally — installing into conda env..."
-    pip install uv --quiet
-    UV="python -m uv pip"
-fi
+# Short alias — all package installs target this interpreter
+UV="uv pip --python $RVC_PYTHON"
 
 # ---------------------------------------------------------------------------
-# 5. Install PyTorch (must come before other packages that depend on torch)
+# 4. Install PyTorch (must come before other packages that depend on torch)
 # ---------------------------------------------------------------------------
 info "Installing PyTorch..."
-if [ -n "$TORCH_INDEX" ]; then
+if [ -n "${TORCH_INDEX:-}" ]; then
     info "  Using index: $TORCH_INDEX"
-    $UV install torch torchaudio --index-url "$TORCH_INDEX" --quiet
+    $UV install torch torchaudio --index-url "$TORCH_INDEX"
 else
-    $UV install torch torchaudio --quiet
+    $UV install torch torchaudio
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Install faiss (platform-specific)
+# 5. Install faiss (platform-specific)
 # ---------------------------------------------------------------------------
 info "Installing $FAISS_PKG..."
-$UV install "$FAISS_PKG" --quiet
+$UV install "$FAISS_PKG"
 
 # ---------------------------------------------------------------------------
-# 7. Install fairseq from One-sixth fork
+# 6. Install fairseq from One-sixth fork
 #    Must be after torch; build needs Cython + numpy already present.
 # ---------------------------------------------------------------------------
 info "Installing build prerequisites for fairseq..."
-$UV install Cython numpy --quiet
+$UV install Cython numpy
 
 info "Installing fairseq (One-sixth fork — Python 3.10+ compatible)..."
-$UV install "fairseq @ git+https://github.com/One-sixth/fairseq.git" --quiet
+$UV install "fairseq @ git+https://github.com/One-sixth/fairseq.git"
 
 # ---------------------------------------------------------------------------
-# 8. Install remaining requirements
+# 7. Install remaining requirements
 #    Excludes: torch/torchaudio, faiss, fairseq, onnxruntime (platform-specific)
-#    and lines with sys_platform/platform_machine markers (handled below).
 # ---------------------------------------------------------------------------
 info "Installing remaining Python dependencies..."
 
@@ -226,15 +210,15 @@ grep -vE "^\s*#|^$" requirements.txt \
     | grep -v "sys_platform\|platform_machine" \
     > "$TMPFILE"
 
-$UV install -r "$TMPFILE" --quiet
+$UV install -r "$TMPFILE"
 rm -f "$TMPFILE"
 
 # onnxruntime — correct variant for this platform
 info "Installing $ONNX_PKG..."
-$UV install "$ONNX_PKG" --quiet
+$UV install "$ONNX_PKG"
 
 # ---------------------------------------------------------------------------
-# 9. Install frontend dependencies
+# 8. Install frontend dependencies
 # ---------------------------------------------------------------------------
 info "Installing frontend dependencies (pnpm)..."
 cd frontend
@@ -242,10 +226,10 @@ pnpm install --frozen-lockfile 2>/dev/null || pnpm install
 cd ..
 
 # ---------------------------------------------------------------------------
-# 10. Verify key imports
+# 9. Verify key imports
 # ---------------------------------------------------------------------------
 info "Verifying key imports..."
-python - <<'PYCHECK'
+"$RVC_PYTHON" - <<'PYCHECK'
 import sys
 failures = []
 checks = [
@@ -259,9 +243,9 @@ checks = [
 for mod in checks:
     try:
         __import__(mod)
-        print(f"  ✓ {mod}")
+        print(f"  ok  {mod}")
     except ImportError as e:
-        print(f"  ✗ {mod}: {e}")
+        print(f"  ERR {mod}: {e}")
         failures.append(mod)
 
 import torch
@@ -278,9 +262,10 @@ PYCHECK
 # Done
 # ---------------------------------------------------------------------------
 info ""
-info "═══════════════════════════════════════════════════════"
+info "======================================================="
 info "  Installation complete"
-info "  Conda env : ${ENV_NAME}"
-info "  Device    : ${CUDA_DEVICE:-mps/cpu}"
+info "  venv      : ${ENV_DIR}"
+info "  Python    : ${RVC_PYTHON}"
+info "  Device    : ${CUDA_DEVICE}"
 info "  Run:  ./start.sh"
-info "═══════════════════════════════════════════════════════"
+info "======================================================="

@@ -53,7 +53,7 @@ def _get_device(requested: str) -> torch.device:
 
 def _load_trainer_module():
     """Import beatrice_trainer.__main__ from the sibling trainer/ directory."""
-    trainer_main = Path(__file__).parent / "trainer" / "beatrice_trainer" / "__main__.py"
+    trainer_main = Path(__file__).parent / "beatrice_trainer" / "__main__.py"
     if not trainer_main.exists():
         raise FileNotFoundError(
             f"Trainer not found at {trainer_main}\n"

@@ -1,34 +1,25 @@
 # Codebase Map
 
-Generated: 2026-04-22T04:54:07Z | Files: 237 | Described: 0/237
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-22T04:54:07Z","fingerprint":"8a2ad0b8ab204fcd41f90f40d490a7f9293f18a7","fileCount":237,"truncated":false} -->
+Generated: 2026-04-22T05:19:49Z | Files: 230 | Described: 0/230
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-22T05:19:49Z","fingerprint":"1b1b0c7e46516c87011e75bfe7f71c2a345d7ef0","fileCount":230,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
 - `.gitignore`
-- `convert_nemo_to_pt.py`
 - `install.bat`
 - `install.sh`
 - `pytest.ini`
 - `README.md`
 - `requirements.txt`
-- `RT-VC-ANALYSIS.md`
 - `start.bat`
 - `start.sh`
 - `stop.bat`
 - `stop.sh`
-- `validate_speaker_encoder_strict.py`
-- `validate_speaker_encoder.py`
-- `VOCODER-COMPARISON.md`
 
-### assets/
-- `assets/chtts.yaml`
-- `assets/hubert.yaml`
-- `assets/rmvpe.yaml`
-- `assets/rvc.yaml`
-- `assets/uvr5.yaml`
-- `assets/v1.yaml`
-- `assets/v2.yaml`
+### additional/
+- `additional/convert_nemo_to_pt.py`
+- `additional/validate_speaker_encoder_strict.py`
+- `additional/validate_speaker_encoder.py`
 
 ### assets/hubert/
 - `assets/hubert/.gitignore`
@@ -299,10 +290,12 @@ Generated: 2026-04-22T04:54:07Z | Files: 237 | Described: 0/237
 - `docs/DEITERIS-VC-ANALYSIS.md`
 - `docs/KNOWLEDGE.md`
 - `docs/REALTIME_CLIENT_IO_MIGRATION.md`
+- `docs/RT-VC-ANALYSIS.md`
 - `docs/TRAINING_COMPARISON.md`
 - `docs/TRAINING_PIPELINE_AUDIT.md`
 - `docs/TRAINING_PIPELINE.md`
 - `docs/TRAINING_STRATEGY.md`
+- `docs/VOCODER-COMPARISON.md`
 - `docs/WAY-FORWARD.md`
 
 ### frontend/
@@ -363,7 +356,7 @@ Generated: 2026-04-22T04:54:07Z | Files: 237 | Described: 0/237
 ### logs/mute/3_feature768/
 - `logs/mute/3_feature768/mute.npy`
 
-### old_beatrice/
-- `old_beatrice/__init__.py`
-- `old_beatrice/__main__.py`
-- `old_beatrice/convert.py`
+### original_beatrice/
+- `original_beatrice/__init__.py`
+- `original_beatrice/__main__.py`
+- `original_beatrice/convert.py`

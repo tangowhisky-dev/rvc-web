@@ -105,7 +105,7 @@ if [ "$ASSET_ERRORS" -gt 0 ]; then
   echo "      ecapa_tdnn.pt           -> assets/ecapa/"
   echo ""
   echo "    Beatrice 2 weights (automated, downloads 20 IR + 20 noise files):"
-  echo "      conda run -n \${RVC_CONDA_ENV:-rvc} python -m backend.beatrice2.download_assets"
+  echo "      python -m backend.beatrice2.download_assets"
   echo ""
   exit 1
 fi
@@ -114,13 +114,49 @@ echo "  All assets present -- proceeding."
 echo ""
 
 # ---------------------------------------------------------------------------
-# 3. Detect available compute device
-#    Priority: CUDA > MPS > CPU
+# 3. Resolve Python interpreter
+#    Priority: conda env 'rvc' → uv venv ~/.rvc
 # ---------------------------------------------------------------------------
-CONDA_ENV="${RVC_CONDA_ENV:-rvc}"
-if conda run -n "$CONDA_ENV" python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+ENV_NAME="${RVC_ENV_NAME:-rvc}"
+RVC_PYTHON=""
+RVC_ENV_SOURCE=""
+
+# 1) Try conda
+if command -v conda >/dev/null 2>&1; then
+  CONDA_BASE="$(conda info --base 2>/dev/null)" || CONDA_BASE=""
+  if [ -n "$CONDA_BASE" ]; then
+    CONDA_PY="${CONDA_BASE}/envs/${ENV_NAME}/bin/python"
+    if [ -x "$CONDA_PY" ]; then
+      RVC_PYTHON="$CONDA_PY"
+      RVC_ENV_SOURCE="conda env '${ENV_NAME}'"
+    fi
+  fi
+fi
+
+# 2) Fall back to uv venv at ~/.rvc
+if [ -z "$RVC_PYTHON" ]; then
+  UV_PY="$HOME/.${ENV_NAME}/bin/python"
+  if [ -x "$UV_PY" ]; then
+    RVC_PYTHON="$UV_PY"
+    RVC_ENV_SOURCE="uv venv '$HOME/.${ENV_NAME}'"
+  fi
+fi
+
+if [ -z "$RVC_PYTHON" ]; then
+  echo "[start] ERROR: No Python environment named '${ENV_NAME}' found."
+  echo "[start]        Tried:"
+  echo "[start]          conda: \$(conda info --base)/envs/${ENV_NAME}/bin/python"
+  echo "[start]          uv:    $HOME/.${ENV_NAME}/bin/python"
+  echo "[start]        Run ./install.sh to create the environment."
+  exit 1
+fi
+
+echo "[start] Python: $RVC_PYTHON  (via $RVC_ENV_SOURCE)"
+
+# Detect available compute device
+if "$RVC_PYTHON" -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
   export RVC_DEVICE="cuda"
-elif conda run -n "$CONDA_ENV" python -c "import torch; exit(0 if torch.backends.mps.is_available() else 1)" 2>/dev/null; then
+elif "$RVC_PYTHON" -c "import torch; exit(0 if torch.backends.mps.is_available() else 1)" 2>/dev/null; then
   export RVC_DEVICE="mps"
 else
   export RVC_DEVICE="cpu"
@@ -321,7 +357,7 @@ echo "[start] -----------------------------------------------"
 echo "[start] Device summary"
 echo "[start]   OS:      $PLATFORM"
 echo "[start]   Device:  $RVC_DEVICE"
-python - <<'PYEOF' 2>/dev/null || true
+"$RVC_PYTHON" - <<'PYEOF' 2>/dev/null || true
 import torch, sys
 if torch.cuda.is_available():
     props = torch.cuda.get_device_properties(0)
@@ -337,15 +373,8 @@ echo "[start] -----------------------------------------------"
 # ---------------------------------------------------------------------------
 # 10. Start backend
 # ---------------------------------------------------------------------------
-RVC_CONDA_ENV="${RVC_CONDA_ENV:-rvc}"
-
 echo "[start] Starting backend..."
-if command -v conda >/dev/null 2>&1; then
-  KMP_DUPLICATE_LIB_OK=TRUE conda run --no-capture-output -n "$RVC_CONDA_ENV" \
-    uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 &
-else
-  python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 &
-fi
+"$RVC_PYTHON" -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
 echo "$BACKEND_PID" > .pids/backend.pid
 echo "[start] Backend PID $BACKEND_PID"
