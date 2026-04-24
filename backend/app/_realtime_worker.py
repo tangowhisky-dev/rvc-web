@@ -234,6 +234,8 @@ def _run_beatrice2_realtime(
     profile_rms,
     audio_save_q,
     audio_in_save_q,
+    session_id: str = "",
+    infer_device: str = "cpu",
 ) -> None:
     """Beatrice 2 realtime loop.
 
@@ -375,7 +377,7 @@ def _run_beatrice2_realtime(
         return out_full[:return_length].astype(np.float32)
 
     # ---- Audio I/O loop ----
-    evt_q.put({"type": "ready"})
+    evt_q.put({"event": "ready", "session_id": session_id, "device": infer_device})
 
     def _audio_callback(indata, outdata, frames, time_info, status):
         block_in = indata[:, 0].astype(np.float32)
@@ -548,6 +550,8 @@ def run_worker(
                 profile_rms=profile_rms,
                 audio_save_q=audio_save_q,
                 audio_in_save_q=audio_in_save_q,
+                session_id=session_id,
+                infer_device=infer_device,
             )
             return
 
