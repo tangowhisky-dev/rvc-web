@@ -411,6 +411,7 @@ export default function OfflinePage() {
     if (autoPitch && !sel?.has_speaker_f0) {
       setAutoPitch(false);
       setPitchShift(0);
+      setPitch(0);
     }
   }, [profileId, profiles]);
 
@@ -434,7 +435,8 @@ export default function OfflinePage() {
   }, [outputUrl]);
 
   // Auto pitch-shift: fetch profile mean F0, compute input file mean F0 via
-  // Web Audio FFT approximation, derive semitone shift.
+  // backend DIO (pyworld), derive semitone shift.
+  // Works for both RVC and Beatrice 2 profiles.
   useEffect(() => {
     if (!autoPitch || !profileId || !inputFile) {
       setAutoPitchValue(null);
@@ -446,56 +448,39 @@ export default function OfflinePage() {
 
     (async () => {
       try {
-        // 1. Fetch profile mean F0 from backend
+        // 1. Fetch profile mean F0 from backend (precomputed by DIO on training audio)
         const res = await fetch(`${API}/api/offline/speaker_f0/${profileId}`);
-        if (!res.ok) throw new Error('speaker_f0.json not found — train first');
+        if (!res.ok) throw new Error('speaker_f0.json not found — compute it first');
         const { mean_f0: profileF0 } = await res.json();
 
-        // 2. Compute mean F0 of input file using Web Audio autocorrelation
-        const arrayBuf = await inputFile.arrayBuffer();
-        const audioCtx = new AudioContext({ sampleRate: 16000 });
-        const decoded  = await audioCtx.decodeAudioData(arrayBuf);
-        const pcm      = decoded.getChannelData(0);
-
-        // Autocorrelation pitch detection — frame-based, voiced frames only
-        const frameSize = 2048;   // ~128ms @ 16kHz
-        const hop       = 512;
-        const minPeriod = Math.round(16000 / 800);  // 800 Hz max
-        const maxPeriod = Math.round(16000 / 50);   // 50 Hz min
-        let sumLogF0 = 0, nFrames = 0;
-
-        for (let start = 0; start + frameSize < pcm.length; start += hop) {
-          const frame = pcm.slice(start, start + frameSize);
-          // Compute autocorrelation
-          let bestCorr = -1, bestPeriod = -1;
-          for (let p = minPeriod; p <= maxPeriod; p++) {
-            let corr = 0, norm = 0;
-            for (let i = 0; i < frameSize - p; i++) {
-              corr += frame[i] * frame[i + p];
-              norm += frame[i] * frame[i] + frame[i + p] * frame[i + p];
-            }
-            const r = norm > 0 ? (2 * corr) / norm : 0;
-            if (r > bestCorr) { bestCorr = r; bestPeriod = p; }
-          }
-          // Only count voiced frames (correlation threshold)
-          if (bestCorr > 0.3 && bestPeriod > 0) {
-            const f0 = 16000 / bestPeriod;
-            sumLogF0 += Math.log(f0);
-            nFrames++;
-          }
+        // 2. Compute mean F0 of input file via backend DIO (same algorithm as profile)
+        const form = new FormData();
+        form.append('file', inputFile);
+        const f0Res = await fetch(`${API}/api/offline/input_f0`, {
+          method: 'POST',
+          body: form,
+        });
+        if (!f0Res.ok) {
+          const err = await f0Res.json().catch(() => ({ detail: 'input F0 failed' }));
+          throw new Error(err.detail ?? 'input F0 computation failed');
         }
-        audioCtx.close();
+        const { mean_f0: inputF0 } = await f0Res.json();
 
-        if (nFrames === 0) throw new Error('No voiced frames detected in input');
-        const inputF0 = Math.exp(sumLogF0 / nFrames);
-
-        // 3. Compute semitone shift: 12 × log₂(profileF0 / inputF0)
+        // 3. Semitone shift: 12 × log₂(profileF0 / inputF0), rounded to nearest 0.5
         const semitones = 12 * Math.log2(profileF0 / inputF0);
-        const rounded   = Math.round(semitones * 2) / 2;  // round to nearest 0.5
+        const rounded   = Math.round(semitones * 2) / 2;
 
         if (!cancelled) {
           setAutoPitchValue(rounded);
-          setPitchShift(rounded);
+          // Route to the correct param depending on pipeline:
+          //   RVC       → pitch (the key= semitone slider, passed as pitch form field)
+          //   Beatrice2 → pitchShift (pitch_shift_semitones form field)
+          const pipeline = profiles.find(p => p.id === profileId)?.pipeline;
+          if (pipeline === 'beatrice2') {
+            setPitchShift(rounded);
+          } else {
+            setPitch(Math.round(rounded));  // RVC pitch is integer semitones
+          }
         }
       } catch (e: any) {
         if (!cancelled) {
@@ -508,7 +493,7 @@ export default function OfflinePage() {
     })();
 
     return () => { cancelled = true; };
-  }, [autoPitch, profileId, inputFile]);
+  }, [autoPitch, profileId, inputFile, profiles]);
 
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
@@ -748,10 +733,51 @@ export default function OfflinePage() {
             </div>
           ) : (
           <div className="grid grid-cols-3 gap-6">
-            <ParamSlider
-              label="Pitch" value={pitch} min={-24} max={24} step={1}
-              onChange={setPitch} hint="Semitones shift"
-            />
+            {/* Pitch with auto-compute toggle (RVC) */}
+            <div className="flex flex-col gap-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-mono text-zinc-400">
+                  Pitch ({pitch > 0 ? '+' : ''}{pitch} st)
+                </span>
+                <label className={`flex items-center gap-1.5 select-none ${selectedProfile?.has_speaker_f0 ? 'cursor-pointer' : 'cursor-not-allowed opacity-40'}`}
+                  title={selectedProfile?.has_speaker_f0 ? 'Auto-compute from profile & input F0' : 'Compute profile F0 first'}>
+                  <input
+                    type="checkbox"
+                    checked={autoPitch}
+                    disabled={!selectedProfile?.has_speaker_f0}
+                    onChange={e => {
+                      setAutoPitch(e.target.checked);
+                      if (!e.target.checked) setPitch(0);
+                    }}
+                    className="w-3 h-3 accent-cyan-400"
+                  />
+                  <span className="text-[10px] font-mono text-cyan-400">
+                    {autoPitchLoading ? 'computing…' : 'auto'}
+                  </span>
+                </label>
+              </div>
+              <input
+                type="range"
+                min={-24} max={24} step={1}
+                value={pitch}
+                disabled={autoPitch}
+                onChange={e => setPitch(Number(e.target.value))}
+                className="w-full h-1 accent-cyan-500 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              />
+              <div className="flex items-center justify-between text-[10px] font-mono">
+                <span className="text-zinc-600">-24 st</span>
+                {autoPitch && autoPitchValue !== null ? (
+                  <span className="text-cyan-400/80">
+                    auto: {autoPitchValue > 0 ? '+' : ''}{Math.round(autoPitchValue)} st
+                  </span>
+                ) : autoPitch && !autoPitchLoading ? (
+                  <span className="text-amber-400/70">needs input file</span>
+                ) : selectedProfile?.has_speaker_f0 ? (
+                  <span className="text-zinc-600">{selectedProfile.speaker_mean_f0?.toFixed(1)} Hz profile</span>
+                ) : null}
+                <span className="text-zinc-600">+24 st</span>
+              </div>
+            </div>
             <ParamSlider
               label="Index Rate" value={indexRate} min={0} max={1} step={0.01}
               onChange={setIndexRate} hint="FAISS retrieval blend"

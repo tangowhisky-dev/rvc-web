@@ -931,3 +931,65 @@ async def analyze_job(job_id: str, profile_id: Optional[str] = None):
 
     return result
 
+
+# ---------------------------------------------------------------------------
+# POST /api/offline/input_f0  — compute mean F0 of an uploaded audio file
+# ---------------------------------------------------------------------------
+
+@router.post("/input_f0")
+async def compute_input_f0(file: UploadFile = File(...)):
+    """Compute the geometric mean F0 of an uploaded audio file using pyworld DIO.
+
+    Mirrors the same algorithm used for profile F0 computation so both sides
+    of the auto pitch-shift formula are on equal footing.
+
+    Returns:
+        {"mean_f0": float, "method": "dio", "n_frames": int}
+    Raises:
+        422 if no voiced frames are found (silent or non-speech file).
+    """
+    import json as _json
+    import math as _math
+    import numpy as _np
+    import torch as _torch
+    import torchaudio as _torchaudio
+    import pyworld as _pyworld
+
+    audio_bytes = await file.read()
+    try:
+        buf = io.BytesIO(audio_bytes)
+        audio_data, orig_sr = sf.read(buf, dtype="float32", always_2d=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot read audio file: {e}")
+
+    # Mono
+    if audio_data.ndim == 2:
+        audio_mono = audio_data.mean(axis=1)
+    else:
+        audio_mono = audio_data
+
+    # Resample to 16 kHz (DIO works well at 16 kHz; avoids spending time on
+    # high-frequency content that carries no pitch information).
+    if orig_sr != _SR_16K:
+        t = _torch.from_numpy(audio_mono).unsqueeze(0)
+        from torchaudio.transforms import Resample as _R
+        t = _R(orig_freq=orig_sr, new_freq=_SR_16K)(t).squeeze(0)
+        audio_mono = t.numpy()
+
+    def _run():
+        mono64 = audio_mono.astype(_np.float64)
+        f0, _ = _pyworld.dio(mono64, _SR_16K, f0_floor=50.0, f0_ceil=800.0)
+        voiced = f0[f0 > 0]
+        if len(voiced) == 0:
+            raise ValueError("No voiced frames found — is the file speech?")
+        mean_f0 = _math.exp(float(_np.log(voiced).mean()))
+        return round(mean_f0, 4), int(len(voiced))
+
+    loop = asyncio.get_event_loop()
+    try:
+        mean_f0, n_frames = await loop.run_in_executor(None, _run)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return {"mean_f0": mean_f0, "method": "dio", "n_frames": n_frames}
+
