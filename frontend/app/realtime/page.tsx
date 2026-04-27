@@ -212,7 +212,7 @@ export default function RealtimePage() {
   const wsRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const paramsRef = useRef<SessionParams>(DEFAULT_PARAMS);
-
+  const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Keep paramsRef in sync
   useEffect(() => {
     paramsRef.current = params;
@@ -311,6 +311,7 @@ export default function RealtimePage() {
               setSessionState('idle');
               setSessionId(null);
               sessionIdRef.current = null;
+              cleanup();
             }
           };
         }
@@ -333,6 +334,10 @@ export default function RealtimePage() {
   // ---------------------------------------------------------------------------
 
   const cleanup = useCallback(() => {
+    if (stopTimeoutRef.current !== null) {
+      clearTimeout(stopTimeoutRef.current);
+      stopTimeoutRef.current = null;
+    }
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
@@ -582,6 +587,7 @@ export default function RealtimePage() {
           setSessionState('idle');
           setSessionId(null);
           sessionIdRef.current = null;
+          cleanup();
         }
       };
     } catch (err) {
@@ -623,8 +629,20 @@ export default function RealtimePage() {
       setSessionState('idle');
       setSessionId(null);
       sessionIdRef.current = null;
+      return;
     }
-    // Otherwise: let ws.onmessage({ type: 'done' }) do the cleanup.
+
+    // Fallback: if 'done' doesn't arrive within 6s after stop, force-cleanup so
+    // the UI never stays stuck in 'stopping'. Covers worker crashes, save-thread
+    // hangs, or any future bug that prevents 'stopped' from being emitted.
+    stopTimeoutRef.current = setTimeout(() => {
+      stopTimeoutRef.current = null;
+      cleanup();
+      setSessionState('idle');
+      setSessionId(null);
+      sessionIdRef.current = null;
+    }, 6000);
+    // ws.onmessage({ type: 'done' }) calls cleanup() which cancels this timeout.
   }, [cleanup]);
 
   // ---------------------------------------------------------------------------

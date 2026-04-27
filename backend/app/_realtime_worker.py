@@ -379,6 +379,8 @@ def _run_beatrice2_realtime(
     # ---- Audio I/O loop ----
     evt_q.put({"event": "ready", "session_id": session_id, "device": infer_device})
 
+    _decim_b2 = max(1, _BLOCK_48K_LOCAL // 800)
+
     def _audio_callback(indata, outdata, frames, time_info, status):
         block_in = indata[:, 0].astype(np.float32)
         out_block = _process_block(block_in)
@@ -391,6 +393,20 @@ def _run_beatrice2_realtime(
             audio_save_q.put(out_block.copy())
         if audio_in_save_q is not None:
             audio_in_save_q.put(block_in.copy())
+        # Waveform visualiser — downsample to ~800 samples then base64-encode
+        try:
+            evt_q.put_nowait({
+                "event": "waveform_in",
+                "samples": base64.b64encode(block_in[::_decim_b2].tobytes()).decode(),
+                "sr": 48000,
+            })
+            evt_q.put_nowait({
+                "event": "waveform_out",
+                "samples": base64.b64encode(out_block[::_decim_b2].tobytes()).decode(),
+                "sr": 48000,
+            })
+        except Exception:
+            pass
 
     with _sd.Stream(
         samplerate=48000,
