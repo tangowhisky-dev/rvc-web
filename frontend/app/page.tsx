@@ -39,6 +39,14 @@ interface Profile {
   audio_files: AudioFile[];
   has_speaker_f0: boolean;
   speaker_mean_f0: number | null;
+  speaker_std_f0?: number | null;
+  speaker_p5_f0?: number | null;
+  speaker_p25_f0?: number | null;
+  speaker_p50_f0?: number | null;
+  speaker_p75_f0?: number | null;
+  speaker_p95_f0?: number | null;
+  speaker_vel_std?: number | null;
+  speaker_voiced_rate?: number | null;
 }
 
 interface HealthStatus {
@@ -911,12 +919,11 @@ function AudioFileRow({ profileId, audioFile, onDeleted, onCleaned }: AudioFileR
 }
 
 // ---------------------------------------------------------------------------
-// F0Button — compute / recalculate speaker mean F0 for a profile
+// F0Button — compute / recalculate speaker F0 prior stats for a profile
 // ---------------------------------------------------------------------------
-function F0Button({ profileId, hasSpeakerF0, speakerMeanF0, onRefresh }: {
+function F0Button({ profileId, profile, onRefresh }: {
   profileId: string;
-  hasSpeakerF0: boolean;
-  speakerMeanF0: number | null;
+  profile: Profile;
   onRefresh: () => void;
 }) {
   const [computing, setComputing] = useState(false);
@@ -938,19 +945,26 @@ function F0Button({ profileId, hasSpeakerF0, speakerMeanF0, onRefresh }: {
     }
   }
 
+  const hasFull = profile.speaker_p5_f0 != null;
+  const tip = profile.has_speaker_f0
+    ? hasFull
+      ? `μ=${profile.speaker_mean_f0?.toFixed(1)}Hz  σ=${profile.speaker_std_f0?.toFixed(3)}  range=[${profile.speaker_p5_f0?.toFixed(0)}–${profile.speaker_p95_f0?.toFixed(0)} Hz]  vel=${profile.speaker_vel_std?.toFixed(4)}  voiced=${((profile.speaker_voiced_rate ?? 0) * 100).toFixed(0)}%`
+      : `Recalculate — current: ${profile.speaker_mean_f0?.toFixed(1)} Hz (legacy, missing percentiles)`
+    : 'Compute F0 prior statistics for auto pitch-shift at inference';
+
   return (
     <button
       onClick={handleCompute}
       disabled={computing}
-      title={hasSpeakerF0
-        ? `Recalculate profile mean F0 (current: ${speakerMeanF0?.toFixed(1)} Hz)`
-        : 'Calculate speaker mean F0 for auto pitch-shift at inference'}
+      title={tip}
       className="px-3 py-1.5 rounded-md text-[11px] font-mono uppercase tracking-wider
                  border transition-colors disabled:opacity-40
                  text-cyan-400 border-cyan-900/50 bg-cyan-950/20
                  hover:bg-cyan-900/30 hover:border-cyan-800/60">
-      {computing ? '⟳' : hasSpeakerF0
-        ? `F0 ${speakerMeanF0?.toFixed(0)}Hz ↺`
+      {computing ? '⟳' : profile.has_speaker_f0
+        ? hasFull
+          ? `F0 ${profile.speaker_mean_f0?.toFixed(0)}Hz ✓`
+          : `F0 ${profile.speaker_mean_f0?.toFixed(0)}Hz ↺`
         : 'Calc F0'}
     </button>
   );
@@ -1215,7 +1229,7 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
                        disabled:opacity-40">
             {exporting ? '⟳' : '↑ Export'}
           </button>
-          <F0Button profileId={profile.id} hasSpeakerF0={profile.has_speaker_f0} speakerMeanF0={profile.speaker_mean_f0} onRefresh={onRefresh} />
+          <F0Button profileId={profile.id} profile={profile} onRefresh={onRefresh} />
           <button onClick={handleDelete} disabled={deleting}
             className="px-3 py-1.5 rounded-md text-[11px] font-mono uppercase tracking-wider
                        text-red-400 border border-red-900/50 bg-red-950/20
@@ -1225,6 +1239,18 @@ function ProfileCard({ profile, onDeleted, onRefresh }: ProfileCardProps) {
           </button>
         </div>
       </div>
+
+      {/* ── F0 prior stats strip ─────────────────────────────────────── */}
+      {profile.has_speaker_f0 && profile.speaker_p5_f0 != null && (
+        <div className="border-t border-zinc-700/40 bg-zinc-900/30 px-5 py-2 flex flex-wrap gap-x-4 gap-y-0.5 text-[10px] font-mono text-zinc-400">
+          <span title="Geometric mean F0">μ {profile.speaker_mean_f0?.toFixed(1)} Hz</span>
+          <span title="Log-space std (distribution width)">σ {profile.speaker_std_f0?.toFixed(3)}</span>
+          <span title="Modal pitch (median)">P50 {profile.speaker_p50_f0?.toFixed(1)} Hz</span>
+          <span title="Speaking range (P5–P95)">range [{profile.speaker_p5_f0?.toFixed(0)}–{profile.speaker_p95_f0?.toFixed(0)} Hz]</span>
+          <span title="Velocity std (intonation dynamics)">vel {profile.speaker_vel_std?.toFixed(4)}</span>
+          <span title="Voiced frame fraction">voiced {((profile.speaker_voiced_rate ?? 0) * 100).toFixed(0)}%</span>
+        </div>
+      )}
 
       {/* ── Health error strip ────────────────────────────────────────── */}
       {health && health.errors.length > 0 && (

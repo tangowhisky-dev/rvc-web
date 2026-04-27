@@ -193,6 +193,15 @@ export default function RealtimePage() {
   // Params
   const [params, setParams] = useState<SessionParams>(DEFAULT_PARAMS);
 
+  // F0 prior stats for the selected profile (fetched when profile changes)
+  const [profileF0Stats, setProfileF0Stats] = useState<{
+    mean_f0: number; std_f0: number;
+    p5_f0?: number; p25_f0?: number; p50_f0?: number; p75_f0?: number; p95_f0?: number;
+    vel_std?: number; voiced_rate?: number; f0_hist?: number[];
+  } | null>(null);
+  // Whether to apply F0 prior normalization in realtime (requires profile stats)
+  const [autoPitchRt, setAutoPitchRt] = useState(false);
+
   // Canvas key — incremented on each session start to force fresh DOM canvas elements.
   // Once transferControlToOffscreen() is called, the canvas cannot be re-transferred.
   // Incrementing this key causes React to unmount + remount the canvas elements,
@@ -222,6 +231,15 @@ export default function RealtimePage() {
   useEffect(() => {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
+
+  // Fetch profile F0 stats whenever profileId changes
+  useEffect(() => {
+    if (!profileId) { setProfileF0Stats(null); return; }
+    fetch(`${API}/api/offline/speaker_f0/${profileId}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => setProfileF0Stats(d))
+      .catch(() => setProfileF0Stats(null));
+  }, [profileId]);
 
   // ---------------------------------------------------------------------------
   // Fetch devices on mount
@@ -466,6 +484,17 @@ export default function RealtimePage() {
           ...params,
           use_best: useBest,
           ...(saveEnabled && resolvedSavePath ? { save_path: resolvedSavePath } : {}),
+          // F0 prior: send target stats as soft-clip guardrails when autoPitchRt is on.
+          // Affine normalization is NOT applied in realtime (no source file CDF available).
+          ...(autoPitchRt && profileF0Stats ? {
+            f0_norm_params: {
+              // Soft-clip bounds
+              ...(profileF0Stats.p5_f0 && profileF0Stats.p95_f0 ? {
+                p5_tgt: profileF0Stats.p5_f0,
+                p95_tgt: profileF0Stats.p95_f0,
+              } : {}),
+            },
+          } : {}),
         }),
       });
 
@@ -814,6 +843,24 @@ export default function RealtimePage() {
                   Use best variant
                 </span>
               </label>
+              {/* F0 prior guardrail — soft-clips pitch to target's speaking range */}
+              {profileF0Stats?.p5_f0 && profileF0Stats?.p95_f0 && (
+                <label className="flex items-center gap-2 cursor-pointer select-none mt-0.5">
+                  <input
+                    type="checkbox"
+                    checked={autoPitchRt}
+                    disabled={isActive || isBusy}
+                    onChange={(e) => setAutoPitchRt(e.target.checked)}
+                    className="w-4 h-4 rounded border border-zinc-600 bg-zinc-900 accent-cyan-500 focus:ring-2 focus:ring-cyan-500/50 disabled:opacity-40"
+                  />
+                  <span className="text-[11px] font-mono text-zinc-300">
+                    F0 guardrail{' '}
+                    <span className="text-zinc-500">
+                      [{profileF0Stats.p5_f0.toFixed(0)}–{profileF0Stats.p95_f0.toFixed(0)} Hz]
+                    </span>
+                  </span>
+                </label>
+              )}
             </div>
           </div>
         </section>

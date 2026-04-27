@@ -1,7 +1,7 @@
 # Codebase Map
 
-Generated: 2026-04-27T10:47:17Z | Files: 232 | Described: 0/232
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-27T10:47:17Z","fingerprint":"03ff71e3bbdf5778e7356744c4d1681f587f0d67","fileCount":232,"truncated":false} -->
+Generated: 2026-04-27T11:52:48Z | Files: 233 | Described: 0/233
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-27T11:52:48Z","fingerprint":"c11a38d83e8b073c6db4073bb0fee2e0b0ef3806","fileCount":233,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
@@ -291,6 +291,7 @@ Generated: 2026-04-27T10:47:17Z | Files: 232 | Described: 0/232
 - `docs/DEITERIS-VC-ANALYSIS.md`
 - `docs/KNOWLEDGE.md`
 - `docs/meanvc-freevc-integration-analysis.md`
+- `docs/pitch-pipeline.md`
 - `docs/REALTIME_CLIENT_IO_MIGRATION.md`
 - `docs/RT-VC-ANALYSIS.md`
 - `docs/TRAINING_COMPARISON.md`

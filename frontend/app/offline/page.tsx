@@ -26,6 +26,15 @@ interface Profile {
   best_avg_gen_loss?: number | null;
   has_speaker_f0?: boolean;
   speaker_mean_f0?: number | null;
+  speaker_std_f0?: number | null;
+  speaker_p5_f0?: number | null;
+  speaker_p25_f0?: number | null;
+  speaker_p50_f0?: number | null;
+  speaker_p75_f0?: number | null;
+  speaker_p95_f0?: number | null;
+  speaker_vel_std?: number | null;
+  speaker_voiced_rate?: number | null;
+  speaker_f0_hist?: number[] | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -371,10 +380,16 @@ export default function OfflinePage() {
   // Beatrice 2 params
   const [pitchShift, setPitchShift]           = useState(0);
   const [formantShift, setFormantShift]       = useState(0);
-  // Auto pitch-shift — fetches profile mean F0 + computes from input file
+  // Auto pitch — F0 normalization stats (null = not yet computed)
   const [autoPitch, setAutoPitch]             = useState(false);
-  const [autoPitchValue, setAutoPitchValue]   = useState<number | null>(null);
+  const [autoPitchValue, setAutoPitchValue]   = useState<number | null>(null);  // display only: effective mean shift in semitones
   const [autoPitchLoading, setAutoPitchLoading] = useState(false);
+  const [f0NormStats, setF0NormStats] = useState<{
+    srcMean: number; srcStd: number; tgtMean: number; tgtStd: number;
+    srcVelStd?: number; tgtVelStd?: number;
+    tgtP5?: number; tgtP95?: number;
+    srcHist?: number[]; tgtHist?: number[];
+  } | null>(null);
 
   // Job state
   const [jobStatus, setJobStatus]   = useState<'idle' | 'running' | 'done' | 'error'>('idle');
@@ -412,6 +427,8 @@ export default function OfflinePage() {
       setAutoPitch(false);
       setPitchShift(0);
       setPitch(0);
+      setF0NormStats(null);
+      setAutoPitchValue(null);
     }
   }, [profileId, profiles]);
 
@@ -434,26 +451,33 @@ export default function OfflinePage() {
     a.onloadedmetadata = () => setOutputDuration(a.duration);
   }, [outputUrl]);
 
-  // Auto pitch-shift: fetch profile mean F0, compute input file mean F0 via
-  // backend DIO (pyworld), derive semitone shift.
-  // Works for both RVC and Beatrice 2 profiles.
+  // Auto pitch: fetch profile F0 stats + input file F0 stats from backend DIO,
+  // store all four for mean-std normalization. Works for both RVC and Beatrice 2.
   useEffect(() => {
     if (!autoPitch || !profileId || !inputFile) {
       setAutoPitchValue(null);
+      setF0NormStats(null);
       return;
     }
     let cancelled = false;
     setAutoPitchLoading(true);
     setAutoPitchValue(null);
+    setF0NormStats(null);
 
     (async () => {
       try {
-        // 1. Fetch profile mean F0 from backend (precomputed by DIO on training audio)
+        // 1. Fetch profile F0 stats (precomputed by DIO on training audio)
         const res = await fetch(`${API}/api/offline/speaker_f0/${profileId}`);
         if (!res.ok) throw new Error('speaker_f0.json not found — compute it first');
-        const { mean_f0: profileF0 } = await res.json();
+        const profileData = await res.json();
+        const tgtMean: number = profileData.mean_f0;
+        const tgtStd: number  = profileData.std_f0 ?? 0;
+        const tgtVelStd: number | undefined = profileData.vel_std ?? undefined;
+        const tgtP5: number | undefined     = profileData.p5_f0  ?? undefined;
+        const tgtP95: number | undefined    = profileData.p95_f0 ?? undefined;
+        const tgtHist: number[] | undefined = profileData.f0_hist ?? undefined;
 
-        // 2. Compute mean F0 of input file via backend DIO (same algorithm as profile)
+        // 2. Compute input file F0 stats via backend DIO
         const form = new FormData();
         form.append('file', inputFile);
         const f0Res = await fetch(`${API}/api/offline/input_f0`, {
@@ -464,28 +488,37 @@ export default function OfflinePage() {
           const err = await f0Res.json().catch(() => ({ detail: 'input F0 failed' }));
           throw new Error(err.detail ?? 'input F0 computation failed');
         }
-        const { mean_f0: inputF0 } = await f0Res.json();
+        const f0Data = await f0Res.json();
+        const srcMean: number = f0Data.mean_f0;
+        const srcStd: number  = f0Data.std_f0 ?? 0;
+        const srcVelStd: number | undefined = f0Data.vel_std ?? undefined;
+        const srcHist: number[] | undefined = f0Data.f0_hist ?? undefined;
 
-        // 3. Semitone shift: 12 × log₂(profileF0 / inputF0), rounded to nearest 0.5
-        const semitones = 12 * Math.log2(profileF0 / inputF0);
-        const rounded   = Math.round(semitones * 2) / 2;
+        // 3. Compute effective mean-shift semitones for display only
+        const meanShiftSt = 12 * Math.log2(tgtMean / srcMean);
+        const rounded = Math.round(meanShiftSt * 2) / 2;
 
         if (!cancelled) {
           setAutoPitchValue(rounded);
-          // Route to the correct param depending on pipeline:
-          //   RVC       → pitch (the key= semitone slider, passed as pitch form field)
-          //   Beatrice2 → pitchShift (pitch_shift_semitones form field)
+          setF0NormStats({
+            srcMean, srcStd, tgtMean, tgtStd,
+            srcVelStd, tgtVelStd,
+            tgtP5, tgtP95,
+            srcHist, tgtHist,
+          });
+          // For B2 we still need a fallback pitch slider value in case std is missing
           const pipeline = profiles.find(p => p.id === profileId)?.pipeline;
           if (pipeline === 'beatrice2') {
             setPitchShift(rounded);
           } else {
-            setPitch(Math.round(rounded));  // RVC pitch is integer semitones
+            setPitch(Math.round(rounded));
           }
         }
       } catch (e: any) {
         if (!cancelled) {
           setAutoPitchValue(null);
-          console.warn('Auto pitch-shift failed:', e.message);
+          setF0NormStats(null);
+          console.warn('Auto pitch failed:', e.message);
         }
       } finally {
         if (!cancelled) setAutoPitchLoading(false);
@@ -526,6 +559,30 @@ export default function OfflinePage() {
     // Beatrice 2 params (ignored by RVC backend)
     form.append('pitch_shift_semitones', String(pitchShift));
     form.append('formant_shift_semitones', String(formantShift));
+    // F0 normalization stats — sent for both pipelines when auto pitch is on
+    // and std data is available. Backend activates normalization when all four > 0.
+    if (autoPitch && f0NormStats && f0NormStats.srcStd > 0 && f0NormStats.tgtStd > 0) {
+      form.append('f0_src_mean', String(f0NormStats.srcMean));
+      form.append('f0_src_std',  String(f0NormStats.srcStd));
+      form.append('f0_tgt_mean', String(f0NormStats.tgtMean));
+      form.append('f0_tgt_std',  String(f0NormStats.tgtStd));
+      // Velocity normalization (if both sides have vel_std)
+      if (f0NormStats.srcVelStd && f0NormStats.tgtVelStd &&
+          f0NormStats.srcVelStd > 1e-6 && f0NormStats.tgtVelStd > 1e-6) {
+        form.append('f0_vel_src', String(f0NormStats.srcVelStd));
+        form.append('f0_vel_tgt', String(f0NormStats.tgtVelStd));
+      }
+      // Soft-clip range
+      if (f0NormStats.tgtP5 && f0NormStats.tgtP95 && f0NormStats.tgtP95 > f0NormStats.tgtP5) {
+        form.append('f0_p5_tgt',  String(f0NormStats.tgtP5));
+        form.append('f0_p95_tgt', String(f0NormStats.tgtP95));
+      }
+      // HistEQ (offline: full file available)
+      if (f0NormStats.srcHist && f0NormStats.tgtHist) {
+        form.append('f0_src_hist', JSON.stringify(f0NormStats.srcHist));
+        form.append('f0_tgt_hist', JSON.stringify(f0NormStats.tgtHist));
+      }
+    }
     form.append('file', inputFile);
 
     const abort = new AbortController();
@@ -715,12 +772,14 @@ export default function OfflinePage() {
                   <span className="text-zinc-600">-12 st</span>
                   {autoPitch && autoPitchValue !== null ? (
                     <span className="text-cyan-400/80">
-                      auto: {autoPitchValue > 0 ? '+' : ''}{autoPitchValue} st
+                      {f0NormStats?.srcStd && f0NormStats?.tgtStd
+                        ? `norm  μ ${autoPitchValue > 0 ? '+' : ''}${autoPitchValue}st  σ×${(f0NormStats.tgtStd / f0NormStats.srcStd).toFixed(2)}${f0NormStats.tgtVelStd && f0NormStats.srcVelStd ? `  v×${(f0NormStats.tgtVelStd / f0NormStats.srcVelStd).toFixed(2)}` : ''}${f0NormStats.tgtP5 ? '  🎯' : ''}`
+                        : `auto: ${autoPitchValue > 0 ? '+' : ''}${autoPitchValue} st`}
                     </span>
                   ) : autoPitch && !autoPitchLoading ? (
                     <span className="text-amber-400/70">needs input file</span>
                   ) : selectedProfile?.has_speaker_f0 ? (
-                    <span className="text-zinc-600">{selectedProfile.speaker_mean_f0?.toFixed(1)} Hz profile</span>
+                    <span className="text-zinc-600">{selectedProfile.speaker_mean_f0?.toFixed(1)} Hz  {selectedProfile.speaker_std_f0 ? `σ=${selectedProfile.speaker_std_f0.toFixed(3)}` : ''}{selectedProfile.speaker_p5_f0 ? `  [${selectedProfile.speaker_p5_f0.toFixed(0)}–${selectedProfile.speaker_p95_f0?.toFixed(0)} Hz]` : ''}</span>
                   ) : null}
                   <span className="text-zinc-600">+12 st</span>
                 </div>
@@ -768,12 +827,14 @@ export default function OfflinePage() {
                 <span className="text-zinc-600">-24 st</span>
                 {autoPitch && autoPitchValue !== null ? (
                   <span className="text-cyan-400/80">
-                    auto: {autoPitchValue > 0 ? '+' : ''}{Math.round(autoPitchValue)} st
+                    {f0NormStats?.srcStd && f0NormStats?.tgtStd
+                      ? `norm  μ ${autoPitchValue > 0 ? '+' : ''}${Math.round(autoPitchValue)}st  σ×${(f0NormStats.tgtStd / f0NormStats.srcStd).toFixed(2)}${f0NormStats.tgtVelStd && f0NormStats.srcVelStd ? `  v×${(f0NormStats.tgtVelStd / f0NormStats.srcVelStd).toFixed(2)}` : ''}${f0NormStats.tgtP5 ? '  🎯' : ''}`
+                      : `auto: ${autoPitchValue > 0 ? '+' : ''}${Math.round(autoPitchValue)} st`}
                   </span>
                 ) : autoPitch && !autoPitchLoading ? (
                   <span className="text-amber-400/70">needs input file</span>
                 ) : selectedProfile?.has_speaker_f0 ? (
-                  <span className="text-zinc-600">{selectedProfile.speaker_mean_f0?.toFixed(1)} Hz profile</span>
+                  <span className="text-zinc-600">{selectedProfile.speaker_mean_f0?.toFixed(1)} Hz  {selectedProfile.speaker_std_f0 ? `σ=${selectedProfile.speaker_std_f0.toFixed(3)}` : ''}{selectedProfile.speaker_p5_f0 ? `  [${selectedProfile.speaker_p5_f0.toFixed(0)}–${selectedProfile.speaker_p95_f0?.toFixed(0)} Hz]` : ''}</span>
                 ) : null}
                 <span className="text-zinc-600">+24 st</span>
               </div>

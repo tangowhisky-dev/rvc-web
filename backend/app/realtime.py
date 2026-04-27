@@ -157,6 +157,8 @@ class RealtimeManager:
         # Beatrice 2 params
         pitch_shift_semitones: float = 0.0,
         formant_shift_semitones: float = 0.0,
+        # F0 normalization prior
+        f0_norm_params: Optional[dict] = None,
     ) -> RealtimeSession:
         """Spawn isolated worker process and return a RealtimeSession.
 
@@ -261,6 +263,7 @@ class RealtimeManager:
                 pipeline=db_pipeline,
                 pitch_shift_semitones=pitch_shift_semitones,
                 formant_shift_semitones=formant_shift_semitones,
+                f0_norm_params=f0_norm_params,
             ),
             daemon=True,
         )

@@ -132,6 +132,7 @@ async def _poll_rvc_epochs(
     total_epoch: int,
     overtrain_threshold: int,
     proc_done: asyncio.Event,
+    train_start_ts: float = 0.0,
 ) -> None:
     """Poll epoch_losses every 2s; emit epoch_done events with DB losses.
 
@@ -148,6 +149,12 @@ async def _poll_rvc_epochs(
     _min_delta: float = 0.004
     _ot_consecutive: int = 0
     _ot_triggered: bool = False
+
+    # Time tracking — rolling window of recent epoch timestamps for ETA
+    _epoch_ts: list[float] = []          # monotonic timestamps when each epoch completed
+    _WINDOW = 5                           # use last 5 epochs for secs/epoch estimate
+    if train_start_ts == 0.0:
+        train_start_ts = time.monotonic()
 
     # Seed OT state from DB on resume
     if overtrain_threshold > 0 and prior_epochs > 0:
@@ -189,6 +196,12 @@ async def _poll_rvc_epochs(
                 "loss_kl":   row[5],
                 "loss_spk":  row[6],
             }
+
+            # Record timestamp for this epoch
+            now_ts = time.monotonic()
+            _epoch_ts.append(now_ts)
+            if len(_epoch_ts) > _WINDOW:
+                _epoch_ts.pop(0)
 
             # Overtraining detection
             ot_label = ""
@@ -250,6 +263,54 @@ async def _poll_rvc_epochs(
                 msg["overtrain_consecutive"] = _ot_consecutive
             await job.queue.put(msg)
             _seen_epoch = epoch_num
+
+            # Emit time stats log line (mirrors Beatrice 2 pattern)
+            elapsed_s = now_ts - train_start_ts
+            epochs_done = epoch_num - prior_epochs  # epochs completed this session
+            epochs_remaining = total_epoch - epoch_num
+
+            # secs/epoch from rolling window of recent epoch timestamps
+            secs_per_epoch: float = 0.0
+            if len(_epoch_ts) >= 2:
+                window_secs = _epoch_ts[-1] - _epoch_ts[0]
+                window_epochs = len(_epoch_ts) - 1
+                secs_per_epoch = window_secs / window_epochs
+            elif epochs_done > 0:
+                secs_per_epoch = elapsed_s / epochs_done
+
+            parts = [f"Epoch {epoch_num}/{total_epoch}"]
+
+            # secs/epoch or mins/epoch
+            if secs_per_epoch >= 60:
+                parts.append(f"{secs_per_epoch / 60:.1f}min/epoch")
+            elif secs_per_epoch >= 1:
+                parts.append(f"{secs_per_epoch:.1f}s/epoch")
+
+            # elapsed
+            e_h, e_rem = divmod(int(elapsed_s), 3600)
+            e_m, e_s   = divmod(e_rem, 60)
+            if e_h:
+                parts.append(f"elapsed {e_h}h{e_m:02d}m")
+            else:
+                parts.append(f"elapsed {e_m}m{e_s:02d}s")
+
+            # ETA
+            if secs_per_epoch > 0 and epochs_remaining > 0:
+                remaining_s = epochs_remaining * secs_per_epoch
+                r_h, r_rem = divmod(int(remaining_s), 3600)
+                r_m, r_s   = divmod(r_rem, 60)
+                if r_h:
+                    parts.append(f"ETA {r_h}h{r_m:02d}m")
+                else:
+                    parts.append(f"ETA {r_m}m{r_s:02d}s")
+            elif epochs_remaining == 0:
+                parts.append("done")
+
+            await job.queue.put({
+                "type": "log",
+                "message": "  ".join(parts),
+                "phase": "train",
+            })
 
         # Stop one cycle after proc exits (catches last epoch)
         if proc_done.is_set():
@@ -1243,6 +1304,7 @@ async def _run_pipeline(
             total_epoch,
             overtrain_threshold,
             _proc_done,
+            train_start_ts=time.monotonic(),
         )
     )
 

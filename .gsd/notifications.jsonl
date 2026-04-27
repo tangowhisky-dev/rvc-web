@@ -22,3 +22,4 @@
 {"id":"91929539-754a-4021-bb2e-a2ca39defe1c","ts":"2026-04-24T11:53:06.474Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}
 {"id":"73c98a24-ae1a-4278-96e2-ae5932649abf","ts":"2026-04-24T12:08:25.599Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}
 {"id":"722d860b-2d24-4755-85bb-9f429a3d66f1","ts":"2026-04-27T10:05:04.189Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}
+{"id":"dfad14be-8c25-4cab-8198-219389bccc10","ts":"2026-04-27T10:54:53.946Z","severity":"info","message":"GSD: backfilled 41 decisions into the memory store (ADR-013).","source":"notify","read":false}

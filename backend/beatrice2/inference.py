@@ -33,8 +33,13 @@ class BeatriceInferenceEngine:
 
     def __init__(self, checkpoint_path: str, device: str = "cuda") -> None:
         import torch
-
+        import os as _os
         self._device = torch.device(device)
+        # Store project root for f0_transform import inside the subprocess
+        self._rvc_root = _os.environ.get("PROJECT_ROOT", _os.getcwd())
+        # Persistent velocity state for realtime (reset when f0_norm_params changes)
+        self._vel_state_rt = None
+        self._last_norm_key: str = ""
         self._load(checkpoint_path)
 
     # ------------------------------------------------------------------
@@ -111,12 +116,94 @@ class BeatriceInferenceEngine:
     # Public API
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # F0 normalization hook
+    # ------------------------------------------------------------------
+
+    def _apply_f0_norm_patch(self, f0_norm_params: dict,
+                               vel_state=None) -> None:
+        """Monkey-patch pitch_estimator.sample_pitch to apply the full F0 prior pipeline.
+
+        Transform order (all in bin space — bins are linear in log-Hz):
+          1. Affine: bin_out = μ_t_bin + (σ_t/σ_s) × (bin_in − μ_s_bin)
+          2. Velocity normalization (if vel_ratio present; causal, uses vel_state)
+          3. Soft-clip to target speaking range (if p5_tgt/p95_tgt present)
+
+        Unvoiced frames (bin = 0) are left unchanged throughout.
+        Called once before inference; _remove_f0_norm_patch restores the original.
+
+        Parameters
+        ----------
+        vel_state : VelocityNormalizerBins | None
+            Persistent velocity state for realtime (shared across blocks).
+            Pass None for offline (a fresh one-shot state is created per call).
+        """
+        import math
+        import torch
+        import sys, os as _os
+        # Ensure project root is importable
+        _proj = getattr(self, '_rvc_root', None) or _os.getcwd()
+        if _proj not in sys.path:
+            sys.path.insert(0, _proj)
+        from backend.app.f0_transform import apply_f0_prior_bins, VelocityNormalizerBins
+
+        bpo = self.pitch_estimator.pitch_bins_per_octave  # 96
+        src_mean = float(f0_norm_params["src_mean"])
+        src_std  = float(f0_norm_params["src_std"])
+        tgt_mean = float(f0_norm_params["tgt_mean"])
+        tgt_std  = float(f0_norm_params["tgt_std"])
+
+        mu_s_bin = math.log2(src_mean / 55.0) * bpo
+        mu_t_bin = math.log2(tgt_mean / 55.0) * bpo
+        ratio = (tgt_std / src_std) if src_std > 1e-6 else 1.0
+
+        # Velocity state: use caller-provided (realtime) or create fresh (offline)
+        _vel_state = vel_state
+        vel_ratio = f0_norm_params.get("vel_ratio")
+        if _vel_state is None and vel_ratio is not None and abs(float(vel_ratio) - 1.0) > 1e-4:
+            _vel_state = VelocityNormalizerBins(float(vel_ratio))
+
+        _f0_params = f0_norm_params  # captured
+        _has_affine = src_mean > 0 and tgt_mean > 0
+
+        _orig_sample_pitch = self.pitch_estimator.sample_pitch
+
+        def _normed_sample_pitch(pitch_logits, band_width=4, return_features=False):
+            result = _orig_sample_pitch(pitch_logits, band_width=band_width,
+                                        return_features=return_features)
+            qp = result[0] if return_features else result
+            # Step 1: Affine in bin space (only when src/tgt means are available)
+            if _has_affine:
+                voiced = qp > 0
+                if voiced.any():
+                    qp_f = qp.float()
+                    qp_norm = torch.round(
+                        mu_t_bin + ratio * (qp_f - mu_s_bin)
+                    ).long()
+                    qp = torch.where(voiced, qp_norm.clamp(1, self.net_g.pitch_bins - 1), qp)
+            # Steps 2-3: velocity + soft-clip via f0_transform (apply even without affine)
+            qp = apply_f0_prior_bins(qp, _f0_params, vel_state=_vel_state)
+            if return_features:
+                return qp, result[1]
+            return qp
+
+        self.pitch_estimator._orig_sample_pitch = _orig_sample_pitch
+        self.pitch_estimator.sample_pitch = _normed_sample_pitch
+
+    def _remove_f0_norm_patch(self) -> None:
+        """Restore the original sample_pitch after a normalized inference run."""
+        orig = getattr(self.pitch_estimator, "_orig_sample_pitch", None)
+        if orig is not None:
+            self.pitch_estimator.sample_pitch = orig
+            del self.pitch_estimator._orig_sample_pitch
+
     def convert(
         self,
         audio_16k: np.ndarray,
         target_speaker_id: int = 0,
         pitch_shift_semitones: float = 0.0,
         formant_shift_semitones: float = 0.0,
+        f0_norm_params: "dict | None" = None,
     ) -> np.ndarray:
         """Convert ``audio_16k`` to the target speaker voice.
 
@@ -160,17 +247,39 @@ class BeatriceInferenceEngine:
             wav = F.pad(wav, (0, pad_len))
 
         target_ids = torch.tensor([target_speaker_id], device=device)
-        pitch_shift = torch.tensor([float(pitch_shift_semitones)], device=device)
+        # When normalization is active, the sample_pitch patch handles all pitch
+        # mapping — pass shift=0 so the scalar bin-offset in converter.py is a no-op.
+        effective_shift = 0.0 if f0_norm_params else float(pitch_shift_semitones)
+        pitch_shift = torch.tensor([effective_shift], device=device)
         formant_shift = torch.tensor([float(formant_shift_semitones)], device=device)
 
-        with torch.inference_mode():
-            # net_g expects [batch, 1, T]
-            converted = self.net_g(
-                wav.unsqueeze(1),
-                target_ids,
-                formant_shift,
-                pitch_shift,
-            )  # [batch, T_out]
+        if f0_norm_params:
+            # Manage persistent velocity state: reset if norm params changed
+            _norm_key = str(sorted((k, v) for k, v in f0_norm_params.items()
+                                   if k in ("src_mean", "src_std", "tgt_mean", "tgt_std",
+                                            "vel_ratio", "p5_tgt", "p95_tgt")))
+            if _norm_key != self._last_norm_key:
+                self._vel_state_rt = None
+                self._last_norm_key = _norm_key
+            # Lazily create velocity state for realtime
+            if self._vel_state_rt is None:
+                vel_ratio = f0_norm_params.get("vel_ratio")
+                if vel_ratio is not None and abs(float(vel_ratio) - 1.0) > 1e-4:
+                    from backend.app.f0_transform import VelocityNormalizerBins
+                    self._vel_state_rt = VelocityNormalizerBins(float(vel_ratio))
+            self._apply_f0_norm_patch(f0_norm_params, vel_state=self._vel_state_rt)
+        try:
+            with torch.inference_mode():
+                # net_g expects [batch, 1, T]
+                converted = self.net_g(
+                    wav.unsqueeze(1),
+                    target_ids,
+                    formant_shift,
+                    pitch_shift,
+                )  # [batch, T_out]
+        finally:
+            if f0_norm_params:
+                self._remove_f0_norm_patch()
 
         # Trim to expected output length
         # Ratio: out_sr / in_sr * hop_length relationship
@@ -189,6 +298,7 @@ class BeatriceInferenceEngine:
         pitch_shift_semitones: float = 0.0,
         formant_shift_semitones: float = 0.0,
         chunk_samples: int = 96000,
+        f0_norm_params: "dict | None" = None,
     ) -> np.ndarray:
         """Convert a long audio file by chunking into 6-second windows.
 
@@ -236,28 +346,42 @@ class BeatriceInferenceEngine:
         T = wav.shape[0]
 
         target_ids  = torch.tensor([target_speaker_id], device=device)
-        pitch_shift = torch.tensor([float(pitch_shift_semitones)], device=device)
+        # When normalization is active, patch sample_pitch and pass shift=0.
+        effective_shift = 0.0 if f0_norm_params else float(pitch_shift_semitones)
+        pitch_shift = torch.tensor([effective_shift], device=device)
         formant_shift = torch.tensor([float(formant_shift_semitones)], device=device)
 
-        chunks_out = []
-        with torch.inference_mode():
-            for start in range(0, T, chunk_samples):
-                chunk = wav[start : start + chunk_samples]  # [N]
+        if f0_norm_params:
+            # Offline: fresh velocity state so it accumulates across all chunks sequentially
+            _offline_vel = None
+            vel_ratio = f0_norm_params.get("vel_ratio")
+            if vel_ratio is not None and abs(float(vel_ratio) - 1.0) > 1e-4:
+                from backend.app.f0_transform import VelocityNormalizerBins
+                _offline_vel = VelocityNormalizerBins(float(vel_ratio))
+            self._apply_f0_norm_patch(f0_norm_params, vel_state=_offline_vel)
+        try:
+            chunks_out = []
+            with torch.inference_mode():
+                for start in range(0, T, chunk_samples):
+                    chunk = wav[start : start + chunk_samples]  # [N]
 
-                # Pad last chunk to multiple of _HOP
-                rem = chunk.shape[0] % _HOP
-                if rem != 0:
-                    chunk = F.pad(chunk, (0, _HOP - rem))
+                    # Pad last chunk to multiple of _HOP
+                    rem = chunk.shape[0] % _HOP
+                    if rem != 0:
+                        chunk = F.pad(chunk, (0, _HOP - rem))
 
-                # net_g expects [batch, 1, T]. Use keyword arguments to avoid
-                # parameter order confusion (model expects formant then pitch).
-                out = self.net_g(
-                    chunk.unsqueeze(0).unsqueeze(0),
-                    target_speaker_id=target_ids,
-                    formant_shift_semitone=formant_shift,
-                    pitch_shift_semitone=pitch_shift,
-                )  # [1, 1, T_out] or [1, T_out]
-                chunks_out.append(out.squeeze().cpu().float())
+                    # net_g expects [batch, 1, T]. Use keyword arguments to avoid
+                    # parameter order confusion (model expects formant then pitch).
+                    out = self.net_g(
+                        chunk.unsqueeze(0).unsqueeze(0),
+                        target_speaker_id=target_ids,
+                        formant_shift_semitone=formant_shift,
+                        pitch_shift_semitone=pitch_shift,
+                    )  # [1, 1, T_out] or [1, T_out]
+                    chunks_out.append(out.squeeze().cpu().float())
+        finally:
+            if f0_norm_params:
+                self._remove_f0_norm_patch()
 
         y_hat = torch.cat(chunks_out, dim=0)
 

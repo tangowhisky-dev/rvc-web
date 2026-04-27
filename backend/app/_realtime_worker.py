@@ -236,6 +236,7 @@ def _run_beatrice2_realtime(
     audio_in_save_q,
     session_id: str = "",
     infer_device: str = "cpu",
+    f0_norm_params: dict | None = None,
 ) -> None:
     """Beatrice 2 realtime loop.
 
@@ -296,6 +297,7 @@ def _run_beatrice2_realtime(
         "silence_threshold_db": float(silence_threshold_db),
         "output_gain": float(output_gain),
         "noise_reduction": bool(noise_reduction),
+        "f0_norm_params": f0_norm_params,  # may be None
     }
 
     def _process_block(input_48k: np.ndarray) -> np.ndarray:
@@ -338,6 +340,7 @@ def _run_beatrice2_realtime(
             input_buffer_16k,
             pitch_shift_semitones=params["pitch_shift_semitones"],
             formant_shift_semitones=params["formant_shift_semitones"],
+            f0_norm_params=params.get("f0_norm_params"),
         )  # float32 at 24 kHz — length corresponds to full input_buffer_16k window
 
         # ---- Resample to 48k ----
@@ -431,6 +434,8 @@ def _run_beatrice2_realtime(
                     params["pitch_shift_semitones"] = cmd["pitch"]
                 if "formant" in cmd:
                     params["formant_shift_semitones"] = cmd["formant"]
+                if "f0_norm_params" in cmd:
+                    params["f0_norm_params"] = cmd["f0_norm_params"]
                 for k in ("silence_threshold_db", "output_gain", "noise_reduction"):
                     if k in cmd:
                         params[k] = cmd[k]
@@ -466,6 +471,8 @@ def run_worker(
     pipeline: str = "rvc",
     pitch_shift_semitones: float = 0.0,
     formant_shift_semitones: float = 0.0,
+    # F0 normalization prior (affine + vel + soft-clip; no HistEQ in realtime)
+    f0_norm_params: dict | None = None,
 ) -> None:
     """Run in isolated child process. Owns all native code (fairseq, sounddevice, MPS)."""
 
@@ -576,6 +583,7 @@ def run_worker(
                 audio_in_save_q=audio_in_save_q,
                 session_id=session_id,
                 infer_device=infer_device,
+                f0_norm_params=f0_norm_params,
             )
             # B2 path exits here — emit stopped so the drain thread can cleanly exit.
             # (The RVC path reaches the finally block; the B2 path returns early.)
@@ -631,14 +639,20 @@ def run_worker(
                                              sola_buf_ms=sola_crossfade_ms)
 
         # ------------------------------------------------------------------
-        # Patch rvc._get_f0: pad pitch/pitchf at head to match p_len.
-        # rtrvc.py extracts F0 from input[-f0_extractor_frame:] which gives
-        # f0_extractor_frame//window frames, but p_len = total_16k//window.
-        # The difference (extra_16k//window frames) must be padded with zeros
-        # (unvoiced) so the broadcast with feats [1, p_len, H] succeeds.
+        # Patch rvc._get_f0: pad + F0 prior pipeline (affine + vel + soft-clip).
+        # No HistEQ in realtime — requires full file CDF.
         # ------------------------------------------------------------------
         _orig_get_f0 = rvc._get_f0
         _p_len_expected = block_params["p_len"]
+        # Persistent velocity state for this session
+        _rt_f0_norm = f0_norm_params  # captured at session start; may be None
+        _rt_vel_state = None
+        if _rt_f0_norm is not None:
+            vel_ratio = _rt_f0_norm.get("vel_ratio")
+            if vel_ratio is not None and abs(float(vel_ratio) - 1.0) > 1e-4:
+                sys.path.insert(0, rvc_root)
+                from backend.app.f0_transform import VelocityNormalizer as _VN_RT
+                _rt_vel_state = _VN_RT(float(vel_ratio))
 
         def _patched_get_f0(x, f0_up_key, filter_radius=None, method="fcpe"):
             c, f = _orig_get_f0(x, f0_up_key, filter_radius=filter_radius, method=method)
@@ -646,6 +660,38 @@ def run_worker(
                 pad = _p_len_expected - c.shape[-1]
                 c = _torch.cat([_torch.zeros(pad, dtype=c.dtype, device=c.device), c])
                 f = _torch.cat([_torch.zeros(pad, dtype=f.dtype, device=f.device), f])
+            if _rt_f0_norm is not None:
+                import math as _m
+                import numpy as _np_rt
+                sys.path.insert(0, rvc_root)
+                from backend.app.f0_transform import apply_f0_prior_hz
+                f_np = f.cpu().float().numpy()
+                # Affine (only when src_mean + tgt_mean are present)
+                src_mean = _rt_f0_norm.get("src_mean", 0.0)
+                tgt_mean = _rt_f0_norm.get("tgt_mean", 0.0)
+                if src_mean > 0 and tgt_mean > 0:
+                    src_std = float(_rt_f0_norm.get("src_std", 1.0))
+                    tgt_std = float(_rt_f0_norm.get("tgt_std", 1.0))
+                    ratio = (tgt_std / src_std) if src_std > 1e-6 else 1.0
+                    log_mu_s = _m.log(float(src_mean))
+                    log_mu_t = _m.log(float(tgt_mean))
+                    voiced_mask = f_np > 0
+                    if voiced_mask.any():
+                        log_f = _np_rt.log(_np_rt.where(voiced_mask, f_np, 1.0))
+                        log_f_norm = log_mu_t + ratio * (log_f - log_mu_s)
+                        f_np = _np_rt.where(voiced_mask, _np_rt.exp(log_f_norm), 0.0).astype(_np_rt.float32)
+                # Vel + soft-clip (applies even without affine — soft-clip is a standalone guardrail)
+                f_np = apply_f0_prior_hz(f_np, _rt_f0_norm, vel_state=_rt_vel_state)
+                f = _torch.from_numpy(f_np).to(f.device)
+                # Recompute coarse mel-bin
+                f_np_c = f.cpu().numpy()
+                coarse = _np_rt.zeros_like(f_np_c, dtype=_np_rt.int64)
+                voiced_c = f_np_c > 0
+                coarse[voiced_c] = _np_rt.clip(
+                    _np_rt.round(_np_rt.log2(f_np_c[voiced_c] / 32.7) * (255.0 / 7.5)),
+                    1, 255,
+                ).astype(_np_rt.int64)
+                c = _torch.from_numpy(coarse).to(c.device)
             return c, f
 
         rvc._get_f0 = _patched_get_f0

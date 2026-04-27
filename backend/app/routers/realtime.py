@@ -55,6 +55,11 @@ class StartSessionRequest(BaseModel):
     # Beatrice 2 params (ignored for RVC profiles)
     pitch_shift_semitones: float = 0.0
     formant_shift_semitones: float = 0.0
+    # F0 normalization prior — passed to the worker at session start.
+    # Contains: src_mean, src_std, tgt_mean, tgt_std (affine, required for norm)
+    # Optional: vel_ratio (velocity norm), p5_tgt, p95_tgt (soft-clip)
+    # Realtime does NOT include src_hist/tgt_hist (file CDF unavailable in streaming mode).
+    f0_norm_params: Optional[dict] = None
 
 
 class StopSessionRequest(BaseModel):
@@ -157,6 +162,7 @@ async def start_session(request: StartSessionRequest) -> StartSessionResponse:
             use_best=request.use_best,
             pitch_shift_semitones=request.pitch_shift_semitones,
             formant_shift_semitones=request.formant_shift_semitones,
+            f0_norm_params=request.f0_norm_params,
         )
         # start_session is async on the real manager; MagicMock returns sync in tests
         session = await result if asyncio.iscoroutine(result) else result

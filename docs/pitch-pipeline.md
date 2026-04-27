@@ -190,3 +190,122 @@ Auto pitch-shift maps the **central tendency** of the source pitch range to the 
 - Adapt dynamically during inference — the offset is computed once per file before conversion starts
 
 For best results, the training data should cover the target speaker's full pitch range naturally. Profiles trained on very short audio clips or clips with limited pitch variation will produce less reliable `speaker_f0.json` estimates.
+
+---
+
+## 5. Mean-Std F0 Normalization
+
+### 5.1 Motivation
+
+The simple semitone-shift approach (Section 4.3) maps the source speaker's mean F0 to the target's mean, but leaves the **pitch range width unchanged**. If the source has a narrow-range monotone delivery (σ_s small) and the target is an expressive speaker with wide intonation swings (σ_t large), the output will sound flat relative to the target's natural style. Conversely, a wide-range source mapped to a narrow-range target will sound exaggerated.
+
+Mean-std normalization fixes both problems by rescaling the F0 variance as well.
+
+### 5.2 Formula
+
+All operations are in **log-Hz space**, which is linear in semitones (perceptually uniform):
+
+```
+log_f0_out = log(μ_t) + (σ_t / σ_s) × (log_f0_in − log(μ_s))
+```
+
+Equivalently in Hz:
+
+```
+f0_out = μ_t × (f0_in / μ_s)^(σ_t / σ_s)
+```
+
+Where:
+- `μ_s`, `σ_s` = geometric mean and log-space std of **source speaker's** voiced F0 (from input file)
+- `μ_t`, `σ_t` = geometric mean and log-space std of **target speaker's** voiced F0 (from training audio)
+- σ (log-space std) is the natural log standard deviation of voiced F0 frames — equivalent to the log of the geometric standard deviation
+
+The formula has two effects:
+1. **Mean shift**: `log(μ_t) - (σ_t/σ_s) × log(μ_s)` — a constant offset aligning the central tendency
+2. **Variance rescaling**: the `(σ_t / σ_s)` factor stretches or compresses the pitch contour around the mean
+
+**Unvoiced frames (F0 = 0) are not modified** — the transformation is applied only where F0 is detected.
+
+### 5.3 What σ (log-space std) measures
+
+Log-space std is computed as:
+
+```python
+log_f0 = np.log(voiced_f0_hz)   # voiced frames only
+σ = log_f0.std()
+```
+
+A value of `σ = 0.20` means roughly a ±20% multiplicative spread around the mean — approximately ±3.5 semitones at 1-sigma. Typical values:
+- Monotone/flat speaker: σ ≈ 0.08–0.12
+- Normal conversational speaker: σ ≈ 0.15–0.25
+- Highly expressive/singing: σ ≈ 0.30+
+
+When `σ_t / σ_s > 1`, the output pitch contour is stretched (more expressive). When `< 1`, it is compressed (flatter).
+
+### 5.4 Implementation
+
+**Backend — `compute_speaker_f0` (`routers/offline.py`)**
+
+```python
+log_f0 = np.log(voiced_f0)
+mean_f0 = math.exp(log_f0.mean())
+std_f0  = log_f0.std()   # log-space std
+```
+
+Both `mean_f0` and `std_f0` are now saved in `speaker_f0.json`. Existing profiles with only `mean_f0` continue to work — normalization degrades gracefully to mean-only shift when `std_f0` is absent.
+
+**Backend — `POST /api/offline/input_f0`**
+
+Returns `{"mean_f0": float, "std_f0": float, "method": "dio", "n_frames": int}`.
+
+**Backend — `_run_offline_inference` (RVC, `routers/offline.py`)**
+
+When `f0_norm_params` is provided, the `_patched_get_f0` closure applies the normalization frame-by-frame after RMVPE extraction:
+
+```python
+log_f = np.log(voiced_frames_hz)
+log_f_norm = log(μ_t) + (σ_t / σ_s) × (log_f − log(μ_s))
+f0_normalized = np.exp(log_f_norm)
+```
+
+The normalized Hz values are then re-quantized to RVC's mel-bin representation (1–255, log2-scale anchored at 32.7 Hz) for the content encoder and passed as raw Hz to the NSF vocoder. RVC is initialized with `key=0` so no separate semitone shift is applied on top.
+
+**Backend — Beatrice 2 (`BeatriceInferenceEngine`, `inference.py`)**
+
+B2's `sample_pitch()` returns `quantized_pitch` — a Long tensor of log-spaced bin indices (0=unvoiced, 1–447=voiced, 96 bins/octave anchored at 55 Hz). Because bins are linear in log-Hz, the normalization formula is a pure linear rescaling in bin space:
+
+```
+bin_out = μ_t_bin + (σ_t/σ_s) × (bin_in − μ_s_bin)
+where μ_bin = log2(μ_hz / 55) × pitch_bins_per_octave
+```
+
+This is implemented by monkey-patching `pitch_estimator.sample_pitch` inside `_apply_f0_norm_patch()`, which wraps the original method and transforms the returned `quantized_pitch` tensor before it reaches `converter.py`'s bin-offset logic. The patch is installed just before inference and removed in a `finally` block. `pitch_shift_semitone=0` is passed to the model so the built-in bin-offset is a no-op.
+
+The normalization applies to **both** `convert()` (realtime chunks) and `convert_offline()` (full-file batch chunking), and preserves thread safety — the patch is installed/removed around each call, not held globally.
+
+**Frontend — `offline/page.tsx`**
+
+When auto pitch is enabled and all four stats are available:
+- Form fields `f0_src_mean`, `f0_src_std`, `f0_tgt_mean`, `f0_tgt_std` are appended to the FormData
+- The pitch sliders show `norm  μ +Nst  σ×X.XX` instead of `auto: +N st`
+- The profile stats line shows `Hz  σ=X.XXX` when std is available
+
+When auto pitch is on but std is missing from an old profile (no `std_f0` in json), the backend falls back to mean-only shift (`ratio = 1.0` guard in `_patched_get_f0`).
+
+### 5.5 Comparison: mean-only shift vs mean-std normalization
+
+| Scenario | Mean-only shift | Mean-std normalization |
+|---|---|---|
+| Same-type voice (e.g. male→male, similar range) | Good | Marginally better |
+| Cross-gender (male→female) with similar expressiveness | Good | Similar |
+| Monotone source → expressive target | Flat, unnatural output | Pitch contour stretched — more natural |
+| Expressive source → monotone target | Overly dynamic output | Pitch contour compressed — more natural |
+| Very short source file (few voiced frames) | Reliable | σ estimate unreliable → treat σ ratio with caution |
+
+**When to re-compute profile F0**: after adding significantly more training audio. The original `speaker_f0.json` computed from limited data may have a skewed σ. The `/api/offline/speaker_f0/{id}/compute` endpoint overwrites the file cleanly.
+
+### 5.6 Limitations
+
+- **σ ratio instability with short files**: if the source file has fewer than ~500 voiced frames (≈5 seconds of speech), the log-std estimate is noisy. DIO's `n_frames` count in the response can be used to detect this.
+- **Prosody is rescaled, not reconstructed**: normalization stretches/compresses the existing F0 contour — it does not resynthsize natural intonation in the target speaker's style. The output contour shape is still the source speaker's.
+- **Extreme ratios clip badly**: if σ_t/σ_s > 2 or < 0.5, consider clamping the ratio before applying to avoid unnaturally extreme intonation. The current implementation applies the ratio without clamping.

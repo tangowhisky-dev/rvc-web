@@ -112,6 +112,16 @@ class ProfileOut(BaseModel):
     # Speaker mean F0 (Hz) — present when speaker_f0.json has been computed
     has_speaker_f0: bool = False
     speaker_mean_f0: Optional[float] = None
+    speaker_std_f0: Optional[float] = None
+    # Extended F0 prior statistics (populated when speaker_f0.json has full stats)
+    speaker_p5_f0:   Optional[float] = None
+    speaker_p25_f0:  Optional[float] = None
+    speaker_p50_f0:  Optional[float] = None
+    speaker_p75_f0:  Optional[float] = None
+    speaker_p95_f0:  Optional[float] = None
+    speaker_vel_std: Optional[float] = None
+    speaker_voiced_rate: Optional[float] = None
+    speaker_f0_hist: Optional[list] = None   # 256-bucket CDF histogram
 
 
 class PreprocessResponse(BaseModel):
@@ -286,6 +296,15 @@ async def _row_to_out(row, db) -> ProfileOut:
     # speaker_f0.json — RVC stores in profile_dir/, Beatrice 2 in beatrice2_out/
     _has_f0 = False
     _mean_f0 = None
+    _std_f0 = None
+    _p5_f0 = None
+    _p25_f0 = None
+    _p50_f0 = None
+    _p75_f0 = None
+    _p95_f0 = None
+    _vel_std = None
+    _voiced_rate = None
+    _f0_hist = None
     if pdir:
         import json as _json
         for _f0_path in (
@@ -297,6 +316,15 @@ async def _row_to_out(row, db) -> ProfileOut:
                     _d = _json.loads(open(_f0_path).read())
                     _has_f0 = True
                     _mean_f0 = float(_d["mean_f0"])
+                    _std_f0  = float(_d["std_f0"]) if "std_f0" in _d else None
+                    _p5_f0   = float(_d["p5_f0"])  if "p5_f0"  in _d else None
+                    _p25_f0  = float(_d["p25_f0"]) if "p25_f0" in _d else None
+                    _p50_f0  = float(_d["p50_f0"]) if "p50_f0" in _d else None
+                    _p75_f0  = float(_d["p75_f0"]) if "p75_f0" in _d else None
+                    _p95_f0  = float(_d["p95_f0"]) if "p95_f0" in _d else None
+                    _vel_std  = float(_d["vel_std"])      if "vel_std"      in _d else None
+                    _voiced_rate = float(_d["voiced_rate"]) if "voiced_rate" in _d else None
+                    _f0_hist = _d["f0_hist"] if "f0_hist" in _d else None
                 except Exception:
                     pass
                 break
@@ -340,6 +368,15 @@ async def _row_to_out(row, db) -> ProfileOut:
         audio_files=audio_files,
         has_speaker_f0=_has_f0,
         speaker_mean_f0=_mean_f0,
+        speaker_std_f0=_std_f0,
+        speaker_p5_f0=_p5_f0,
+        speaker_p25_f0=_p25_f0,
+        speaker_p50_f0=_p50_f0,
+        speaker_p75_f0=_p75_f0,
+        speaker_p95_f0=_p95_f0,
+        speaker_vel_std=_vel_std,
+        speaker_voiced_rate=_voiced_rate,
+        speaker_f0_hist=_f0_hist,
     )
 
 

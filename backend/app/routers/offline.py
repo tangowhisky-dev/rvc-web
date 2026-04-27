@@ -192,6 +192,10 @@ def _run_offline_inference(
     output_gain: float = 1.0,  # post-inference volume multiplier (1.0 = no change)
     noise_reduction: bool = False,  # apply pyrnnoise to input before inference
     sola_crossfade_ms: int = _SOLA_BUF_MS_DEFAULT,  # SOLA crossfade buffer length in ms
+    f0_norm_params: "dict | None" = None,
+    # f0_norm_params keys: src_mean, src_std, tgt_mean, tgt_std  (all floats)
+    # When set, applies mean-std log-F0 normalisation instead of a global semitone shift.
+    # pitch parameter is ignored when f0_norm_params is provided.
 ) -> np.ndarray:
     """Run chunked RVC inference on a full audio array.
 
@@ -224,7 +228,7 @@ def _run_offline_inference(
     is_half = device.startswith("cuda")
 
     rvc = RVC(
-        key=pitch,
+        key=0 if f0_norm_params else pitch,
         formant=0,
         pth_path=model_path,
         index_path=index_path,
@@ -253,9 +257,17 @@ def _run_offline_inference(
     sola_buf_tgt = int(sola_buf_48k * tgt_sr / _SR_48K)
     sola_search_tgt = int(sola_search_48k * tgt_sr / _SR_48K)
 
-    # Patch _get_f0 for head-padding (same as realtime worker)
+    # Patch _get_f0: head-padding + F0 normalization pipeline (affine → HistEQ → vel → soft-clip)
     _orig_get_f0 = rvc._get_f0
     p_len_expected = bp["p_len"]
+    _f0_norm = f0_norm_params  # captured in closure
+    # Offline: build a one-shot VelocityNormalizer here (processes all blocks sequentially)
+    _vel_state_offline = None
+    if _f0_norm is not None:
+        vel_ratio = _f0_norm.get("vel_ratio")
+        if vel_ratio is not None and abs(float(vel_ratio) - 1.0) > 1e-4:
+            from backend.app.f0_transform import VelocityNormalizer as _VN
+            _vel_state_offline = _VN(float(vel_ratio))
 
     def _patched_get_f0(x, f0_up_key, filter_radius=None, method="rmvpe"):
         c, f = _orig_get_f0(x, f0_up_key, filter_radius=filter_radius, method=method)
@@ -263,9 +275,36 @@ def _run_offline_inference(
             pad = p_len_expected - c.shape[-1]
             c = torch.cat([torch.zeros(pad, dtype=c.dtype, device=c.device), c])
             f = torch.cat([torch.zeros(pad, dtype=f.dtype, device=f.device), f])
+        if _f0_norm is not None:
+            import math as _m
+            from backend.app.f0_transform import apply_f0_prior_hz
+            src_mean = float(_f0_norm["src_mean"])
+            src_std  = float(_f0_norm["src_std"])
+            tgt_mean = float(_f0_norm["tgt_mean"])
+            tgt_std  = float(_f0_norm["tgt_std"])
+            ratio = (tgt_std / src_std) if src_std > 1e-6 else 1.0
+            log_mu_s = _m.log(src_mean) if src_mean > 0 else 0.0
+            log_mu_t = _m.log(tgt_mean) if tgt_mean > 0 else 0.0
+            # Step 1: Affine normalization in log-Hz space
+            f_np = f.cpu().float().numpy()
+            voiced_mask = f_np > 0
+            if voiced_mask.any():
+                log_f = np.log(np.where(voiced_mask, f_np, 1.0))
+                log_f_norm = log_mu_t + ratio * (log_f - log_mu_s)
+                f_np = np.where(voiced_mask, np.exp(log_f_norm), 0.0).astype(np.float32)
+            # Steps 2-4: HistEQ + velocity norm + soft-clip (from f0_transform module)
+            f_np = apply_f0_prior_hz(f_np, _f0_norm, vel_state=_vel_state_offline)
+            f = torch.from_numpy(f_np).to(f.device)
+            # Recompute coarse mel-bin from normalized Hz
+            f_np_c = f.cpu().numpy()
+            coarse = np.zeros_like(f_np_c, dtype=np.int64)
+            voiced_c = f_np_c > 0
+            coarse[voiced_c] = np.clip(
+                np.round(np.log2(f_np_c[voiced_c] / 32.7) * (255.0 / 7.5)),
+                1, 255,
+            ).astype(np.int64)
+            c = torch.from_numpy(coarse).to(c.device)
         return c, f
-
-    rvc._get_f0 = _patched_get_f0
 
     # FAISS fix
     if hasattr(rvc, "index"):
@@ -441,6 +480,22 @@ async def convert_audio(
     sola_crossfade_ms: int = Form(_SOLA_BUF_MS_DEFAULT),
     pitch_shift_semitones: float = Form(0.0),
     formant_shift_semitones: float = Form(0.0),
+    # F0 normalization — all four must be non-zero to activate normalization.
+    # When active, replaces the semitone-shift approach for both RVC and B2.
+    f0_src_mean: float = Form(0.0),
+    f0_src_std:  float = Form(0.0),
+    f0_tgt_mean: float = Form(0.0),
+    f0_tgt_std:  float = Form(0.0),
+    # Extended F0 prior — velocity normalization
+    f0_vel_src: float = Form(0.0),   # source vel_std (from input_f0)
+    f0_vel_tgt: float = Form(0.0),   # target vel_std (from speaker_f0.json)
+    # Extended F0 prior — soft-clip range (target percentiles)
+    f0_p5_tgt:  float = Form(0.0),
+    f0_p95_tgt: float = Form(0.0),
+    # Extended F0 prior — histogram equalization (JSON-encoded list[float])
+    # Send as JSON string to avoid multipart encoding issues with 256-float arrays.
+    f0_src_hist: str = Form(""),     # JSON string of source f0_hist
+    f0_tgt_hist: str = Form(""),     # JSON string of target f0_hist
     file: UploadFile = File(...),
 ):
     """Convert an uploaded audio file using a trained profile.
@@ -559,14 +614,42 @@ async def convert_audio(
                     from backend.beatrice2.inference import get_or_load_engine
                     import torch
                     import numpy as np
+                    import json as _json
                     device = "cuda" if torch.cuda.is_available() else "cpu"
                     engine = get_or_load_engine(profile_id, b2_checkpoint, device)
                     _progress(0.1)
+
+                    # Build norm params dict if all four stats are present
+                    _norm = None
+                    if (f0_src_mean > 0 and f0_tgt_mean > 0
+                            and f0_src_std > 1e-6 and f0_tgt_std > 1e-6):
+                        _norm = {
+                            "src_mean": f0_src_mean,
+                            "src_std":  f0_src_std,
+                            "tgt_mean": f0_tgt_mean,
+                            "tgt_std":  f0_tgt_std,
+                        }
+                        # Velocity normalization
+                        if f0_vel_src > 1e-6 and f0_vel_tgt > 1e-6:
+                            _norm["vel_ratio"] = f0_vel_tgt / f0_vel_src
+                        # Soft-clip
+                        if f0_p5_tgt > 0 and f0_p95_tgt > f0_p5_tgt:
+                            _norm["p5_tgt"]  = f0_p5_tgt
+                            _norm["p95_tgt"] = f0_p95_tgt
+                        # HistEQ (offline only — full file available)
+                        if f0_src_hist and f0_tgt_hist:
+                            try:
+                                _norm["src_hist"] = _json.loads(f0_src_hist)
+                                _norm["tgt_hist"] = _json.loads(f0_tgt_hist)
+                            except Exception:
+                                pass
+
                     result = engine.convert_offline(
                         audio_16k,
                         target_speaker_id=0,
                         pitch_shift_semitones=float(pitch_shift_semitones),
                         formant_shift_semitones=float(formant_shift_semitones),
+                        f0_norm_params=_norm,
                     )
                     # Peak normalise to 0.95 to prevent clipping on save
                     peak = np.abs(result).max()
@@ -595,6 +678,31 @@ async def convert_audio(
             # ---- RVC inference ----
             def _run():
                 try:
+                    import json as _json
+                    # Build F0 normalization params if all four values are provided
+                    _norm = None
+                    if (f0_src_mean > 0 and f0_tgt_mean > 0
+                            and f0_src_std > 1e-6 and f0_tgt_std > 1e-6):
+                        _norm = {
+                            "src_mean": f0_src_mean,
+                            "src_std":  f0_src_std,
+                            "tgt_mean": f0_tgt_mean,
+                            "tgt_std":  f0_tgt_std,
+                        }
+                        # Velocity normalization
+                        if f0_vel_src > 1e-6 and f0_vel_tgt > 1e-6:
+                            _norm["vel_ratio"] = f0_vel_tgt / f0_vel_src
+                        # Soft-clip
+                        if f0_p5_tgt > 0 and f0_p95_tgt > f0_p5_tgt:
+                            _norm["p5_tgt"]  = f0_p5_tgt
+                            _norm["p95_tgt"] = f0_p95_tgt
+                        # HistEQ (offline only — full file available)
+                        if f0_src_hist and f0_tgt_hist:
+                            try:
+                                _norm["src_hist"] = _json.loads(f0_src_hist)
+                                _norm["tgt_hist"] = _json.loads(f0_tgt_hist)
+                            except Exception:
+                                pass
                     result_audio, tgt_sr = _run_offline_inference(
                         audio_16k=audio_16k,
                         audio_tgt=audio_16k,  # unused placeholder
@@ -606,6 +714,7 @@ async def convert_audio(
                         progress_cb=_progress,
                         noise_reduction=noise_reduction,
                         sola_crossfade_ms=sola_crossfade_ms,
+                        f0_norm_params=_norm,
                     )
                     # Write result to temp file preserving original format
                     out_path = _output_path(job_id, out_ext)
@@ -709,17 +818,19 @@ async def stream_input(job_id: str):
 
 @router.post("/speaker_f0/{profile_id}/compute")
 async def compute_speaker_f0(profile_id: str):
-    """Compute mean F0 from profile audio files and save to speaker_f0.json.
+    """Compute full F0 statistics from profile audio files and save to speaker_f0.json.
 
     Works for both RVC (audio in profile_dir/audio/) and Beatrice 2
     (audio in profile_dir/beatrice2_data/<speaker>/). Uses pyworld DIO.
-    Returns {"mean_f0": float, "method": "dio"}.
+
+    Returns full stats: mean_f0, std_f0, p5_f0, p25_f0, p50_f0, p75_f0, p95_f0,
+    vel_std, voiced_rate, n_frames, f0_hist (256-bucket CDF histogram), method.
     """
     import json as _json
-    import math as _math
     import numpy as _np
     import torch as _torch
     import torchaudio as _torchaudio
+    from backend.app.f0_transform import compute_f0_statistics
 
     async with aiosqlite.connect(db.DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
@@ -757,11 +868,10 @@ async def compute_speaker_f0(profile_id: str):
     if not audio_files:
         raise HTTPException(status_code=422, detail="No audio files found in profile")
 
-    # Compute geometric mean F0 in an executor (CPU-bound)
     def _compute():
         import pyworld as _pyworld
-        sum_log_f0 = 0.0
-        n_frames = 0
+        all_log_f0: list[float] = []
+        total_frames = 0
         for af in audio_files:
             try:
                 wav, sr = _torchaudio.load(af)
@@ -771,20 +881,25 @@ async def compute_speaker_f0(profile_id: str):
                         _torch.from_numpy(mono), sr, 16000
                     ).numpy().astype(_np.float64)
                     sr = 16000
-                f0, _ = _pyworld.dio(mono, sr)
+                f0, _ = _pyworld.dio(mono, sr, f0_floor=50.0, f0_ceil=800.0)
+                total_frames += len(f0)
                 voiced = f0[f0 > 0]
                 if len(voiced):
-                    sum_log_f0 += float(_np.log(voiced).sum())
-                    n_frames += len(voiced)
+                    all_log_f0.extend(_np.log(voiced).tolist())
             except Exception:
                 pass
-        if n_frames == 0:
+        if not all_log_f0:
             raise ValueError("No voiced frames found in audio files")
-        return _math.exp(sum_log_f0 / n_frames)
+        stats = compute_f0_statistics(_np.array(all_log_f0, dtype=_np.float64))
+        voiced_rate = len(all_log_f0) / total_frames if total_frames > 0 else 0.0
+        stats["voiced_rate"] = round(voiced_rate, 4)
+        stats["n_frames"] = len(all_log_f0)
+        stats["method"] = "dio"
+        return stats
 
     loop = asyncio.get_event_loop()
     try:
-        mean_f0 = await loop.run_in_executor(None, _compute)
+        payload = await loop.run_in_executor(None, _compute)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -796,7 +911,7 @@ async def compute_speaker_f0(profile_id: str):
     else:
         save_path = os.path.join(pdir, "speaker_f0.json")
 
-    payload = {"mean_f0": round(mean_f0, 4), "method": "dio"}
+    import json as _json
     with open(save_path, "w") as f:
         _json.dump(payload, f)
 
@@ -938,22 +1053,20 @@ async def analyze_job(job_id: str, profile_id: Optional[str] = None):
 
 @router.post("/input_f0")
 async def compute_input_f0(file: UploadFile = File(...)):
-    """Compute the geometric mean F0 of an uploaded audio file using pyworld DIO.
+    """Compute full F0 statistics for an uploaded audio file using pyworld DIO.
 
     Mirrors the same algorithm used for profile F0 computation so both sides
-    of the auto pitch-shift formula are on equal footing.
+    of the normalization formula are on equal footing.
 
-    Returns:
-        {"mean_f0": float, "method": "dio", "n_frames": int}
-    Raises:
-        422 if no voiced frames are found (silent or non-speech file).
+    Returns full stats: mean_f0, std_f0, p5_f0, p25_f0, p50_f0, p75_f0, p95_f0,
+    vel_std, voiced_rate, n_frames, f0_hist (256-bucket CDF), method.
+    Raises 422 if no voiced frames are found.
     """
-    import json as _json
-    import math as _math
     import numpy as _np
     import torch as _torch
     import torchaudio as _torchaudio
     import pyworld as _pyworld
+    from backend.app.f0_transform import compute_f0_statistics
 
     audio_bytes = await file.read()
     try:
@@ -962,14 +1075,11 @@ async def compute_input_f0(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cannot read audio file: {e}")
 
-    # Mono
     if audio_data.ndim == 2:
         audio_mono = audio_data.mean(axis=1)
     else:
         audio_mono = audio_data
 
-    # Resample to 16 kHz (DIO works well at 16 kHz; avoids spending time on
-    # high-frequency content that carries no pitch information).
     if orig_sr != _SR_16K:
         t = _torch.from_numpy(audio_mono).unsqueeze(0)
         from torchaudio.transforms import Resample as _R
@@ -982,14 +1092,19 @@ async def compute_input_f0(file: UploadFile = File(...)):
         voiced = f0[f0 > 0]
         if len(voiced) == 0:
             raise ValueError("No voiced frames found — is the file speech?")
-        mean_f0 = _math.exp(float(_np.log(voiced).mean()))
-        return round(mean_f0, 4), int(len(voiced))
+        log_v = _np.log(voiced)
+        stats = compute_f0_statistics(log_v)
+        voiced_rate = len(voiced) / len(f0) if len(f0) > 0 else 0.0
+        stats["voiced_rate"] = round(voiced_rate, 4)
+        stats["n_frames"] = int(len(voiced))
+        stats["method"] = "dio"
+        return stats
 
     loop = asyncio.get_event_loop()
     try:
-        mean_f0, n_frames = await loop.run_in_executor(None, _run)
+        result = await loop.run_in_executor(None, _run)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    return {"mean_f0": mean_f0, "method": "dio", "n_frames": n_frames}
+    return result
 
