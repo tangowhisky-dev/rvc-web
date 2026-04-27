@@ -406,10 +406,18 @@ def _run_beatrice2_realtime(
                 cmd = cmd_q.get(timeout=0.1)
             except Exception:
                 continue
-            if cmd is None or (isinstance(cmd, dict) and cmd.get("type") == "stop"):
+            if cmd is None or (isinstance(cmd, dict) and cmd.get("cmd") == "stop"):
                 break
-            if isinstance(cmd, dict) and cmd.get("type") == "update_params":
-                params.update(cmd.get("params", {}))
+            if isinstance(cmd, dict) and cmd.get("cmd") == "update_params":
+                # Map parent-side keys (pitch, formant) → B2 internal keys.
+                # Other keys (silence_threshold_db, output_gain, noise_reduction) match directly.
+                if "pitch" in cmd:
+                    params["pitch_shift_semitones"] = cmd["pitch"]
+                if "formant" in cmd:
+                    params["formant_shift_semitones"] = cmd["formant"]
+                for k in ("silence_threshold_db", "output_gain", "noise_reduction"):
+                    if k in cmd:
+                        params[k] = cmd[k]
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +561,9 @@ def run_worker(
                 session_id=session_id,
                 infer_device=infer_device,
             )
+            # B2 path exits here — emit stopped so the drain thread can cleanly exit.
+            # (The RVC path reaches the finally block; the B2 path returns early.)
+            evt_q.put({"event": "stopped"})
             return
 
         # ----------------------------------------------------------------

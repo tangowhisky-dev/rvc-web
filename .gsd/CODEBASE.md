@@ -1,13 +1,14 @@
 # Codebase Map
 
-Generated: 2026-04-24T12:44:39Z | Files: 230 | Described: 0/230
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-24T12:44:39Z","fingerprint":"1b1b0c7e46516c87011e75bfe7f71c2a345d7ef0","fileCount":230,"truncated":false} -->
+Generated: 2026-04-27T10:05:44Z | Files: 232 | Described: 0/232
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-27T10:05:44Z","fingerprint":"03ff71e3bbdf5778e7356744c4d1681f587f0d67","fileCount":232,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
 - `.gitignore`
 - `install.bat`
 - `install.sh`
+- `meanvc_freevc_comparison.md`
 - `pytest.ini`
 - `README.md`
 - `requirements.txt`
@@ -289,6 +290,7 @@ Generated: 2026-04-24T12:44:39Z | Files: 230 | Described: 0/230
 - `docs/CROSS_PLATFORM_ANALYSIS.md`
 - `docs/DEITERIS-VC-ANALYSIS.md`
 - `docs/KNOWLEDGE.md`
+- `docs/meanvc-freevc-integration-analysis.md`
 - `docs/REALTIME_CLIENT_IO_MIGRATION.md`
 - `docs/RT-VC-ANALYSIS.md`
 - `docs/TRAINING_COMPARISON.md`
