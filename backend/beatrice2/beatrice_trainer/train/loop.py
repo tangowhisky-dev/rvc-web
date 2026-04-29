@@ -574,6 +574,7 @@ def prepare_training():
         _use_amp,
         db_path,
         profile_id,
+        speaker_audio_files,
     )
 
 
@@ -609,6 +610,7 @@ def _run_main():
         _use_amp,
         db_path,
         profile_id,
+        speaker_audio_files,
     ) = prepare_training()
 
     # Direct DB writer — same pattern as RVC's TrainingDBWriter
