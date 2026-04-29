@@ -1087,7 +1087,9 @@ export default function TrainingPage() {
         } else if (msg.type === 'phase') {
           if (msg.message) appendLog(`── ${msg.phase?.toUpperCase() ?? ''}: ${msg.message}`);
         } else if (msg.type === 'epoch_done') {
-          if (msg.message) appendLog(`✓ ${msg.message}`);
+          // Stats line (Epoch N/M  Xs/epoch  elapsed  ETA) is emitted as a
+          // separate 'log' event by the poller — no need to echo the epoch_done
+          // message here too.
           if (msg.epoch != null && msg.losses) {
             const l = msg.losses;
             const point = {
