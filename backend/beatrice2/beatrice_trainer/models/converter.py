@@ -402,6 +402,20 @@ class ConverterNetwork(nn.Module):
         if self.use_reference_encoder and ref_wav is not None:
             # ref_wav: [batch, T_ref] at 16 kHz
             style_vec = self.reference_encoder(ref_wav)   # [batch, ref_channels]
+            # Guard against NaN/inf from random conv init or AMP fp16 overflow.
+            _non_finite = (~style_vec.isfinite()).sum().item()
+            if _non_finite:
+                self._ref_enc_nan_count = getattr(self, "_ref_enc_nan_count", 0) + int(_non_finite)
+                self._ref_enc_nan_steps = getattr(self, "_ref_enc_nan_steps", 0) + 1
+                # Log on first occurrence and then every 100 steps that had NaN
+                if self._ref_enc_nan_steps == 1 or self._ref_enc_nan_steps % 100 == 0:
+                    print(
+                        f"[ref_enc] nan_to_num activated: {int(_non_finite)} non-finite values "
+                        f"in style_vec (cumulative: {self._ref_enc_nan_count} values across "
+                        f"{self._ref_enc_nan_steps} steps)",
+                        flush=True,
+                    )
+                style_vec = torch.nan_to_num(style_vec, nan=0.0, posinf=0.0, neginf=0.0)
             style_vec = style_vec.unsqueeze(-1)            # [batch, ref_channels, 1]
             x = x + self.style_projection(style_vec)      # broadcast over length
         if slice_start_indices is not None:

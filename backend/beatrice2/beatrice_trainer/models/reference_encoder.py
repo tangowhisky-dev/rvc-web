@@ -72,6 +72,15 @@ class ReferenceEncoder(nn.Module):
             convs.append(nn.ReLU(inplace=True))
         self.convs = nn.Sequential(*convs)
 
+        # Small-weight init on convs so activations stay within fp16 range under AMP.
+        # Kaiming default would produce O(1) activations that can overflow fp16 in
+        # the early steps before the proj zero-init takes effect.
+        for m in self.convs.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
         # After conv stack: [B, 128, freq//64, T//64].  freq//64 of 80-mel = 2.
         gru_input_size = 128 * 2  # 128 channels × 2 freq bins
 
@@ -83,9 +92,10 @@ class ReferenceEncoder(nn.Module):
         )
         self.proj = nn.Linear(gru_hidden, style_channels)
 
-        # Zero-initialise projection so the encoder starts as a no-op.
-        # The model behaves like the baseline at the start of fine-tuning
-        # and gradually learns to use the encoder as training progresses.
+        # Zero-initialise projection AND GRU so the encoder starts as a true no-op.
+        # Conv weights are small-init (xavier gain=0.1) above to prevent fp16 overflow.
+        for name, param in self.gru.named_parameters():
+            nn.init.zeros_(param)
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
 
