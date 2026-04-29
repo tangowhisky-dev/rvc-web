@@ -1,7 +1,7 @@
 # Codebase Map
 
-Generated: 2026-04-29T05:51:07Z | Files: 237 | Described: 0/237
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-29T05:51:07Z","fingerprint":"c71040c17a959a05498d6e297f5bc438283c5e68","fileCount":237,"truncated":false} -->
+Generated: 2026-04-29T06:05:05Z | Files: 238 | Described: 0/238
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-29T06:05:05Z","fingerprint":"ceee14030dd60ade3ab6fa4e00785e48364a8970","fileCount":238,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
@@ -102,6 +102,7 @@ Generated: 2026-04-29T05:51:07Z | Files: 237 | Described: 0/237
 - `backend/beatrice2/beatrice_trainer/models/discriminator.py`
 - `backend/beatrice2/beatrice_trainer/models/phone_extractor.py`
 - `backend/beatrice2/beatrice_trainer/models/pitch_estimator.py`
+- `backend/beatrice2/beatrice_trainer/models/reference_encoder.py`
 - `backend/beatrice2/beatrice_trainer/models/vocoder.py`
 
 ### backend/beatrice2/beatrice_trainer/models/utmos/

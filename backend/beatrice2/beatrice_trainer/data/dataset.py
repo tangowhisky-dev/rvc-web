@@ -175,7 +175,7 @@ class WavDataset(torch.utils.data.Dataset):
         # Load reference clip for reference encoder (different file, same speaker)
         ref_wav_16k = self._load_ref_wav(index, speaker_id)
 
-        return clean_wav, noisy_wav_16k, speaker_id, formant_shift, ref_wav_16k, ref_wav_16k
+        return clean_wav, noisy_wav_16k, speaker_id, formant_shift, ref_wav_16k
 
     def _load_ref_wav(self, index: int, speaker_id: int) -> Optional[torch.Tensor]:
         """Load a reference clip at 16 kHz from a *different* file of the same speaker.
