@@ -368,6 +368,12 @@ def prepare_training():
     )
     del pitch_estimator_checkpoint
 
+    _ref_enc_kwargs = {}
+    import inspect as _inspect
+    _converter_params = _inspect.signature(ConverterNetwork.__init__).parameters
+    if "use_reference_encoder" in _converter_params:
+        _ref_enc_kwargs["use_reference_encoder"] = bool(getattr(h, "use_reference_encoder", False))
+        _ref_enc_kwargs["reference_encoder_channels"] = int(getattr(h, "reference_encoder_channels", 256))
     net_g = ConverterNetwork(
         phone_extractor,
         pitch_estimator,
@@ -378,8 +384,7 @@ def prepare_training():
         h.training_time_vq,
         h.phone_noise_ratio,
         h.floor_noise_level,
-        use_reference_encoder=bool(getattr(h, "use_reference_encoder", False)),
-        reference_encoder_channels=int(getattr(h, "reference_encoder_channels", 256)),
+        **_ref_enc_kwargs,
     ).to(device)
     net_d = MultiPeriodDiscriminator(san=h.san).to(device)
 

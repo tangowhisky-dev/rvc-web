@@ -945,7 +945,7 @@ export default function TrainingPage() {
   const [klAnnealEpochs, setKlAnnealEpochs] = useState(40);
   const [optimizer, setOptimizer] = useState<'adamw' | 'adamspd'>('adamw');
   // Beatrice 2: reference encoder
-  const [useRefEncoder, setUseRefEncoder] = useState(false);
+  const [useRefEncoder, setUseRefEncoder] = useState(true);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
 
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -1005,6 +1005,18 @@ export default function TrainingPage() {
     return () => { cancelled = true; };
   }, [selectedId, profiles, historyKey]);
 
+  // Default useRefEncoder: ON for fresh profiles (no prior training steps),
+  // preserve previous state for profiles with existing training history.
+  useEffect(() => {
+    const sel = profiles.find(p => p.id === selectedId);
+    if (!sel) return;
+    const isFresh = sel.total_epochs_trained === 0 && sel.status !== 'trained' && sel.status !== 'training';
+    if (isFresh) {
+      setUseRefEncoder(true);
+    }
+    // For profiles with existing training, leave the checkbox at its current value —
+    // changing it mid-run would alter the architecture and invalidate the checkpoint.
+  }, [selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
   // Auto-snap steps to minB2Steps when a Beatrice 2 profile is selected or
   // batch size changes. Only adjusts if current value is below the new minimum
   // so the user can still choose a larger value freely.
