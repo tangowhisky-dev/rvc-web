@@ -1315,7 +1315,7 @@ async def _run_pipeline(
             job,
             job.profile_id,
             prior_epochs,
-            total_epoch,
+            cumulative_epochs,
             overtrain_threshold,
             _proc_done,
             train_start_ts=time.monotonic(),

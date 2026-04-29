@@ -251,10 +251,11 @@ def prepare_training():
     print("Computing mean F0s of target speakers...", end="")
     (out_dir / "phase.txt").write_text("extract_f0")
 
-    # Cache speaker F0s to disk so resume skips recomputation.
+    # Cache speaker F0s to disk keyed by speaker name.
+    # Always loaded (not just on resume) — new speakers are computed and appended.
     _f0_cache_path = out_dir / "_speaker_f0s_cache.json"
     _f0_cached = {}
-    if resume and _f0_cache_path.is_file():
+    if _f0_cache_path.is_file():
         try:
             import json as _json_f0
             _f0_cached = _json_f0.loads(_f0_cache_path.read_text())
@@ -270,7 +271,11 @@ def prepare_training():
         else:
             if len(files) > 10:
                 files = Random(42).sample(files, 10)
-            f0 = compute_mean_f0(files)
+            try:
+                f0 = compute_mean_f0(files)
+            except Exception as _f0_err:
+                print(f"\n  [warn] F0 computation failed for speaker {spk_name}: {_f0_err} — using 200 Hz")
+                f0 = 200.0
             _f0_cached[spk_name] = f0
         speaker_f0s.append(f0)
         if speaker % 5 == 0:
@@ -279,7 +284,7 @@ def prepare_training():
     print()
     print("Done.")
 
-    # Persist updated cache
+    # Persist updated cache (new speakers appended, existing entries unchanged)
     try:
         import json as _json_f0
         _f0_cache_path.write_text(_json_f0.dumps(_f0_cached))
@@ -299,15 +304,16 @@ def prepare_training():
 
     print("Computing pitch shifts for test files...")
 
-    # Cache test pitch shifts to disk — recomputing them on every resume is the
-    # main source of "feels like starting from step 1" slowness.
+    # Cache test pitch shifts to disk.
+    # Keys are bare filenames (not absolute paths) so the cache is portable
+    # across machines and survives profile directory moves.
     _pts_cache_path = out_dir / "_test_pitch_shifts_cache.json"
     _pts_cache: dict[str, list[int]] = {}
-    if resume and _pts_cache_path.is_file():
+    if _pts_cache_path.is_file():
         try:
             import json as _json_pts
             _pts_cache = _json_pts.loads(_pts_cache_path.read_text())
-            print(f"  (test pitch-shift cache: {len(_pts_cache)} entries loaded from {_pts_cache_path.name})")
+            print(f"  (test pitch-shift cache: {len(_pts_cache)} entries)")
         except Exception:
             _pts_cache = {}
 
@@ -316,12 +322,24 @@ def prepare_training():
     for i, (file, target_ids) in enumerate(
         tqdm(test_filelist, desc="Computing pitch shifts")
     ):
-        _cache_key = str(file)
+        _cache_key = file.name  # bare filename — portable, no absolute paths
         if _cache_key in _pts_cache:
-            source_f0s.append(float("nan"))  # placeholder; not used after this loop
+            source_f0s.append(float("nan"))
             test_pitch_shifts.append(_pts_cache[_cache_key])
             continue
-        source_f0 = compute_mean_f0([file], method="harvest")
+        # Skip files that don't exist or can't be read (e.g. corrupt holdout copy)
+        if not file.is_file() or file.stat().st_size < 100:
+            print(f"  [warn] skipping unreadable test file: {file.name}")
+            test_pitch_shifts.append([0] * len(target_ids))
+            _pts_cache[_cache_key] = [0] * len(target_ids)
+            continue
+        try:
+            source_f0 = compute_mean_f0([file], method="harvest")
+        except Exception as _f0_err:
+            print(f"  [warn] F0 computation failed for {file.name}: {_f0_err} — using 0 pitch shift")
+            test_pitch_shifts.append([0] * len(target_ids))
+            _pts_cache[_cache_key] = [0] * len(target_ids)
+            continue
         source_f0s.append(source_f0)
         if math.isnan(source_f0):
             test_pitch_shifts.append([0] * len(target_ids))

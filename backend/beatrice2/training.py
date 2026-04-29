@@ -307,7 +307,7 @@ def _build_test_holdout(data_dir: str, test_dir: str, holdout_fraction: float = 
     Picks the last ``holdout_fraction`` of chunks from each speaker subdir
     (deterministic — same files every time) up to ``max_files`` total.
     Files are *copied* not moved so training data is unaffected.
-    Returns the number of files in test_dir after the call.
+    Returns the number of valid files in test_dir after the call.
     """
     import shutil as _shutil
     from pathlib import Path as _Path
@@ -316,7 +316,8 @@ def _build_test_holdout(data_dir: str, test_dir: str, holdout_fraction: float = 
     test_path = _Path(test_dir)
     test_path.mkdir(parents=True, exist_ok=True)
 
-    # Collect all chunk files across speaker subdirs, sorted for determinism
+    MIN_WAV_BYTES = 200  # anything smaller is certainly corrupt
+
     EXTS = {".wav", ".flac"}
     all_chunks: list[_Path] = []
     for speaker_dir in sorted(data_path.iterdir()):
@@ -325,24 +326,35 @@ def _build_test_holdout(data_dir: str, test_dir: str, holdout_fraction: float = 
         chunks = sorted(
             f for f in speaker_dir.iterdir()
             if f.suffix.lower() in EXTS and "_originals" not in f.parts
+            and f.stat().st_size >= MIN_WAV_BYTES  # skip corrupt/empty chunks
         )
         if not chunks:
             continue
-        # Take last holdout_fraction of each speaker's chunks — these are
-        # unseen by training only if the dataset is large enough; for small
-        # datasets (<10 chunks) we still use the last 1 file so there's
-        # always something to eval on.
         n_hold = max(1, int(len(chunks) * holdout_fraction))
         all_chunks.extend(chunks[-n_hold:])
 
-    # Cap total and copy
     selected = all_chunks[:max_files]
     for src in selected:
         dst = test_path / src.name
-        if not dst.exists():
-            _shutil.copy2(src, dst)
+        # Re-copy if dest is missing, corrupt, or older than source
+        src_mtime = src.stat().st_mtime
+        needs_copy = (
+            not dst.exists()
+            or dst.stat().st_size < MIN_WAV_BYTES
+            or dst.stat().st_mtime < src_mtime
+        )
+        if needs_copy:
+            try:
+                _shutil.copy2(src, dst)
+                # Verify the copy landed intact
+                if dst.stat().st_size < MIN_WAV_BYTES:
+                    dst.unlink(missing_ok=True)
+            except Exception:
+                dst.unlink(missing_ok=True)
 
-    return len(list(test_path.iterdir()))
+    # Count only valid files
+    valid = [f for f in test_path.iterdir() if f.stat().st_size >= MIN_WAV_BYTES]
+    return len(valid)
 
 
 def _preprocess_audio(
@@ -359,6 +371,7 @@ def _preprocess_audio(
     import warnings
     import torchaudio
     import torch
+    import json as _json_pp
 
     warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -385,6 +398,48 @@ def _preprocess_audio(
             audio_dir, sorted(audio_suffixes),
         )
         return 0
+
+    # Fingerprint the source audio directory: sorted list of (filename, mtime, size).
+    # If unchanged since last preprocess, skip re-chunking entirely.
+    _fingerprint_path = os.path.join(speaker_out, ".audio_fingerprint.json")
+    _fingerprint = [
+        (fname, os.path.getmtime(os.path.join(audio_dir, fname)),
+         os.path.getsize(os.path.join(audio_dir, fname)))
+        for fname in files_found
+    ]
+    _existing_chunks = [
+        f for f in os.listdir(speaker_out)
+        if f.startswith("chunk_") and f.endswith(".wav")
+    ]
+    _cached_fp = None
+    if os.path.isfile(_fingerprint_path):
+        try:
+            _cached_fp = _json_pp.loads(open(_fingerprint_path).read())
+        except Exception:
+            pass
+    if _cached_fp == _fingerprint and _existing_chunks:
+        _log.info("_preprocess_audio: source unchanged, skipping re-chunk (%d chunks on disk)", len(_existing_chunks))
+        return len(_existing_chunks)
+
+    # Source changed (or first run) — re-chunk from scratch.
+    # Clear old chunks so stale files from a prior larger dataset don't linger.
+    for _old in os.listdir(speaker_out):
+        if _old.startswith("chunk_") and _old.endswith(".wav"):
+            try:
+                os.remove(os.path.join(speaker_out, _old))
+            except Exception:
+                pass
+
+    # Invalidate F0/pitch-shift caches in the parent out_dir — they were computed
+    # against the previous chunk set and are now stale.
+    _out_dir_parent = os.path.dirname(speaker_out)
+    for _cache_name in ("_speaker_f0s_cache.json", "_test_pitch_shifts_cache.json"):
+        _cp = os.path.join(_out_dir_parent, _cache_name)
+        if os.path.isfile(_cp):
+            try:
+                os.remove(_cp)
+            except Exception:
+                pass
 
     for fname in files_found:
         src = os.path.join(audio_dir, fname)
@@ -423,6 +478,12 @@ def _preprocess_audio(
             f"First error: {load_errors[0]}"
         )
 
+    # Persist fingerprint so next run can skip re-chunking if source is unchanged
+    try:
+        open(_fingerprint_path, "w").write(_json_pp.dumps(_fingerprint))
+    except Exception:
+        pass
+
     return total_chunks
 
 
@@ -449,54 +510,39 @@ async def _run_beatrice_pipeline(
     """Full Beatrice 2 training pipeline coroutine.
 
     Phases:
-      1. preprocess — split audio into 4s chunks (skipped on resume if data_dir exists)
+      1. preprocess — split audio into 4s chunks
+                      (_preprocess_audio skips re-chunking if source files unchanged)
       2. train      — launch beatrice_trainer subprocess
     """
     python = sys.executable
 
+    job.phase = "preprocess"
+    job.queue.put_nowait(
+        {"type": "phase", "message": "Preprocessing audio for Beatrice 2...", "phase": "preprocess"}
+    )
+
     # ------------------------------------------------------------------
     # Phase 1: Preprocessing (sync → executor)
-    # Skip on resume if the data_dir already contains chunks — re-chunking
-    # audio on every restart is the main source of "starting from step 1"
-    # slowness. Re-run if audio_dir has changed or data_dir is empty.
-    # ------------------------------------------------------------------
-    _checkpoint_exists = os.path.exists(os.path.join(out_dir, "checkpoint_latest.pt.gz"))
-    _data_has_chunks = os.path.isdir(os.path.join(data_dir, speaker_name)) and \
-        any(True for _ in __import__("os").scandir(os.path.join(data_dir, speaker_name)))
-    _skip_preprocess = _checkpoint_exists and _data_has_chunks
-
-    job.phase = "preprocess"
-    if _skip_preprocess:
-        job.queue.put_nowait(
-            {"type": "phase", "message": "Resuming — skipping audio preprocessing (chunks already on disk).", "phase": "preprocess"}
-        )
-        job.queue.put_nowait(
-            {"type": "log", "message": "Preprocessing skipped (resume with existing chunks).", "phase": "preprocess"}
-        )
-        n_chunks = sum(1 for _ in __import__("os").scandir(os.path.join(data_dir, speaker_name)))
-    else:
-        job.queue.put_nowait(
-            {"type": "phase", "message": "Preprocessing audio for Beatrice 2...", "phase": "preprocess"}
-        )
-
+    # _preprocess_audio fingerprints the source audio dir and skips re-chunking
+    # when files are unchanged. Re-chunks from scratch when files are added,
+    # removed, or modified (clearing stale chunks first).
     # ------------------------------------------------------------------
     try:
         loop = asyncio.get_event_loop()
-        if not _skip_preprocess:
-            n_chunks = await loop.run_in_executor(
-                None,
-                _preprocess_audio,
-                audio_dir,
-                data_dir,
-                speaker_name,
-            )
-            job.queue.put_nowait(
-                {
-                    "type": "log",
-                    "message": f"Preprocessing complete: {n_chunks} chunks written.",
-                    "phase": "preprocess",
-                }
-            )
+        n_chunks = await loop.run_in_executor(
+            None,
+            _preprocess_audio,
+            audio_dir,
+            data_dir,
+            speaker_name,
+        )
+        job.queue.put_nowait(
+            {
+                "type": "log",
+                "message": f"Preprocessing: {n_chunks} chunks ready.",
+                "phase": "preprocess",
+            }
+        )
         if n_chunks == 0:
             job.status = "failed"
             job.error = (
