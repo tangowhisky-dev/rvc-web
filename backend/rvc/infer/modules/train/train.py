@@ -263,6 +263,8 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
     )
     mdl = hps.copy().model
     del mdl.use_spectral_norm
+    _use_ref_enc = bool(getattr(hps, "use_reference_encoder", False))
+    _ref_enc_channels = int(getattr(hps, "reference_encoder_channels", 256))
     if hps.if_f0 == 1:
         net_g = RVC_Model_f0(
             hps.data.filter_length // 2 + 1,
@@ -270,12 +272,16 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
             **mdl,
             sr=hps.sample_rate,
             vocoder=getattr(hps, "vocoder", "HiFi-GAN"),
+            use_reference_encoder=_use_ref_enc,
+            reference_encoder_channels=_ref_enc_channels,
         )
     else:
         net_g = RVC_Model_nof0(
             hps.data.filter_length // 2 + 1,
             hps.train.segment_size // hps.data.hop_length,
             **mdl,
+            use_reference_encoder=_use_ref_enc,
+            reference_encoder_channels=_ref_enc_channels,
         )
     if torch.cuda.is_available():
         net_g = net_g.cuda(rank)
@@ -360,20 +366,26 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
         if hps.pretrainG != "":
             if rank == 0:
                 logger.info("loaded pretrained %s" % (hps.pretrainG))
+            # strict=False when reference encoder is enabled: pretrained weights
+            # lack reference_encoder.* and style_projection.* keys; those start
+            # from their zero-init state and are trained in from scratch.
+            _strict_g = not _use_ref_enc
             if hasattr(net_g, "module"):
                 logger.info(
                     net_g.module.load_state_dict(
                         torch.load(
                             hps.pretrainG, map_location="cpu", weights_only=True
-                        )["model"]
+                        )["model"],
+                        strict=_strict_g,
                     )
-                )  ##测试不加载优化器
+                )
             else:
                 logger.info(
                     net_g.load_state_dict(
                         torch.load(
                             hps.pretrainG, map_location="cpu", weights_only=True
-                        )["model"]
+                        )["model"],
+                        strict=_strict_g,
                     )
                 )  ##测试不加载优化器
         if hps.pretrainD != "":
@@ -465,6 +477,7 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
                 _spk_encoder,
                 _c_spk,
                 _profile_emb,
+                _use_ref_enc,
             )
         else:
             train_and_evaluate(
@@ -485,6 +498,7 @@ def run(rank, n_gpus, hps: utils.HParams, logger: logging.Logger):
                 None,
                 0.0,
                 None,
+                _use_ref_enc,
             )
         # scheduler.step() is called here — after all optimizer.step() calls for the epoch
         # have completed inside train_and_evaluate. PyTorch's internal heuristic fires a
@@ -545,6 +559,7 @@ def train_and_evaluate(
     spk_encoder=None,
     c_spk=0.0,
     profile_emb=None,
+    use_reference_encoder=False,
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
@@ -576,7 +591,8 @@ def train_and_evaluate(
         if cache == []:
             # Make new cache
             for batch_idx, info in enumerate(train_loader):
-                # Unpack
+                # Unpack — collate returns 10 items when use_reference_encoder=True
+                # (last item is ref_wav_padded; None when disabled)
                 if hps.if_f0 == 1:
                     (
                         phone,
@@ -588,6 +604,7 @@ def train_and_evaluate(
                         wave,
                         wave_lengths,
                         sid,
+                        ref_wav,
                     ) = info
                 else:
                     (
@@ -598,6 +615,7 @@ def train_and_evaluate(
                         wave,
                         wave_lengths,
                         sid,
+                        ref_wav,
                     ) = info
                 # Load on device (CUDA or MPS)
                 if torch.cuda.is_available():
@@ -611,6 +629,8 @@ def train_and_evaluate(
                     spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
                     wave = wave.cuda(rank, non_blocking=True)
                     wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
+                    if ref_wav is not None:
+                        ref_wav = ref_wav.cuda(rank, non_blocking=True)
                 elif _use_mps:
                     phone = phone.to(_device)
                     phone_lengths = phone_lengths.to(_device)
@@ -622,6 +642,8 @@ def train_and_evaluate(
                     spec_lengths = spec_lengths.to(_device)
                     wave = wave.to(_device)
                     wave_lengths = wave_lengths.to(_device)
+                    if ref_wav is not None:
+                        ref_wav = ref_wav.to(_device)
                 # Cache on list
                 if hps.if_f0 == 1:
                     cache.append(
@@ -637,6 +659,7 @@ def train_and_evaluate(
                                 wave,
                                 wave_lengths,
                                 sid,
+                                ref_wav,
                             ),
                         )
                     )
@@ -652,6 +675,7 @@ def train_and_evaluate(
                                 wave,
                                 wave_lengths,
                                 sid,
+                                ref_wav,
                             ),
                         )
                     )
@@ -667,7 +691,7 @@ def train_and_evaluate(
     for batch_idx, info in data_iterator:
         # Data
         ## Unpack
-        pitch = pitchf = None
+        pitch = pitchf = ref_wav = None
         if hps.if_f0 == 1:
             (
                 phone,
@@ -679,9 +703,10 @@ def train_and_evaluate(
                 wave,
                 wave_lengths,
                 sid,
+                ref_wav,
             ) = info
         else:
-            phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid = info
+            phone, phone_lengths, spec, spec_lengths, wave, wave_lengths, sid, ref_wav = info
         ## Load on device (CUDA or MPS)
         if (hps.if_cache_data_in_gpu == False) and torch.cuda.is_available():
             phone = phone.cuda(rank, non_blocking=True)
@@ -693,6 +718,8 @@ def train_and_evaluate(
             spec = spec.cuda(rank, non_blocking=True)
             spec_lengths = spec_lengths.cuda(rank, non_blocking=True)
             wave = wave.cuda(rank, non_blocking=True)
+            if ref_wav is not None:
+                ref_wav = ref_wav.cuda(rank, non_blocking=True)
         elif (hps.if_cache_data_in_gpu == False) and _use_mps:
             phone = phone.to(_device)
             phone_lengths = phone_lengths.to(_device)
@@ -703,6 +730,8 @@ def train_and_evaluate(
             spec = spec.to(_device)
             spec_lengths = spec_lengths.to(_device)
             wave = wave.to(_device)
+            if ref_wav is not None:
+                ref_wav = ref_wav.to(_device)
             # wave_lengths = wave_lengths.cuda(rank, non_blocking=True)
 
         # Calculate
@@ -713,7 +742,8 @@ def train_and_evaluate(
                 x_mask,
                 z_mask,
                 (z, z_p, m_p, logs_p, m_q, logs_q),
-            ) = net_g(phone, phone_lengths, spec, spec_lengths, sid, pitch, pitchf)
+            ) = net_g(phone, phone_lengths, spec, spec_lengths, sid, pitch, pitchf,
+                      ref_wav=ref_wav if use_reference_encoder else None)
             mel = spec_to_mel_torch(
                 spec,
                 hps.data.filter_length,
@@ -1050,8 +1080,10 @@ def train_and_evaluate(
 
         if hasattr(net_g, "module"):
             ckpt = net_g.module.state_dict()
+            _net_g_module = net_g.module
         else:
             ckpt = net_g.state_dict()
+            _net_g_module = net_g
         logger.info(
             "saving final ckpt:%s"
             % (
@@ -1060,6 +1092,54 @@ def train_and_evaluate(
                 )
             )
         )
+
+        # ── Reference encoder post-training dump ──────────────────────────
+        # Saves two standalone artifacts for inference without the full checkpoint:
+        #   reference_encoder.pt  — encoder + projection weights (~6 MB)
+        #   style_vec_mean.pt     — mean style vector computed over all training audio
+        if _use_ref_enc and hasattr(_net_g_module, "reference_encoder") and _net_g_module.reference_encoder is not None:
+            try:
+                import torchaudio as _ta
+                _ref_enc = _net_g_module.reference_encoder
+                _proj    = _net_g_module.style_projection
+                _ref_enc_path = os.path.join(hps.model_dir, "reference_encoder.pt")
+                torch.save({
+                    "reference_encoder": _ref_enc.state_dict(),
+                    "style_projection":  _proj.state_dict(),
+                    "reference_encoder_channels": int(getattr(hps, "reference_encoder_channels", 256)),
+                    "gin_channels": hps.model.gin_channels,
+                }, _ref_enc_path)
+                logger.info(f"reference encoder saved → {_ref_enc_path}")
+
+                # Compute mean style vector over all training audio
+                _filelist = hps.data.training_files
+                _vecs = []
+                _ref_enc_cpu = _ref_enc.cpu().eval()
+                with open(_filelist) as _fl:
+                    for _line in _fl:
+                        _audiopath = _line.strip().split("|")[0]
+                        if not os.path.isfile(_audiopath):
+                            continue
+                        try:
+                            _wav, _sr = _ta.load(_audiopath)
+                            if _wav.shape[0] > 1:
+                                _wav = _wav.mean(0, keepdim=True)
+                            if _sr != 16_000:
+                                _wav = _ta.transforms.Resample(_sr, 16_000)(_wav)
+                            _wav = _wav.squeeze(0)
+                            with torch.no_grad():
+                                _v = _ref_enc_cpu(_wav)
+                            _vecs.append(_v.detach().cpu())
+                        except Exception as _e:
+                            logger.warning(f"style_vec_mean: skip {_audiopath}: {_e}")
+                if _vecs:
+                    _mean_vec = torch.stack(_vecs).mean(0)
+                    _mean_path = os.path.join(hps.model_dir, "style_vec_mean.pt")
+                    torch.save(_mean_vec, _mean_path)
+                    logger.info(f"style_vec_mean saved → {_mean_path}  (n={len(_vecs)})")
+            except Exception as _re:
+                logger.warning(f"reference encoder dump failed (non-fatal): {_re}")
+
         sleep(1)
         # Flush all logging handlers before os._exit() bypasses normal cleanup
         logging.shutdown()

@@ -449,34 +449,54 @@ async def _run_beatrice_pipeline(
     """Full Beatrice 2 training pipeline coroutine.
 
     Phases:
-      1. preprocess — split audio into 4s chunks
+      1. preprocess — split audio into 4s chunks (skipped on resume if data_dir exists)
       2. train      — launch beatrice_trainer subprocess
     """
     python = sys.executable
-    job.phase = "preprocess"
-    job.queue.put_nowait(
-        {"type": "phase", "message": "Preprocessing audio for Beatrice 2...", "phase": "preprocess"}
-    )
 
     # ------------------------------------------------------------------
     # Phase 1: Preprocessing (sync → executor)
+    # Skip on resume if the data_dir already contains chunks — re-chunking
+    # audio on every restart is the main source of "starting from step 1"
+    # slowness. Re-run if audio_dir has changed or data_dir is empty.
+    # ------------------------------------------------------------------
+    _checkpoint_exists = os.path.exists(os.path.join(out_dir, "checkpoint_latest.pt.gz"))
+    _data_has_chunks = os.path.isdir(os.path.join(data_dir, speaker_name)) and \
+        any(True for _ in __import__("os").scandir(os.path.join(data_dir, speaker_name)))
+    _skip_preprocess = _checkpoint_exists and _data_has_chunks
+
+    job.phase = "preprocess"
+    if _skip_preprocess:
+        job.queue.put_nowait(
+            {"type": "phase", "message": "Resuming — skipping audio preprocessing (chunks already on disk).", "phase": "preprocess"}
+        )
+        job.queue.put_nowait(
+            {"type": "log", "message": "Preprocessing skipped (resume with existing chunks).", "phase": "preprocess"}
+        )
+        n_chunks = sum(1 for _ in __import__("os").scandir(os.path.join(data_dir, speaker_name)))
+    else:
+        job.queue.put_nowait(
+            {"type": "phase", "message": "Preprocessing audio for Beatrice 2...", "phase": "preprocess"}
+        )
+
     # ------------------------------------------------------------------
     try:
         loop = asyncio.get_event_loop()
-        n_chunks = await loop.run_in_executor(
-            None,
-            _preprocess_audio,
-            audio_dir,
-            data_dir,
-            speaker_name,
-        )
-        job.queue.put_nowait(
-            {
-                "type": "log",
-                "message": f"Preprocessing complete: {n_chunks} chunks written.",
-                "phase": "preprocess",
-            }
-        )
+        if not _skip_preprocess:
+            n_chunks = await loop.run_in_executor(
+                None,
+                _preprocess_audio,
+                audio_dir,
+                data_dir,
+                speaker_name,
+            )
+            job.queue.put_nowait(
+                {
+                    "type": "log",
+                    "message": f"Preprocessing complete: {n_chunks} chunks written.",
+                    "phase": "preprocess",
+                }
+            )
         if n_chunks == 0:
             job.status = "failed"
             job.error = (

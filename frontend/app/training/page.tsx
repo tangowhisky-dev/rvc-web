@@ -1451,7 +1451,8 @@ export default function TrainingPage() {
             {/* Beatrice 2 — reference encoder toggle */}
             {(() => {
               const _sel = profiles.find(p => p.id === selectedId);
-              if (_sel?.pipeline !== 'beatrice2') return null;
+              // Reference encoder is supported for both RVC and Beatrice 2
+              if (!_sel) return null;
               return (
                 <div className="border-t border-zinc-800/60 pt-4">
                   <label className="flex items-center gap-2 cursor-pointer select-none">

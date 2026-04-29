@@ -660,6 +660,24 @@ def run_worker(
         block_params = _compute_block_params(_BLOCK_48K, tgt_sr=tgt_sr,
                                              sola_buf_ms=sola_crossfade_ms)
 
+        # Reference encoder: encode reference clip once at session start.
+        if reference_audio_b64 and rvc.has_reference_encoder:
+            try:
+                import base64 as _b64, io as _io
+                import torchaudio as _ta
+                _ref_bytes = _b64.b64decode(reference_audio_b64)
+                _ref_wav, _ref_sr = _ta.load(_io.BytesIO(_ref_bytes))
+                if _ref_wav.shape[0] > 1:
+                    _ref_wav = _ref_wav.mean(0, keepdim=True)
+                if _ref_sr != 16000:
+                    _ref_wav = _ta.transforms.Resample(_ref_sr, 16000)(_ref_wav)
+                rvc.set_reference(_ref_wav.squeeze(0).numpy())
+                evt_q.put({"event": "log", "message": "RVC reference encoder: clip encoded and cached."})
+            except Exception as _re:
+                evt_q.put({"event": "log", "message": f"RVC reference encoder: clip decode failed ({_re}); using profile default."})
+        elif rvc.has_reference_encoder and rvc._mean_style_vec is not None:
+            evt_q.put({"event": "log", "message": "RVC reference encoder: using profile mean style vector."})
+
         # ------------------------------------------------------------------
         # Patch rvc._get_f0: pad + F0 prior pipeline (affine + vel + soft-clip).
         # No HistEQ in realtime — requires full file CDF.

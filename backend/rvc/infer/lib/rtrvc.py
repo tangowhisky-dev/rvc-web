@@ -216,6 +216,114 @@ class RVC:
             import logging as _logging
             _logging.getLogger("rvc_web.rtrvc").info("Loaded fairseq HuBERT embedder")
 
+        # ── Reference encoder ────────────────────────────────────────────────
+        # Loaded from model_dir/reference_encoder.pt if present.
+        # Inference path uses set_reference() to cache the style vector so the
+        # encoder only runs once per session (not per block).
+        self._reference_encoder = None
+        self._style_projection = None
+        self._active_style_vec: Optional[torch.Tensor] = None  # [1, gin_channels, 1]
+        self._mean_style_vec: Optional[torch.Tensor] = None    # fallback
+        self._use_reference_encoder = False
+        self._load_reference_encoder()
+
+    def _load_reference_encoder(self) -> None:
+        """Load reference_encoder.pt from the same directory as pth_path."""
+        import os as _os
+        pth_dir = _os.path.dirname(str(self.pth_path))
+        ref_enc_path = _os.path.join(pth_dir, "reference_encoder.pt")
+        if not _os.path.isfile(ref_enc_path):
+            return
+        try:
+            from backend.beatrice2.beatrice_trainer.models.reference_encoder import ReferenceEncoder
+            import torch as _t
+            data = _t.load(ref_enc_path, map_location="cpu", weights_only=False)
+            style_channels = data.get("reference_encoder_channels", 256)
+            gin_channels   = data.get("gin_channels", 256)
+
+            enc = ReferenceEncoder(style_channels=style_channels)
+            enc.load_state_dict(data["reference_encoder"])
+            enc = enc.to(self.device).eval()
+            if self.is_half and self.device.startswith("cuda"):
+                enc = enc.half()
+            self._reference_encoder = enc
+
+            proj = torch.nn.Conv1d(style_channels, gin_channels, 1)
+            proj.load_state_dict(data["style_projection"])
+            proj = proj.to(self.device).eval()
+            if self.is_half and self.device.startswith("cuda"):
+                proj = proj.half()
+            self._style_projection = proj
+
+            self._use_reference_encoder = True
+
+            # Load mean style vector from same dir
+            mean_path = _os.path.join(pth_dir, "style_vec_mean.pt")
+            if _os.path.isfile(mean_path):
+                mean_vec = _t.load(mean_path, map_location="cpu", weights_only=True)  # [style_channels]
+                with torch.no_grad():
+                    mean_proj = proj(mean_vec.unsqueeze(0).unsqueeze(-1).to(self.device))  # [1, gin_channels, 1]
+                self._mean_style_vec = mean_proj.detach()
+                _log2.getLogger("rvc_web.rtrvc").info(
+                    "reference encoder loaded (%d→%d), mean style vector ready", style_channels, gin_channels
+                )
+            else:
+                _log2.getLogger("rvc_web.rtrvc").info(
+                    "reference encoder loaded (%d→%d), no mean style vector", style_channels, gin_channels
+                )
+        except Exception as _e:
+            _log2.getLogger("rvc_web.rtrvc").warning(
+                "reference encoder load failed (non-fatal): %s", _e
+            )
+            self._reference_encoder = None
+            self._style_projection = None
+            self._use_reference_encoder = False
+
+    @property
+    def has_reference_encoder(self) -> bool:
+        return self._use_reference_encoder
+
+    def encode_reference(self, wav_16k: np.ndarray) -> np.ndarray:
+        """Encode a 16 kHz waveform into a style vector (numpy float32).
+
+        Returns the projected gin_channels-dim vector as numpy array.
+        """
+        if not self._use_reference_encoder or self._reference_encoder is None:
+            raise RuntimeError("Reference encoder not loaded for this checkpoint")
+        t = torch.from_numpy(wav_16k.astype(np.float32)).to(self.device)
+        if self.is_half and self.device.startswith("cuda"):
+            t = t.half()
+        with torch.no_grad():
+            style = self._reference_encoder(t)   # [style_channels]
+            proj  = self._style_projection(style.unsqueeze(0).unsqueeze(-1))  # [1, gin, 1]
+        return proj.squeeze().float().cpu().numpy()
+
+    def set_reference(self, wav_16k: Optional[np.ndarray]) -> None:
+        """Cache a reference style vector for the current session.
+
+        Pass wav_16k=None to revert to the profile mean style vector.
+        """
+        if wav_16k is None:
+            self._active_style_vec = None
+            return
+        if not self._use_reference_encoder or self._reference_encoder is None:
+            return
+        t = torch.from_numpy(wav_16k.astype(np.float32)).to(self.device)
+        if self.is_half and self.device.startswith("cuda"):
+            t = t.half()
+        with torch.no_grad():
+            style = self._reference_encoder(t)   # [style_channels]
+            proj  = self._style_projection(style.unsqueeze(0).unsqueeze(-1))  # [1, gin, 1]
+        self._active_style_vec = proj.detach()
+
+    def _get_active_style_vec(self) -> Optional[torch.Tensor]:
+        """Return cached session style vec, or profile mean, or None."""
+        if self._active_style_vec is not None:
+            return self._active_style_vec
+        if self._mean_style_vec is not None:
+            return self._mean_style_vec
+        return None
+
     def set_key(self, new_key):
         self.f0_up_key = new_key
 
@@ -341,17 +449,29 @@ class RVC:
         # net_g expects fp32 — an explicit cast bridges the two.
         _net_g_dtype = torch.float16 if self._net_g_is_half else torch.float32
         feats = feats.to(_net_g_dtype)
+        # Reference encoder: inject pre-computed style vector into infer().
+        # JIT-compiled models don't support the extra kwarg — skip gracefully.
+        _style_vec = self._get_active_style_vec() if self._use_reference_encoder else None
+        if _style_vec is not None and self.use_jit:
+            _style_vec = None  # JIT path: style injection not supported
+        if _style_vec is not None:
+            _style_vec = _style_vec.to(_net_g_dtype)
         with torch.no_grad():
+            _infer_kwargs = dict(
+                pitch=cache_pitch,
+                pitchf=cache_pitchf,
+                skip_head=skip_head,
+                return_length=return_length,
+                return_length2=return_length2,
+            )
+            if _style_vec is not None:
+                _infer_kwargs["style_vec"] = _style_vec
             infered_audio = (
                 self.net_g.infer(
                     feats,
                     p_len,
                     sid,
-                    pitch=cache_pitch,
-                    pitchf=cache_pitchf,
-                    skip_head=skip_head,
-                    return_length=return_length,
-                    return_length2=return_length2,
+                    **_infer_kwargs,
                 )
                 .squeeze(1)
                 .float()

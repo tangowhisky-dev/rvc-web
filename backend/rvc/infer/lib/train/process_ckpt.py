@@ -59,6 +59,8 @@ def save_small_model(ckpt, sr, if_f0, name, epoch, version, hps):
         opt["version"] = version
         opt["vocoder"] = getattr(hps, "vocoder", "HiFi-GAN")
         opt["embedder"] = getattr(hps, "embedder", "hubert")
+        opt["use_reference_encoder"] = bool(getattr(hps, "use_reference_encoder", False))
+        opt["reference_encoder_channels"] = int(getattr(hps, "reference_encoder_channels", 256))
         try:
             h = model_hash_ckpt(opt)
             opt["hash"] = h

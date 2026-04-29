@@ -1107,6 +1107,9 @@ _EXPORT_FILES = [
     "train.log",
     "checkpoints/G_latest.pth",
     "checkpoints/G_best.pth",
+    # Reference encoder artifacts (present only when trained with use_reference_encoder=True)
+    "reference_encoder.pt",
+    "style_vec_mean.pt",
 ]
 
 

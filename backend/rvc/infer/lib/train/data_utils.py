@@ -29,7 +29,23 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         self.sampling_rate = hparams.sampling_rate
         self.min_text_len = getattr(hparams, "min_text_len", 1)
         self.max_text_len = getattr(hparams, "max_text_len", 5000)
+        # Reference encoder support: True when config requests it
+        self.use_reference_encoder = bool(getattr(hparams, "use_reference_encoder", False))
+        self.ref_clip_seconds = float(getattr(hparams, "ref_clip_seconds", 6.0))
         self._filter()
+        # Build per-speaker (dv) file index for anti-leakage reference sampling
+        if self.use_reference_encoder:
+            self._build_spk_index()
+
+    def _build_spk_index(self):
+        """Index audio files by speaker ID so we can pick a *different* file
+        from the same speaker as the reference clip (prevents content leakage)."""
+        from collections import defaultdict
+        spk_to_files: dict = defaultdict(list)
+        for item in self.audiopaths_and_text:
+            audiopath, _, _, _, dv = item
+            spk_to_files[str(dv)].append(audiopath)
+        self._spk_to_files = dict(spk_to_files)
 
     def _filter(self):
         """
@@ -78,7 +94,48 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             pitch = pitch[:len_min]
             pitchf = pitchf[:len_min]
 
+        if self.use_reference_encoder:
+            ref_wav = self._load_ref_wav(file, str(audiopath_and_text[4]))
+            return (spec, wav, phone, pitch, pitchf, dv, ref_wav)
         return (spec, wav, phone, pitch, pitchf, dv)
+
+    def _load_ref_wav(self, current_file: str, spk_id: str) -> torch.Tensor:
+        """Load a reference wav from the *same speaker* but a *different file*.
+
+        Anti-leakage: if the speaker has only one file we still use it (no choice),
+        but we load a random sub-clip so position-level content doesn't leak.
+        Returns a 1-D float32 tensor at 16 kHz of length ref_clip_seconds × 16000.
+        """
+        import random
+        import torchaudio
+
+        ref_samples = int(self.ref_clip_seconds * 16_000)
+        candidates = self._spk_to_files.get(spk_id, [current_file])
+        # Prefer a different file if available
+        others = [f for f in candidates if f != current_file]
+        ref_file = random.choice(others) if others else current_file
+
+        try:
+            ref_audio, ref_sr = torchaudio.load(ref_file)
+        except Exception:
+            return torch.zeros(ref_samples, dtype=torch.float32)
+
+        if ref_audio.shape[0] > 1:
+            ref_audio = ref_audio.mean(0, keepdim=True)
+        if ref_sr != 16_000:
+            ref_audio = torchaudio.transforms.Resample(ref_sr, 16_000)(ref_audio)
+        ref_audio = ref_audio.squeeze(0)  # [T]
+
+        if ref_audio.shape[0] >= ref_samples:
+            # random start offset so we don't always take the beginning
+            start = random.randint(0, ref_audio.shape[0] - ref_samples)
+            ref_audio = ref_audio[start : start + ref_samples]
+        else:
+            # tile-repeat to fill the clip length
+            reps = (ref_samples // ref_audio.shape[0]) + 1
+            ref_audio = ref_audio.repeat(reps)[:ref_samples]
+
+        return ref_audio.float()
 
     def get_labels(self, phone, pitch, pitchf):
         phone = np.load(phone)
@@ -183,6 +240,13 @@ class TextAudioCollateMultiNSFsid:
         # dv = torch.FloatTensor(len(batch), 256)#gin=256
         sid = torch.LongTensor(len(batch))
 
+        # Reference encoder: present when dataset was built with use_reference_encoder=True
+        _has_ref = len(batch[0]) == 7
+        ref_wav_padded = None
+        if _has_ref:
+            _ref_len = batch[0][6].shape[0]
+            ref_wav_padded = torch.FloatTensor(len(batch), _ref_len).zero_()
+
         for i in range(len(ids_sorted_decreasing)):
             row = batch[ids_sorted_decreasing[i]]
 
@@ -206,6 +270,9 @@ class TextAudioCollateMultiNSFsid:
             # dv[i] = row[5]
             sid[i] = row[5]
 
+            if _has_ref and ref_wav_padded is not None:
+                ref_wav_padded[i] = row[6]
+
         return (
             phone_padded,
             phone_lengths,
@@ -217,6 +284,8 @@ class TextAudioCollateMultiNSFsid:
             wave_lengths,
             # dv
             sid,
+            # reference wavs (None when use_reference_encoder=False)
+            ref_wav_padded,
         )
 
 

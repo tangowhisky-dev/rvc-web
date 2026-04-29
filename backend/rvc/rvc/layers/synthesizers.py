@@ -15,6 +15,42 @@ from .utils import (
 )
 
 
+# ---------------------------------------------------------------------------
+# ReferenceEncoder — lightweight style-conditioning module
+# Lazy-imported so the file is importable even when torchaudio is absent.
+# ---------------------------------------------------------------------------
+
+def _make_reference_encoder(style_channels: int = 256) -> nn.Module:
+    """Return a ReferenceEncoder with the requested output size.
+
+    The class lives in backend/beatrice2 but we re-use it here to avoid
+    duplicating 150 lines of Conv2d+GRU code.  Import is deferred so the
+    synthesizer module stays importable on systems without torchaudio.
+    """
+    try:
+        from backend.beatrice2.beatrice_trainer.models.reference_encoder import (
+            ReferenceEncoder,
+        )
+        return ReferenceEncoder(style_channels=style_channels)
+    except Exception:
+        # Fallback: identity module that always returns zeros.  Allows the
+        # synthesizer to run without the beatrice2 package installed.
+        class _NoOpEncoder(nn.Module):
+            def __init__(self, style_channels: int) -> None:
+                super().__init__()
+                self._sc = style_channels
+                self.dummy = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+            def forward(self, wav: torch.Tensor) -> torch.Tensor:
+                B = wav.shape[0] if wav.dim() > 1 else 1
+                return torch.zeros(B, self._sc, device=wav.device, dtype=wav.dtype)
+
+            def encode_clip(self, wav: torch.Tensor) -> torch.Tensor:
+                return self.forward(wav)
+
+        return _NoOpEncoder(style_channels)
+
+
 class SynthesizerTrnMsNSFsid(nn.Module):
     def __init__(
         self,
@@ -39,6 +75,9 @@ class SynthesizerTrnMsNSFsid(nn.Module):
         encoder_dim: int,
         use_f0: bool,
         vocoder: str = "HiFi-GAN",
+        # Reference encoder — style conditioning
+        use_reference_encoder: bool = False,
+        reference_encoder_channels: int = 256,
     ):
         super().__init__()
         if isinstance(sr, str):
@@ -122,6 +161,20 @@ class SynthesizerTrnMsNSFsid(nn.Module):
         )
         self.emb_g = nn.Embedding(self.spk_embed_dim, gin_channels)
 
+        # Reference encoder — optional style conditioning.
+        # Adds a projected style vector to g before every forward pass.
+        # Zero-init projection → behaves like baseline until fine-tuning teaches it.
+        self.use_reference_encoder = use_reference_encoder
+        if use_reference_encoder:
+            self.reference_encoder = _make_reference_encoder(reference_encoder_channels)
+            # Project style vector into gin_channels space
+            self.style_projection = nn.Conv1d(reference_encoder_channels, gin_channels, 1)
+            nn.init.zeros_(self.style_projection.weight)
+            nn.init.zeros_(self.style_projection.bias)
+        else:
+            self.reference_encoder = None
+            self.style_projection = None
+
     def remove_weight_norm(self):
         self.dec.remove_weight_norm()
         self.flow.remove_weight_norm()
@@ -164,9 +217,15 @@ class SynthesizerTrnMsNSFsid(nn.Module):
         ds: Optional[torch.Tensor] = None,
         pitch: Optional[torch.Tensor] = None,
         pitchf: Optional[torch.Tensor] = None,
+        ref_wav: Optional[torch.Tensor] = None,
     ):  # 这里ds是id，[bs,1]
         # print(1,pitch.shape)#[bs,t]
         g = self.emb_g(ds).unsqueeze(-1)  # [b, 256, 1]##1是t，广播的
+        # Reference encoder: add projected style vector to g when enabled
+        if self.use_reference_encoder and self.reference_encoder is not None and ref_wav is not None:
+            style = self.reference_encoder(ref_wav)         # [B, style_channels]
+            style = self.style_projection(style.unsqueeze(-1))  # [B, gin_channels, 1]
+            g = g + style
         m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
         z_p = self.flow(z, y_mask, g=g)
@@ -191,8 +250,12 @@ class SynthesizerTrnMsNSFsid(nn.Module):
         skip_head: Optional[int] = None,
         return_length: Optional[int] = None,
         return_length2: Optional[int] = None,
+        style_vec: Optional[torch.Tensor] = None,
     ):
         g = self.emb_g(sid).unsqueeze(-1)
+        # Inject pre-computed style vector (reference encoder output, [B, gin_channels, 1])
+        if style_vec is not None:
+            g = g + style_vec
         if skip_head is not None and return_length is not None:
             head = int(skip_head)
             length = int(return_length)

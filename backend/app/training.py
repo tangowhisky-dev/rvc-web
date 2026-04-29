@@ -401,6 +401,9 @@ def _write_config(
     kl_anneal: bool = False,
     kl_anneal_epochs: int = 40,
     optimizer: str = "adamw",
+    use_reference_encoder: bool = False,
+    reference_encoder_channels: int = 256,
+    ref_clip_seconds: float = 6.0,
 ) -> None:
     """Copy backend/rvc/configs/inuse/v2/32k.json into exp_dir/config.json, patching
     training hyperparameters for MPS performance.
@@ -509,6 +512,11 @@ def _write_config(
         except Exception:
             pass  # leave config value as-is; train.py will surface the mismatch
 
+    # Reference encoder flags — stored at top level so train.py and hps can read them
+    cfg["use_reference_encoder"] = use_reference_encoder
+    cfg["reference_encoder_channels"] = reference_encoder_channels
+    cfg["ref_clip_seconds"] = ref_clip_seconds
+
     with open(config_save_path, "w") as _f:
         _json.dump(cfg, _f, indent=2)
 
@@ -575,6 +583,9 @@ async def _run_pipeline(
     kl_anneal: bool = False,
     kl_anneal_epochs: int = 40,
     optimizer: str = "adamw",
+    use_reference_encoder: bool = False,
+    reference_encoder_channels: int = 256,
+    ref_clip_seconds: float = 6.0,
 ) -> None:
     """Orchestrate the full training pipeline for one TrainingJob.
 
@@ -1157,6 +1168,9 @@ async def _run_pipeline(
             kl_anneal=kl_anneal,
             kl_anneal_epochs=kl_anneal_epochs,
             optimizer=optimizer,
+            use_reference_encoder=use_reference_encoder,
+            reference_encoder_channels=reference_encoder_channels,
+            ref_clip_seconds=ref_clip_seconds,
         )
         _build_filelist(project_root, exp_dir)
     except Exception as exc:
@@ -1612,6 +1626,17 @@ async def _run_pipeline(
                     "phase": "index",
                 }
             )
+            # Copy reference encoder artifacts if present
+            for _ref_fname in ("reference_encoder.pt", "style_vec_mean.pt"):
+                _ref_src = os.path.join(exp_dir, _ref_fname)
+                if os.path.isfile(_ref_src):
+                    _ref_dst = os.path.join(profile_dir, _ref_fname)
+                    shutil.copy2(_ref_src, _ref_dst)
+                    await job.queue.put({
+                        "type": "log",
+                        "message": f"Saved {_ref_fname} → {_ref_dst}",
+                        "phase": "index",
+                    })
         except Exception as exc:
             await job.queue.put(
                 {
@@ -1726,6 +1751,9 @@ class TrainingManager:
         kl_anneal: bool = False,
         kl_anneal_epochs: int = 40,
         optimizer: str = "adamw",
+        use_reference_encoder: bool = False,
+        reference_encoder_channels: int = 256,
+        ref_clip_seconds: float = 6.0,
     ) -> TrainingJob:
         """Create and launch a training job for profile_id.
 
@@ -1781,6 +1809,9 @@ class TrainingManager:
                 kl_anneal,
                 kl_anneal_epochs,
                 optimizer,
+                use_reference_encoder,
+                reference_encoder_channels,
+                ref_clip_seconds,
             )
         )
 

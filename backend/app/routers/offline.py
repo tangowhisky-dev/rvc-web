@@ -196,6 +196,7 @@ def _run_offline_inference(
     # f0_norm_params keys: src_mean, src_std, tgt_mean, tgt_std  (all floats)
     # When set, applies mean-std log-F0 normalisation instead of a global semitone shift.
     # pitch parameter is ignored when f0_norm_params is provided.
+    reference_audio_bytes: "bytes | None" = None,  # raw audio bytes for reference encoder
 ) -> np.ndarray:
     """Run chunked RVC inference on a full audio array.
 
@@ -237,6 +238,20 @@ def _run_offline_inference(
         is_half=is_half,
     )
     tgt_sr = rvc.tgt_sr
+
+    # Reference encoder: encode reference clip once, or use profile mean
+    if reference_audio_bytes and rvc.has_reference_encoder:
+        try:
+            import io as _io
+            import torchaudio as _ta
+            _ref_wav, _ref_sr = _ta.load(_io.BytesIO(reference_audio_bytes))
+            if _ref_wav.shape[0] > 1:
+                _ref_wav = _ref_wav.mean(0, keepdim=True)
+            if _ref_sr != 16000:
+                _ref_wav = _ta.transforms.Resample(_ref_sr, 16000)(_ref_wav)
+            rvc.set_reference(_ref_wav.squeeze(0).numpy())
+        except Exception as _re:
+            logger.warning("offline RVC: failed to encode reference audio: %s", _re)
 
     # Resamplers
     resample_16_tgt = Resample(
@@ -739,6 +754,7 @@ async def convert_audio(
                         noise_reduction=noise_reduction,
                         sola_crossfade_ms=sola_crossfade_ms,
                         f0_norm_params=_norm,
+                        reference_audio_bytes=reference_audio_bytes,
                     )
                     # Write result to temp file preserving original format
                     out_path = _output_path(job_id, out_ext)

@@ -333,6 +333,9 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
             kl_anneal=request.kl_anneal,
             kl_anneal_epochs=request.kl_anneal_epochs,
             optimizer=request.optimizer,
+            use_reference_encoder=request.use_reference_encoder,
+            reference_encoder_channels=request.reference_encoder_channels,
+            ref_clip_seconds=request.ref_clip_seconds,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

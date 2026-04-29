@@ -250,17 +250,41 @@ def prepare_training():
 
     print("Computing mean F0s of target speakers...", end="")
     (out_dir / "phase.txt").write_text("extract_f0")
+
+    # Cache speaker F0s to disk so resume skips recomputation.
+    _f0_cache_path = out_dir / "_speaker_f0s_cache.json"
+    _f0_cached = {}
+    if resume and _f0_cache_path.is_file():
+        try:
+            import json as _json_f0
+            _f0_cached = _json_f0.loads(_f0_cache_path.read_text())
+            print(f" (loaded from cache: {_f0_cache_path.name})")
+        except Exception:
+            _f0_cached = {}
+
     speaker_f0s = []
     for speaker, files in enumerate(speaker_audio_files):
-        if len(files) > 10:
-            files = Random(42).sample(files, 10)
-        f0 = compute_mean_f0(files)
+        spk_name = speakers[speaker]
+        if spk_name in _f0_cached:
+            f0 = float(_f0_cached[spk_name])
+        else:
+            if len(files) > 10:
+                files = Random(42).sample(files, 10)
+            f0 = compute_mean_f0(files)
+            _f0_cached[spk_name] = f0
         speaker_f0s.append(f0)
         if speaker % 5 == 0:
             print()
         print(f"  {speaker:3d}: {f0:.1f}Hz", end=",")
     print()
     print("Done.")
+
+    # Persist updated cache
+    try:
+        import json as _json_f0
+        _f0_cache_path.write_text(_json_f0.dumps(_f0_cached))
+    except Exception:
+        pass
 
     # Save speaker mean F0 for auto pitch-shift at inference time.
     # speaker_f0s[0] is the target speaker (single-speaker fine-tune).
@@ -274,15 +298,34 @@ def prepare_training():
         print(f"Profile mean F0: {speaker_f0s[0]:.1f} Hz → saved to speaker_f0.json")
 
     print("Computing pitch shifts for test files...")
+
+    # Cache test pitch shifts to disk — recomputing them on every resume is the
+    # main source of "feels like starting from step 1" slowness.
+    _pts_cache_path = out_dir / "_test_pitch_shifts_cache.json"
+    _pts_cache: dict[str, list[int]] = {}
+    if resume and _pts_cache_path.is_file():
+        try:
+            import json as _json_pts
+            _pts_cache = _json_pts.loads(_pts_cache_path.read_text())
+            print(f"  (test pitch-shift cache: {len(_pts_cache)} entries loaded from {_pts_cache_path.name})")
+        except Exception:
+            _pts_cache = {}
+
     test_pitch_shifts = []
     source_f0s = []
     for i, (file, target_ids) in enumerate(
         tqdm(test_filelist, desc="Computing pitch shifts")
     ):
+        _cache_key = str(file)
+        if _cache_key in _pts_cache:
+            source_f0s.append(float("nan"))  # placeholder; not used after this loop
+            test_pitch_shifts.append(_pts_cache[_cache_key])
+            continue
         source_f0 = compute_mean_f0([file], method="harvest")
         source_f0s.append(source_f0)
         if math.isnan(source_f0):
             test_pitch_shifts.append([0] * len(target_ids))
+            _pts_cache[_cache_key] = [0] * len(target_ids)
             continue
         pitch_shifts = []
         for target_id in target_ids:
@@ -293,7 +336,15 @@ def prepare_training():
                 pitch_shift = int(round(12.0 * math.log2(target_f0 / source_f0)))
             pitch_shifts.append(pitch_shift)
         test_pitch_shifts.append(pitch_shifts)
+        _pts_cache[_cache_key] = pitch_shifts
     print("Done.")
+
+    # Persist cache
+    try:
+        import json as _json_pts
+        _pts_cache_path.write_text(_json_pts.dumps(_pts_cache))
+    except Exception:
+        pass
 
     # モデルと最適化
 
