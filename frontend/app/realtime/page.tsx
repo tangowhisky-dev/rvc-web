@@ -202,6 +202,11 @@ export default function RealtimePage() {
   // Whether to apply F0 prior normalization in realtime (requires profile stats)
   const [autoPitchRt, setAutoPitchRt] = useState(false);
 
+  // Reference encoder state for realtime
+  const [rtRefFile, setRtRefFile]           = useState<File | null>(null);
+  const [rtRefEnabled, setRtRefEnabled]     = useState(false);
+  const [rtRefB64, setRtRefB64]             = useState<string | null>(null);
+
   // Canvas key — incremented on each session start to force fresh DOM canvas elements.
   // Once transferControlToOffscreen() is called, the canvas cannot be re-transferred.
   // Incrementing this key causes React to unmount + remount the canvas elements,
@@ -240,6 +245,19 @@ export default function RealtimePage() {
       .then(d => setProfileF0Stats(d))
       .catch(() => setProfileF0Stats(null));
   }, [profileId]);
+
+  // Encode reference file to base64 when changed
+  useEffect(() => {
+    if (!rtRefFile || !rtRefEnabled) { setRtRefB64(null); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      // result is "data:audio/wav;base64,<b64>" — extract just the b64 part
+      const b64 = result.includes(',') ? result.split(',')[1] : result;
+      setRtRefB64(b64);
+    };
+    reader.readAsDataURL(rtRefFile);
+  }, [rtRefFile, rtRefEnabled]);
 
   // ---------------------------------------------------------------------------
   // Fetch devices on mount
@@ -495,6 +513,8 @@ export default function RealtimePage() {
               } : {}),
             },
           } : {}),
+          // Reference encoder — send pre-encoded base64 clip if user uploaded one
+          ...(rtRefEnabled && rtRefB64 ? { reference_audio_b64: rtRefB64 } : {}),
         }),
       });
 
@@ -858,6 +878,34 @@ export default function RealtimePage() {
                     <span className="text-zinc-500">
                       [{profileF0Stats.p5_f0.toFixed(0)}–{profileF0Stats.p95_f0.toFixed(0)} Hz]
                     </span>
+                  </span>
+                </label>
+              )}
+              {/* Reference encoder — style conditioning (Beatrice 2 only) */}
+              <label className="flex items-center gap-2 cursor-pointer select-none mt-0.5">
+                <input
+                  type="checkbox"
+                  checked={rtRefEnabled}
+                  disabled={isActive || isBusy}
+                  onChange={(e) => { setRtRefEnabled(e.target.checked); if (!e.target.checked) { setRtRefFile(null); setRtRefB64(null); } }}
+                  className="w-4 h-4 rounded border border-zinc-600 bg-zinc-900 accent-violet-500 focus:ring-2 focus:ring-violet-500/50 disabled:opacity-40"
+                />
+                <span className="text-[11px] font-mono text-zinc-300">Style reference</span>
+              </label>
+              {rtRefEnabled && (
+                <label className="flex items-center gap-2 cursor-pointer ml-6">
+                  <span className="text-[10px] font-mono text-zinc-500 truncate max-w-[140px]">
+                    {rtRefFile ? rtRefFile.name : 'no clip — profile default'}
+                  </span>
+                  <input
+                    type="file"
+                    accept=".wav,.mp3,.flac,.ogg,.m4a"
+                    disabled={isActive || isBusy}
+                    className="hidden"
+                    onChange={e => setRtRefFile(e.target.files?.[0] ?? null)}
+                  />
+                  <span className="px-2 py-0.5 rounded border border-zinc-600 text-[10px] font-mono text-zinc-400 hover:border-zinc-400 cursor-pointer">
+                    browse
                   </span>
                 </label>
               )}

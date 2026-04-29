@@ -63,6 +63,11 @@ class WavDataset(torch.utils.data.Dataset):
             4000.0,
             6000.0,
         ],
+        # Reference encoder support: when True, collate() returns a ref clip per sample.
+        # The ref clip is a *different* audio file from the same speaker, loaded at
+        # 16 kHz (the reference encoder's expected sample rate).
+        use_reference_encoder: bool = False,
+        ref_clip_seconds: float = 6.0,
     ):
         self.audio_files = audio_files
         self.in_sample_rate = in_sample_rate
@@ -93,7 +98,22 @@ class WavDataset(torch.utils.data.Dataset):
         self.in_hop_length = in_sample_rate // 100
         self.out_hop_length = out_sample_rate // 100  # 10ms 刻み
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        # Reference encoder support
+        self.use_reference_encoder = use_reference_encoder
+        self.ref_clip_samples = int(ref_clip_seconds * in_sample_rate)  # at 16 kHz
+
+        # Build a per-speaker file list for fast reference sampling.
+        # Maps speaker_id → sorted list of dataset indices.
+        if use_reference_encoder:
+            from collections import defaultdict as _dd
+            _spk_to_idx: dict[int, list[int]] = _dd(list)
+            for i, (_, spk) in enumerate(audio_files):
+                _spk_to_idx[spk].append(i)
+            self._spk_to_idx: dict[int, list[int]] = dict(_spk_to_idx)
+        else:
+            self._spk_to_idx = {}
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, int, Optional[torch.Tensor]]:
         file, speaker_id = self.audio_files[index]
         clean_wav, sample_rate = torchaudio.load(file)
         if clean_wav.size(0) != 1:
@@ -152,14 +172,67 @@ class WavDataset(torch.utils.data.Dataset):
             clean_wav *= 0.5
             noisy_wav_16k *= 0.5
 
-        return clean_wav, noisy_wav_16k, speaker_id, formant_shift
+        # Load reference clip for reference encoder (different file, same speaker)
+        ref_wav_16k = self._load_ref_wav(index, speaker_id)
+
+        return clean_wav, noisy_wav_16k, speaker_id, formant_shift, ref_wav_16k, ref_wav_16k
+
+    def _load_ref_wav(self, index: int, speaker_id: int) -> Optional[torch.Tensor]:
+        """Load a reference clip at 16 kHz from a *different* file of the same speaker.
+
+        If the speaker has only one file, uses a different segment of that file.
+        Returns None if use_reference_encoder is False.
+        """
+        if not self.use_reference_encoder:
+            return None
+
+        same_speaker_indices = self._spk_to_idx.get(speaker_id, [index])
+        # Try to find a different file index to prevent leakage
+        candidates = [i for i in same_speaker_indices if i != index]
+        if not candidates:
+            # Single-file speaker: use the same file, different random segment
+            candidates = same_speaker_indices
+
+        ref_idx = candidates[torch.randint(0, len(candidates), ()).item()]
+        ref_file, _ = self.audio_files[ref_idx]
+        try:
+            wav, sr = torchaudio.load(ref_file)
+        except Exception:
+            return None
+
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+
+        # Resample to 16 kHz
+        if sr != self.in_sample_rate:
+            wav = get_resampler(sr, self.in_sample_rate)(wav)
+
+        wav = wav.squeeze(0)  # [T]
+
+        # Trim or repeat to exactly ref_clip_samples
+        if wav.shape[0] >= self.ref_clip_samples:
+            # Random start within the file
+            max_start = wav.shape[0] - self.ref_clip_samples
+            start = torch.randint(0, max_start + 1, ()).item()
+            wav = wav[start : start + self.ref_clip_samples]
+        else:
+            # Repeat to fill
+            repeats = (self.ref_clip_samples + wav.shape[0] - 1) // wav.shape[0]
+            wav = wav.repeat(repeats)[: self.ref_clip_samples]
+
+        # Normalise amplitude
+        peak = wav.abs().max()
+        if peak > 1e-6:
+            wav = wav / peak * 0.9
+
+        return wav  # [ref_clip_samples]
 
     def __len__(self) -> int:
         return len(self.audio_files)
 
     def collate(
-        self, batch: list[tuple[torch.Tensor, torch.Tensor, int, int]]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, batch: list[tuple[torch.Tensor, torch.Tensor, int, int, Optional[torch.Tensor]]]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         assert self.wav_length % self.out_hop_length == 0
         length = self.wav_length // self.out_hop_length
         clean_wavs = []
@@ -167,7 +240,8 @@ class WavDataset(torch.utils.data.Dataset):
         slice_starts = []
         speaker_ids = []
         formant_shifts = []
-        for clean_wav, noisy_wav, speaker_id, formant_shift in batch:
+        ref_wavs = []
+        for clean_wav, noisy_wav, speaker_id, formant_shift, ref_wav in batch:
             # 発声部分をランダムに 1 箇所選ぶ
             (voiced,) = clean_wav.nonzero(as_tuple=True)
             assert voiced.numel() != 0
@@ -192,17 +266,24 @@ class WavDataset(torch.utils.data.Dataset):
             slice_starts.append(slice_start)
             speaker_ids.append(speaker_id)
             formant_shifts.append(formant_shift)
+            if ref_wav is not None:
+                ref_wavs.append(ref_wav)
         clean_wavs = torch.stack(clean_wavs)
         noisy_wavs = torch.stack(noisy_wavs)
         slice_starts = torch.tensor(slice_starts)
         speaker_ids = torch.tensor(speaker_ids)
         formant_shifts = torch.tensor(formant_shifts)
+        # ref_wavs: [batch, 1, ref_clip_samples] if all present, else None
+        ref_wavs_tensor: Optional[torch.Tensor] = None
+        if len(ref_wavs) == len(batch):
+            ref_wavs_tensor = torch.stack(ref_wavs).unsqueeze(1)  # [B, 1, T_ref]
         return (
             clean_wavs,  # [batch_size, wav_length]
             noisy_wavs,  # [batch_size, wav_length]
             slice_starts,  # Long[batch_size]
             speaker_ids,  # Long[batch_size]
             formant_shifts,  # Long[batch_size]
+            ref_wavs_tensor,  # [batch_size, 1, T_ref] or None
         )
 
 

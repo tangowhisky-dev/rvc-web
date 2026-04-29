@@ -65,6 +65,8 @@ class BeatriceInferenceEngine:
         vq_topk = h.get("vq_topk", 4)
         phone_noise_ratio = h.get("phone_noise_ratio", 0.5)
         floor_noise_level = h.get("floor_noise_level", 1e-3)
+        use_reference_encoder = bool(h.get("use_reference_encoder", False))
+        reference_encoder_channels = int(h.get("reference_encoder_channels", 256))
 
         self.phone_extractor = PhoneExtractor()
         self.pitch_estimator = PitchEstimator()
@@ -81,6 +83,8 @@ class BeatriceInferenceEngine:
             training_time_vq="none",
             phone_noise_ratio=phone_noise_ratio,
             floor_noise_level=floor_noise_level,
+            use_reference_encoder=use_reference_encoder,
+            reference_encoder_channels=reference_encoder_channels,
         )
 
         # Load weights
@@ -93,7 +97,7 @@ class BeatriceInferenceEngine:
                 checkpoint["pitch_estimator"]
             )
         if "net_g" in checkpoint:
-            self.net_g.load_state_dict(checkpoint["net_g"], strict=True)
+            self.net_g.load_state_dict(checkpoint["net_g"], strict=False)
 
         # Move to device and set eval
         self.phone_extractor = (
@@ -111,6 +115,20 @@ class BeatriceInferenceEngine:
         # Cache hyperparams
         self._in_sample_rate: int = checkpoint.get("in_sample_rate", self.IN_SR)
         self._out_sample_rate: int = checkpoint.get("out_sample_rate", self.OUT_SR)
+        self._use_reference_encoder: bool = use_reference_encoder
+
+        # Load mean style vector (default, used when no reference clip is given)
+        self._mean_style_vec: "torch.Tensor | None" = None
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        mean_style_path = os.path.join(checkpoint_dir, "style_vec_mean.pt")
+        if os.path.isfile(mean_style_path):
+            import torch as _torch
+            self._mean_style_vec = _torch.load(
+                mean_style_path, map_location=self._device, weights_only=True
+            )
+
+        # Session-level cached style vector (set by set_reference())
+        self._session_style_vec: "torch.Tensor | None" = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -197,6 +215,59 @@ class BeatriceInferenceEngine:
             self.pitch_estimator.sample_pitch = orig
             del self.pitch_estimator._orig_sample_pitch
 
+    # ------------------------------------------------------------------
+    # Reference encoder API
+    # ------------------------------------------------------------------
+
+    @property
+    def has_reference_encoder(self) -> bool:
+        """True when the loaded checkpoint was trained with use_reference_encoder."""
+        return getattr(self, "_use_reference_encoder", False)
+
+    def encode_reference(self, wav_16k: np.ndarray) -> "np.ndarray":
+        """Encode a reference waveform into a style vector.
+
+        Parameters
+        ----------
+        wav_16k : np.ndarray
+            1-D float32 waveform at 16 000 Hz.  5–10 s recommended.
+
+        Returns
+        -------
+        np.ndarray
+            1-D float32 style vector of shape ``(style_channels,)``.
+            Returns zeros if the model has no reference encoder.
+        """
+        import torch
+        if not self.has_reference_encoder:
+            style_channels = self.net_g.reference_encoder.proj.out_features
+            return np.zeros(style_channels, dtype=np.float32)
+        wav = torch.from_numpy(wav_16k).float().to(self._device)
+        with torch.inference_mode():
+            style_vec = self.net_g.reference_encoder(wav)  # [style_channels]
+        return style_vec.cpu().numpy().astype(np.float32)
+
+    def set_reference(self, wav_16k: np.ndarray) -> None:
+        """Encode ``wav_16k`` and cache the style vector for all subsequent calls.
+
+        Called once at realtime session start.  Cached until explicitly replaced
+        or cleared.  Pass ``wav_16k=None`` to revert to the profile mean style.
+        """
+        import torch
+        if wav_16k is None:
+            self._session_style_vec = None
+            return
+        style_np = self.encode_reference(wav_16k)
+        self._session_style_vec = torch.from_numpy(style_np).to(self._device)
+
+    def _get_active_style_vec(self) -> "torch.Tensor | None":
+        """Return the session style vector, falling back to the profile mean, then None."""
+        if self._session_style_vec is not None:
+            return self._session_style_vec
+        if self._mean_style_vec is not None:
+            return self._mean_style_vec
+        return None
+
     def convert(
         self,
         audio_16k: np.ndarray,
@@ -268,15 +339,43 @@ class BeatriceInferenceEngine:
                     from backend.app.f0_transform import VelocityNormalizerBins
                     self._vel_state_rt = VelocityNormalizerBins(float(vel_ratio))
             self._apply_f0_norm_patch(f0_norm_params, vel_state=self._vel_state_rt)
+
+        # Resolve active style vector (session reference → profile mean → None)
+        _active_style = self._get_active_style_vec()  # Tensor [style_channels] or None
+
         try:
             with torch.inference_mode():
-                # net_g expects [batch, 1, T]
-                converted = self.net_g(
-                    wav.unsqueeze(1),
-                    target_ids,
-                    formant_shift,
-                    pitch_shift,
-                )  # [batch, T_out]
+                # Build ref_wav argument: unsqueeze to [1, T] for the batch forward
+                _ref_wav = _active_style  # not a raw wav — inject via pre-encoded style
+                # We bypass the encoder at inference: directly set the encoded style
+                # vector into net_g before calling forward, then clear it after.
+                # This avoids recomputing the mel transform every block.
+                if _active_style is not None and self.has_reference_encoder:
+                    # Temporarily monkey-patch reference_encoder.forward to return
+                    # the pre-computed vector (skip mel + conv + gru at inference).
+                    _orig_ref_enc = self.net_g.reference_encoder.forward
+                    _sv = _active_style
+                    def _cached_ref_enc(wav, _sv=_sv):
+                        return _sv.unsqueeze(0).expand(wav.shape[0], -1)
+                    self.net_g.reference_encoder.forward = _cached_ref_enc
+                    # net_g.forward will call reference_encoder(ref_wav) with a dummy wav
+                    _dummy_ref = torch.zeros(wav.shape[0], 1, device=device)
+                    converted = self.net_g(
+                        wav.unsqueeze(1),
+                        target_ids,
+                        formant_shift,
+                        pitch_shift,
+                        ref_wav=_dummy_ref,
+                    )  # [batch, T_out]
+                    self.net_g.reference_encoder.forward = _orig_ref_enc
+                else:
+                    # net_g expects [batch, 1, T]
+                    converted = self.net_g(
+                        wav.unsqueeze(1),
+                        target_ids,
+                        formant_shift,
+                        pitch_shift,
+                    )  # [batch, T_out]
         finally:
             if f0_norm_params:
                 self._remove_f0_norm_patch()
@@ -359,6 +458,17 @@ class BeatriceInferenceEngine:
                 from backend.app.f0_transform import VelocityNormalizerBins
                 _offline_vel = VelocityNormalizerBins(float(vel_ratio))
             self._apply_f0_norm_patch(f0_norm_params, vel_state=_offline_vel)
+
+        # Pre-compute reference encoder patch (avoids re-encoding mel every chunk)
+        _active_style = self._get_active_style_vec()
+        _orig_ref_enc = None
+        if _active_style is not None and self.has_reference_encoder:
+            _orig_ref_enc = self.net_g.reference_encoder.forward
+            _sv = _active_style
+            def _cached_ref_enc_offline(wav, _sv=_sv):
+                return _sv.unsqueeze(0).expand(wav.shape[0], -1)
+            self.net_g.reference_encoder.forward = _cached_ref_enc_offline
+
         try:
             chunks_out = []
             with torch.inference_mode():
@@ -370,18 +480,29 @@ class BeatriceInferenceEngine:
                     if rem != 0:
                         chunk = F.pad(chunk, (0, _HOP - rem))
 
-                    # net_g expects [batch, 1, T]. Use keyword arguments to avoid
-                    # parameter order confusion (model expects formant then pitch).
-                    out = self.net_g(
-                        chunk.unsqueeze(0).unsqueeze(0),
-                        target_speaker_id=target_ids,
-                        formant_shift_semitone=formant_shift,
-                        pitch_shift_semitone=pitch_shift,
-                    )  # [1, 1, T_out] or [1, T_out]
+                    _chunk_batch = chunk.unsqueeze(0).unsqueeze(0)  # [1, 1, N]
+                    if _active_style is not None and self.has_reference_encoder:
+                        _dummy_ref = torch.zeros(1, 1, device=device)
+                        out = self.net_g(
+                            _chunk_batch,
+                            target_speaker_id=target_ids,
+                            formant_shift_semitone=formant_shift,
+                            pitch_shift_semitone=pitch_shift,
+                            ref_wav=_dummy_ref,
+                        )
+                    else:
+                        out = self.net_g(
+                            _chunk_batch,
+                            target_speaker_id=target_ids,
+                            formant_shift_semitone=formant_shift,
+                            pitch_shift_semitone=pitch_shift,
+                        )
                     chunks_out.append(out.squeeze().cpu().float())
         finally:
             if f0_norm_params:
                 self._remove_f0_norm_patch()
+            if _orig_ref_enc is not None:
+                self.net_g.reference_encoder.forward = _orig_ref_enc
 
         y_hat = torch.cat(chunks_out, dim=0)
 

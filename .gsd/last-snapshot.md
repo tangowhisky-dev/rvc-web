@@ -1,4 +1,4 @@
-# GSD context snapshot (2026-04-27T12:40:30.823Z)
+# GSD context snapshot (2026-04-28T10:04:03.359Z)
 
 ## Top project memories
 - [MEM001] (architecture) Database Chose: SQLite via aiosqlite. Rationale: PostgreSQL not installed; zero-setup; single-user local tool; trivially swappable later.

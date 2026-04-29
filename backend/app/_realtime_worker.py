@@ -471,8 +471,10 @@ def run_worker(
     pipeline: str = "rvc",
     pitch_shift_semitones: float = 0.0,
     formant_shift_semitones: float = 0.0,
-    # F0 normalization prior (affine + vel + soft-clip; no HistEQ in realtime)
+    # F0 normalization prior
     f0_norm_params: dict | None = None,
+    # Reference encoder — base64-encoded audio bytes or None
+    reference_audio_b64: str | None = None,
 ) -> None:
     """Run in isolated child process. Owns all native code (fairseq, sounddevice, MPS)."""
 
@@ -562,6 +564,26 @@ def run_worker(
             block_params = _compute_block_params(_BLOCK_48K, tgt_sr=tgt_sr,
                                                  extra_time=_EXTRA_TIME_B2,
                                                  sola_buf_ms=sola_crossfade_ms)
+
+            # Reference encoder: encode reference clip once at session start.
+            # Falls back to profile mean style vector if no clip is provided.
+            if reference_audio_b64 and b2_engine.has_reference_encoder:
+                try:
+                    import base64 as _b64
+                    import io as _io
+                    import torchaudio as _ta
+                    _ref_bytes = _b64.b64decode(reference_audio_b64)
+                    _ref_wav, _ref_sr = _ta.load(_io.BytesIO(_ref_bytes))
+                    if _ref_wav.shape[0] > 1:
+                        _ref_wav = _ref_wav.mean(0, keepdim=True)
+                    if _ref_sr != 16000:
+                        _ref_wav = _ta.transforms.Resample(_ref_sr, 16000)(_ref_wav)
+                    b2_engine.set_reference(_ref_wav.squeeze(0).numpy())
+                    evt_q.put({"event": "log", "message": "Reference encoder: clip encoded and cached."})
+                except Exception as _re:
+                    evt_q.put({"event": "log", "message": f"Reference encoder: clip decode failed ({_re}); using profile default."})
+            elif b2_engine.has_reference_encoder and b2_engine._mean_style_vec is not None:
+                evt_q.put({"event": "log", "message": "Reference encoder: using profile mean style vector."})
 
             # Use the same SOLA/gate/RMS machinery but swap out the infer step
             # ----------------------------------------------------------------

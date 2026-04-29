@@ -159,6 +159,8 @@ class RealtimeManager:
         formant_shift_semitones: float = 0.0,
         # F0 normalization prior
         f0_norm_params: Optional[dict] = None,
+        # Reference encoder — base64-encoded audio clip or None for profile default
+        reference_audio_b64: Optional[str] = None,
     ) -> RealtimeSession:
         """Spawn isolated worker process and return a RealtimeSession.
 
@@ -264,6 +266,7 @@ class RealtimeManager:
                 pitch_shift_semitones=pitch_shift_semitones,
                 formant_shift_semitones=formant_shift_semitones,
                 f0_norm_params=f0_norm_params,
+                reference_audio_b64=reference_audio_b64,
             ),
             daemon=True,
         )

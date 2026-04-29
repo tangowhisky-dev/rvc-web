@@ -232,6 +232,8 @@ def prepare_training():
         augmentation_reverb_probability=h.augmentation_reverb_probability,
         augmentation_lpf_probability=h.augmentation_lpf_probability,
         augmentation_lpf_cutoff_freq_candidates=h.augmentation_lpf_cutoff_freq_candidates,
+        use_reference_encoder=bool(getattr(h, "use_reference_encoder", False)),
+        ref_clip_seconds=float(getattr(h, "ref_clip_seconds", 6.0)),
     )
     training_loader = torch.utils.data.DataLoader(
         training_dataset,
@@ -325,6 +327,8 @@ def prepare_training():
         h.training_time_vq,
         h.phone_noise_ratio,
         h.floor_noise_level,
+        use_reference_encoder=bool(getattr(h, "use_reference_encoder", False)),
+        reference_encoder_channels=int(getattr(h, "reference_encoder_channels", 256)),
     ).to(device)
     net_d = MultiPeriodDiscriminator(san=h.san).to(device)
 
@@ -584,7 +588,9 @@ def _run_main():
                 slice_starts,
                 speaker_ids,
                 formant_shift_semitone,
-            ) = map(lambda x: x.to(device, non_blocking=True), batch)
+                ref_wavs,
+            ) = [x.to(device, non_blocking=True) if isinstance(x, torch.Tensor) else x
+                 for x in batch]
 
             # === 2. 学習 ===
             with torch.amp.autocast(_amp_device, enabled=_use_amp):
@@ -607,6 +613,7 @@ def _run_main():
                     slice_segment_length=h.segment_length,
                     y_all=clean_wavs[:, None, :],
                     enable_loss_ap=h.grad_weight_ap != 0.0,
+                    ref_wavs_16k=ref_wavs.to(device) if isinstance(ref_wavs, torch.Tensor) else None,
                 )
                 if h.compile_convnext:
                     ConvNeXtStack.forward = raw_convnextstack_forward
@@ -801,6 +808,7 @@ def _run_main():
                                 slice_segment_length=h.segment_length,
                                 y_all=clean_wavs[:, None, :],
                                 enable_loss_ap=h.grad_weight_ap != 0.0,
+                                ref_wavs_16k=ref_wavs.to(device) if isinstance(ref_wavs, torch.Tensor) else None,
                             )
                         for handle in hook_handles:
                             handle.remove()
@@ -958,8 +966,7 @@ def _run_main():
                         },
                         f,
                     )
-                shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")
-                # During warmup (≤1000 steps), latest IS best — keep checkpoint_best in sync.
+                shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")                # During warmup (≤1000 steps), latest IS best — keep checkpoint_best in sync.
                 # After warmup, only copy when UTMOS genuinely improves.
                 best_path = out_dir / "checkpoint_best.pt.gz"
                 if _needs_best_copy:
@@ -1047,3 +1054,47 @@ def _run_main():
                 profiler.step()
 
     print("Training finished.")
+
+    # --- Post-training: save reference encoder artefacts ---
+    # These are needed at inference without loading the full 500 MB checkpoint.
+    if bool(getattr(h, "use_reference_encoder", False)):
+        _ref_enc_path = out_dir / "reference_encoder.pt"
+        net_g.dump_reference_encoder(_ref_enc_path)
+        print(f"Reference encoder weights saved to {_ref_enc_path}")
+
+        # Compute the mean style vector over ALL training audio and save it.
+        # This is the "default style" used when no reference clip is supplied
+        # at inference time — the speaker's habitual speaking character.
+        print("Computing mean style vector from training audio...", end="", flush=True)
+        all_style_vecs = []
+        net_g.eval()
+        with torch.inference_mode():
+            for _files in speaker_audio_files:
+                for _f in _files:
+                    try:
+                        _wav, _sr = torchaudio.load(_f)
+                    except Exception:
+                        continue
+                    if _wav.shape[0] > 1:
+                        _wav = _wav.mean(0, keepdim=True)
+                    if _sr != h.in_sample_rate:
+                        _wav = get_resampler(_sr, h.in_sample_rate, device)(_wav.to(device))
+                    else:
+                        _wav = _wav.to(device)
+                    _wav = _wav.squeeze(0)  # [T]
+                    # Encode up to 30 s
+                    _max = h.in_sample_rate * 30
+                    if _wav.shape[0] > _max:
+                        _wav = _wav[:_max]
+                    try:
+                        sv = net_g.reference_encoder(_wav)  # [style_channels]
+                        all_style_vecs.append(sv.cpu())
+                    except Exception:
+                        pass
+        if all_style_vecs:
+            mean_style = torch.stack(all_style_vecs).mean(0)  # [style_channels]
+            torch.save(mean_style, out_dir / "style_vec_mean.pt")
+            print(f" done ({len(all_style_vecs)} clips → style_vec_mean.pt)")
+        else:
+            print(" skipped (no clips encoded).")
+        net_g.train()

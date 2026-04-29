@@ -109,6 +109,13 @@ dict_default_hparams = {
     "compile_d4c": False,
     "compile_discriminator": False,
     "profile": False,
+    # Reference encoder — speaking style conditioning
+    # Set use_reference_encoder=True to enable; reference_encoder_channels controls
+    # the style embedding dimension (256 = matches hidden_channels, efficient).
+    # ref_clip_seconds: length of the reference clip loaded per training batch.
+    "use_reference_encoder": False,
+    "reference_encoder_channels": 256,
+    "ref_clip_seconds": 6.0,
 }
 
 if __name__ == "__main__":

@@ -48,6 +48,10 @@ class StartTrainingRequest(BaseModel):
     kl_anneal: bool = False
     kl_anneal_epochs: int = 40
     optimizer: str = "adamw"         # "adamw" | "adamspd"
+    # Beatrice 2: reference encoder
+    use_reference_encoder: bool = False
+    reference_encoder_channels: int = 256
+    ref_clip_seconds: float = 6.0
 
 
 class CancelTrainingRequest(BaseModel):
@@ -288,6 +292,9 @@ async def start_training(request: StartTrainingRequest) -> StartTrainingResponse
                 n_steps=request.epochs,  # epochs param repurposed as n_steps
                 batch_size=batch_size,
                 profile_name=str(row["name"]),
+                use_reference_encoder=request.use_reference_encoder,
+                reference_encoder_channels=request.reference_encoder_channels,
+                ref_clip_seconds=request.ref_clip_seconds,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

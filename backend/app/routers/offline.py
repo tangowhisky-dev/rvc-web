@@ -481,21 +481,23 @@ async def convert_audio(
     pitch_shift_semitones: float = Form(0.0),
     formant_shift_semitones: float = Form(0.0),
     # F0 normalization — all four must be non-zero to activate normalization.
-    # When active, replaces the semitone-shift approach for both RVC and B2.
     f0_src_mean: float = Form(0.0),
     f0_src_std:  float = Form(0.0),
     f0_tgt_mean: float = Form(0.0),
     f0_tgt_std:  float = Form(0.0),
     # Extended F0 prior — velocity normalization
-    f0_vel_src: float = Form(0.0),   # source vel_std (from input_f0)
-    f0_vel_tgt: float = Form(0.0),   # target vel_std (from speaker_f0.json)
-    # Extended F0 prior — soft-clip range (target percentiles)
+    f0_vel_src: float = Form(0.0),
+    f0_vel_tgt: float = Form(0.0),
+    # Extended F0 prior — soft-clip range
     f0_p5_tgt:  float = Form(0.0),
     f0_p95_tgt: float = Form(0.0),
-    # Extended F0 prior — histogram equalization (JSON-encoded list[float])
-    # Send as JSON string to avoid multipart encoding issues with 256-float arrays.
-    f0_src_hist: str = Form(""),     # JSON string of source f0_hist
-    f0_tgt_hist: str = Form(""),     # JSON string of target f0_hist
+    # Extended F0 prior — histogram equalization
+    f0_src_hist: str = Form(""),
+    f0_tgt_hist: str = Form(""),
+    # Reference encoder — optional reference audio clip (5–10 s, 16 kHz or any SR)
+    # When provided, the engine encodes it to a style vector that conditions synthesis.
+    # When absent, the engine uses the profile's pre-computed mean style vector.
+    reference_audio: Optional[UploadFile] = File(default=None),
     file: UploadFile = File(...),
 ):
     """Convert an uploaded audio file using a trained profile.
@@ -554,6 +556,13 @@ async def convert_audio(
 
     # Read input audio
     audio_bytes = await file.read()
+    # Read reference audio bytes now (before the async generator starts;
+    # UploadFile handle is not available inside the streaming generator).
+    reference_audio_bytes: Optional[bytes] = None
+    if reference_audio is not None:
+        reference_audio_bytes = await reference_audio.read()
+        if not reference_audio_bytes:
+            reference_audio_bytes = None
     orig_filename = file.filename or "input.wav"
     orig_ext = os.path.splitext(orig_filename)[1].lower() or ".wav"
     # Always output WAV to preserve full quality regardless of input format.
@@ -619,6 +628,22 @@ async def convert_audio(
                     engine = get_or_load_engine(profile_id, b2_checkpoint, device)
                     _progress(0.1)
 
+                    # Reference encoder: encode the reference audio clip if supplied.
+                    # Done once here; the engine caches it for all subsequent chunks.
+                    if reference_audio_bytes is not None and engine.has_reference_encoder:
+                        try:
+                            import io as _io
+                            import torchaudio as _ta
+                            _ref_wav, _ref_sr = _ta.load(_io.BytesIO(reference_audio_bytes))
+                            if _ref_wav.shape[0] > 1:
+                                _ref_wav = _ref_wav.mean(0, keepdim=True)
+                            if _ref_sr != 16000:
+                                _ref_wav = _ta.transforms.Resample(_ref_sr, 16000)(_ref_wav)
+                            engine.set_reference(_ref_wav.squeeze(0).numpy())
+                            logger.info("offline B2: reference encoder set from uploaded clip (%d samples)", _ref_wav.shape[-1])
+                        except Exception as _re:
+                            logger.warning("offline B2: failed to encode reference audio: %s", _re)
+
                     # Build norm params dict if all four stats are present
                     _norm = None
                     if (f0_src_mean > 0 and f0_tgt_mean > 0
@@ -629,14 +654,11 @@ async def convert_audio(
                             "tgt_mean": f0_tgt_mean,
                             "tgt_std":  f0_tgt_std,
                         }
-                        # Velocity normalization
                         if f0_vel_src > 1e-6 and f0_vel_tgt > 1e-6:
                             _norm["vel_ratio"] = f0_vel_tgt / f0_vel_src
-                        # Soft-clip
                         if f0_p5_tgt > 0 and f0_p95_tgt > f0_p5_tgt:
                             _norm["p5_tgt"]  = f0_p5_tgt
                             _norm["p95_tgt"] = f0_p95_tgt
-                        # HistEQ (offline only — full file available)
                         if f0_src_hist and f0_tgt_hist:
                             try:
                                 _norm["src_hist"] = _json.loads(f0_src_hist)
@@ -651,6 +673,8 @@ async def convert_audio(
                         formant_shift_semitones=float(formant_shift_semitones),
                         f0_norm_params=_norm,
                     )
+                    # Clear session reference after offline use (stateless per call)
+                    engine.set_reference(None)
                     # Peak normalise to 0.95 to prevent clipping on save
                     peak = np.abs(result).max()
                     if peak > 0.95:

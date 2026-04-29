@@ -211,6 +211,9 @@ def _write_beatrice_config(
     n_steps: int,
     batch_size: int,
     record_metrics: bool = False,
+    use_reference_encoder: bool = False,
+    reference_encoder_channels: int = 256,
+    ref_clip_seconds: float = 6.0,
 ) -> str:
     """Write config.json to out_dir and return its path."""
     assets_dir = os.path.join(project_root, "assets", "beatrice2")
@@ -279,6 +282,10 @@ def _write_beatrice_config(
             "save_interval": max(500, total_steps // 20),
             "evaluation_interval": max(500, total_steps // 20),
             "record_metrics": record_metrics,
+            # Reference encoder
+            "use_reference_encoder": use_reference_encoder,
+            "reference_encoder_channels": reference_encoder_channels,
+            "ref_clip_seconds": ref_clip_seconds,
         }
     )
 
@@ -435,6 +442,9 @@ async def _run_beatrice_pipeline(
     n_steps: int,
     batch_size: int,
     profile_id: str,
+    use_reference_encoder: bool = False,
+    reference_encoder_channels: int = 256,
+    ref_clip_seconds: float = 6.0,
 ) -> None:
     """Full Beatrice 2 training pipeline coroutine.
 
@@ -516,6 +526,9 @@ async def _run_beatrice_pipeline(
         project_root=project_root,
         n_steps=n_steps,
         batch_size=batch_size,
+        use_reference_encoder=use_reference_encoder,
+        reference_encoder_channels=reference_encoder_channels,
+        ref_clip_seconds=ref_clip_seconds,
     )
     # Update job with the real total (completed + requested) so progress/ETA
     # are correct when resuming from a prior checkpoint.
@@ -668,6 +681,9 @@ class BeatriceTrainingManager:
         n_steps: int = 10000,
         batch_size: int = 8,
         profile_name: str = "speaker",
+        use_reference_encoder: bool = False,
+        reference_encoder_channels: int = 256,
+        ref_clip_seconds: float = 6.0,
     ) -> BeatriceTrainingJob:
         """Create and launch a Beatrice 2 training job.
 
@@ -711,6 +727,9 @@ class BeatriceTrainingManager:
                 n_steps=n_steps,
                 batch_size=batch_size,
                 profile_id=profile_id,
+                use_reference_encoder=use_reference_encoder,
+                reference_encoder_channels=reference_encoder_channels,
+                ref_clip_seconds=ref_clip_seconds,
             )
         )
         return job

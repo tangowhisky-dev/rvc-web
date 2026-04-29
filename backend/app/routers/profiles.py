@@ -1236,11 +1236,14 @@ async def export_profile(profile_id: str):
             # Beatrice 2 files (if applicable)
             if (row.get("pipeline") or "rvc") == "beatrice2":
                 b2_out_dir = os.path.join(pdir, "beatrice2_out")
-                # checkpoint_latest.pt.gz
-                b2_ckpt = os.path.join(b2_out_dir, "checkpoint_latest.pt.gz")
-                if os.path.isfile(b2_ckpt):
-                    zf.write(b2_ckpt, "beatrice2_out/checkpoint_latest.pt.gz")
-                    files_included.append("beatrice2_out/checkpoint_latest.pt.gz")
+                # checkpoint_latest.pt.gz and checkpoint_best.pt.gz
+                for b2_rel in ("checkpoint_latest.pt.gz", "checkpoint_best.pt.gz",
+                               "reference_encoder.pt", "style_vec_mean.pt"):
+                    b2_src = os.path.join(b2_out_dir, b2_rel)
+                    if os.path.isfile(b2_src):
+                        arc = f"beatrice2_out/{b2_rel}"
+                        zf.write(b2_src, arc)
+                        files_included.append(arc)
                 # Most recent paraphernalia dir (inference binaries)
                 if os.path.isdir(b2_out_dir):
                     para_dirs = sorted(

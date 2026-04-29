@@ -944,6 +944,8 @@ export default function TrainingPage() {
   const [klAnneal, setKlAnneal] = useState(false);
   const [klAnnealEpochs, setKlAnnealEpochs] = useState(40);
   const [optimizer, setOptimizer] = useState<'adamw' | 'adamspd'>('adamw');
+  // Beatrice 2: reference encoder
+  const [useRefEncoder, setUseRefEncoder] = useState(false);
   const [hw, setHw] = useState<HardwareInfo | null>(null);
 
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -1269,7 +1271,7 @@ export default function TrainingPage() {
       const res = await fetch(`${API}/api/training/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainEnabled ? overtrainThreshold : 0, c_spk: lossMode === 'classic' ? 0 : speakerLossWeight, loss_mode: lossMode, adv_loss: advLoss, kl_anneal: klAnneal, kl_anneal_epochs: klAnnealEpochs, optimizer }),
+        body: JSON.stringify({ profile_id: selectedId, epochs, batch_size: batchSize, overtrain_threshold: overtrainEnabled ? overtrainThreshold : 0, c_spk: lossMode === 'classic' ? 0 : speakerLossWeight, loss_mode: lossMode, adv_loss: advLoss, kl_anneal: klAnneal, kl_anneal_epochs: klAnnealEpochs, optimizer, use_reference_encoder: useRefEncoder }),
       });
 
       if (res.status === 409) {
@@ -1445,6 +1447,31 @@ export default function TrainingPage() {
                 })()}
               </div>
             </div>
+
+            {/* Beatrice 2 — reference encoder toggle */}
+            {(() => {
+              const _sel = profiles.find(p => p.id === selectedId);
+              if (_sel?.pipeline !== 'beatrice2') return null;
+              return (
+                <div className="border-t border-zinc-800/60 pt-4">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={useRefEncoder}
+                      disabled={isRunning}
+                      onChange={e => setUseRefEncoder(e.target.checked)}
+                      className="w-4 h-4 rounded border border-zinc-600 bg-zinc-900 accent-violet-500 focus:ring-2 focus:ring-violet-500/50 disabled:opacity-40"
+                    />
+                    <div className="flex flex-col">
+                      <span className="text-[11px] font-mono text-zinc-300">Train reference encoder</span>
+                      <span className="text-[10px] font-mono text-zinc-600 leading-tight">
+                        Adds speaking style conditioning. Requires ≥ 10 min training audio. +~12% training time.
+                      </span>
+                    </div>
+                  </label>
+                </div>
+              );
+            })()}
 
             {/* Batch size slider */}
             <div className="border-t border-zinc-800/60 pt-4">

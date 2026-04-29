@@ -392,6 +392,10 @@ export default function OfflinePage() {
   } | null>(null);
 
   // Job state
+  // Reference encoder state
+  const [referenceFile, setReferenceFile]     = useState<File | null>(null);
+  const [referenceEnabled, setReferenceEnabled] = useState(false);
+
   const [jobStatus, setJobStatus]   = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [progress, setProgress]     = useState(0);
   const [jobError, setJobError]     = useState<string | null>(null);
@@ -582,6 +586,10 @@ export default function OfflinePage() {
         form.append('f0_src_hist', JSON.stringify(f0NormStats.srcHist));
         form.append('f0_tgt_hist', JSON.stringify(f0NormStats.tgtHist));
       }
+    }
+    // Reference audio for style conditioning (Beatrice 2 only; no-op on RVC profiles)
+    if (referenceEnabled && referenceFile) {
+      form.append('reference_audio', referenceFile);
     }
     form.append('file', inputFile);
 
@@ -789,6 +797,39 @@ export default function OfflinePage() {
                 value={formantShift} min={-3} max={3} step={0.25}
                 onChange={setFormantShift} hint="Formant shift (vocal tract)"
               />
+              {/* Reference encoder — style conditioning for Beatrice 2 */}
+              <div className="mt-2 border-t border-zinc-700/50 pt-2 flex flex-col gap-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-mono text-zinc-400">Style Reference</span>
+                  <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={referenceEnabled}
+                      onChange={e => { setReferenceEnabled(e.target.checked); if (!e.target.checked) setReferenceFile(null); }}
+                      className="w-3 h-3 accent-violet-400"
+                    />
+                    <span className="text-[10px] font-mono text-violet-400">custom ref</span>
+                  </label>
+                </div>
+                {referenceEnabled ? (
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <span className="text-[10px] font-mono text-zinc-500 truncate max-w-[120px]">
+                      {referenceFile ? referenceFile.name : 'choose clip…'}
+                    </span>
+                    <input
+                      type="file"
+                      accept=".wav,.mp3,.flac,.ogg,.m4a"
+                      className="hidden"
+                      onChange={e => setReferenceFile(e.target.files?.[0] ?? null)}
+                    />
+                    <span className="px-2 py-0.5 rounded border border-zinc-600 text-[10px] font-mono text-zinc-400 hover:border-zinc-400">browse</span>
+                  </label>
+                ) : (
+                  <span className="text-[10px] font-mono text-zinc-600">
+                    uses profile mean style (computed at training end)
+                  </span>
+                )}
+              </div>
             </div>
           ) : (
           <div className="grid grid-cols-3 gap-6">
