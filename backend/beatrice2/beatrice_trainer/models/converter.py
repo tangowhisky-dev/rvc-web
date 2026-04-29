@@ -45,6 +45,7 @@ from ..models.phone_extractor import PhoneExtractor
 from ..models.pitch_estimator import PitchEstimator
 from ..models.vocoder import Vocoder, slice_segments, compute_loudness, d4c
 from ..io import dump_params, dump_layer
+from ..models.reference_encoder import ReferenceEncoder
 
 class ConverterNetwork(nn.Module):
     def __init__(
@@ -58,6 +59,8 @@ class ConverterNetwork(nn.Module):
         training_time_vq: Literal["none", "self", "random"] = "none",
         phone_noise_ratio: int = 0.5,
         floor_noise_level: float = 1e-3,
+        use_reference_encoder: bool = False,
+        reference_encoder_channels: int = 256,
     ):
         super().__init__()
         self.frozen_modules = {
@@ -68,6 +71,7 @@ class ConverterNetwork(nn.Module):
         self.phone_noise_ratio = phone_noise_ratio
         self.floor_noise_level = floor_noise_level
         self.out_sample_rate = out_sample_rate = 24000
+        self.use_reference_encoder = use_reference_encoder
         phone_channels = 128
         self.vq = VectorQuantizer(
             n_speakers=n_speakers,
@@ -98,6 +102,20 @@ class ConverterNetwork(nn.Module):
         self.embed_speaker.weight.data.normal_(0.0, math.sqrt(2.0 / 5.0))
         self.embed_formant_shift = nn.Embedding(9, hidden_channels)
         self.embed_formant_shift.weight.data.normal_(0.0, math.sqrt(2.0 / 5.0))
+
+        # Reference encoder — optional; enabled by use_reference_encoder=True.
+        # style_projection maps [B, ref_channels, 1] → [B, hidden_channels, 1].
+        # Both modules always exist (required for strict state_dict loading); when
+        # use_reference_encoder=False the style_projection output is multiplied by
+        # a frozen zero mask so it contributes nothing, and no ref_wav is expected.
+        self.reference_encoder = ReferenceEncoder(
+            style_channels=reference_encoder_channels,
+        )
+        self.style_projection = nn.Conv1d(reference_encoder_channels, hidden_channels, 1)
+        # Zero-init style_projection so the model starts as a baseline clone
+        # when fine-tuning from a checkpoint without the reference encoder.
+        nn.init.zeros_(self.style_projection.weight)
+        nn.init.zeros_(self.style_projection.bias)
 
         self.key_value_speaker_embedding_length = 384
         self.key_value_speaker_embedding_channels = 128
@@ -177,6 +195,7 @@ class ConverterNetwork(nn.Module):
         slice_start_indices: Optional[torch.Tensor] = None,
         slice_segment_length: Optional[int] = None,
         return_stats: bool = False,
+        ref_wav: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[str, float]]]:
         # x: [batch_size, 1, wav_length]
         # target_speaker_id: Long[batch_size]
@@ -375,6 +394,16 @@ class ConverterNetwork(nn.Module):
                 + self.embed_formant_shift(formant_shift_indices)[:, :, None]
             )
         )
+        # Reference encoder: compute style vector from ref_wav and add to x.
+        # ref_wav is a different clip from the same speaker (leakage prevention).
+        # When use_reference_encoder is False or ref_wav is None, the style
+        # projection still runs but on a zero tensor — contributing nothing
+        # (style_projection is zero-init; when no ref_wav, we inject zeros).
+        if self.use_reference_encoder and ref_wav is not None:
+            # ref_wav: [batch, T_ref] at 16 kHz
+            style_vec = self.reference_encoder(ref_wav)   # [batch, ref_channels]
+            style_vec = style_vec.unsqueeze(-1)            # [batch, ref_channels, 1]
+            x = x + self.style_projection(style_vec)      # broadcast over length
         if slice_start_indices is not None:
             assert slice_segment_length is not None
             # [batch_size, hidden_channels, length] -> [batch_size, hidden_channels, segment_length]
@@ -407,6 +436,7 @@ class ConverterNetwork(nn.Module):
         slice_segment_length: int,
         y_all: torch.Tensor,
         enable_loss_ap: bool = False,
+        ref_wavs_16k: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -434,6 +464,7 @@ class ConverterNetwork(nn.Module):
             target_speaker_id,
             formant_shift_semitone,
             return_stats=True,
+            ref_wav=ref_wavs_16k[:, 0, :] if ref_wavs_16k is not None else None,
         )
         y_hat_all = y_hat_all.detach().where(y_all == 0.0, y_hat_all)
 
@@ -552,6 +583,26 @@ class ConverterNetwork(nn.Module):
         dump_layer(self.embed_quantized_pitch, f)
         dump_layer(self.embed_pitch_features, f)
         dump_layer(self.vocoder, f)
+
+    def dump_reference_encoder(self, f: Union[BinaryIO, str, bytes, os.PathLike]):
+        """Serialise the reference encoder + style_projection as a standalone .pt file.
+
+        This is the only data needed at inference to encode a new reference clip.
+        Called during training completion and export so inference doesn't need
+        the full checkpoint for reference encoding.
+        """
+        if isinstance(f, (str, bytes, os.PathLike)):
+            with open(f, "wb") as f:
+                self.dump_reference_encoder(f)
+            return
+        import torch as _torch
+        _torch.save({
+            "reference_encoder": self.reference_encoder.state_dict(),
+            "style_projection": self.style_projection.state_dict(),
+            "use_reference_encoder": self.use_reference_encoder,
+            "style_channels": self.reference_encoder.proj.out_features,
+            "hidden_channels": self.style_projection.out_channels,
+        }, f)
 
     def dump_speaker_embeddings(self, f: Union[BinaryIO, str, bytes, os.PathLike]):
         if isinstance(f, (str, bytes, os.PathLike)):

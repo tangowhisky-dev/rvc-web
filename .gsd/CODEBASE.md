@@ -1,7 +1,7 @@
 # Codebase Map
 
-Generated: 2026-04-27T11:52:48Z | Files: 233 | Described: 0/233
-<!-- gsd:codebase-meta {"generatedAt":"2026-04-27T11:52:48Z","fingerprint":"c11a38d83e8b073c6db4073bb0fee2e0b0ef3806","fileCount":233,"truncated":false} -->
+Generated: 2026-04-29T05:51:07Z | Files: 237 | Described: 0/237
+<!-- gsd:codebase-meta {"generatedAt":"2026-04-29T05:51:07Z","fingerprint":"c71040c17a959a05498d6e297f5bc438283c5e68","fileCount":237,"truncated":false} -->
 
 ### (root)/
 - `.env.example`
@@ -52,6 +52,7 @@ Generated: 2026-04-27T11:52:48Z | Files: 233 | Described: 0/233
 - `backend/app/_realtime_worker.py`
 - `backend/app/audio_preprocessing.py`
 - `backend/app/db.py`
+- `backend/app/f0_transform.py`
 - `backend/app/main.py`
 - `backend/app/realtime.py`
 - `backend/app/training.py`
@@ -282,24 +283,7 @@ Generated: 2026-04-27T11:52:48Z | Files: 233 | Described: 0/233
 - `data/samples/fa1a3b24795c40f2a8fc5b3e141782f5/v.wav`
 
 ### docs/
-- `docs/AMPHION-VEVO2-ANALYSIS.md`
-- `docs/BEATRICE-ANALYSIS.md`
-- `docs/BEATRICE2_INTEGRATION.md`
-- `docs/beatrice2-augmentation-precompute.md`
-- `docs/beatrice2-realtime-pipeline.md`
-- `docs/CROSS_PLATFORM_ANALYSIS.md`
-- `docs/DEITERIS-VC-ANALYSIS.md`
-- `docs/KNOWLEDGE.md`
-- `docs/meanvc-freevc-integration-analysis.md`
-- `docs/pitch-pipeline.md`
-- `docs/REALTIME_CLIENT_IO_MIGRATION.md`
-- `docs/RT-VC-ANALYSIS.md`
-- `docs/TRAINING_COMPARISON.md`
-- `docs/TRAINING_PIPELINE_AUDIT.md`
-- `docs/TRAINING_PIPELINE.md`
-- `docs/TRAINING_STRATEGY.md`
-- `docs/VOCODER-COMPARISON.md`
-- `docs/WAY-FORWARD.md`
+- *(21 files: 21 .md)*
 
 ### frontend/
 - `frontend/.gitignore`
