@@ -121,6 +121,13 @@ class ReferenceEncoder(nn.Module):
     def wav_to_mel(self, wav_16k: torch.Tensor) -> torch.Tensor:
         """Convert a 16 kHz waveform to a log-mel spectrogram.
 
+        Runs the MelSpectrogram in fp32 regardless of the caller's autocast
+        context.  Under fp16 AMP, the STFT + filterbank matrix multiply
+        truncates near-zero power spectrum values, causing log() to produce
+        -inf which propagates as NaN through the conv pyramid and corrupts
+        the BatchNorm2d running stats.  fp32 is required for numerical
+        stability — this is a standard AMP pattern for mel transforms.
+
         Parameters
         ----------
         wav_16k : Tensor [B, T] or [T]
@@ -134,8 +141,12 @@ class ReferenceEncoder(nn.Module):
         squeeze = wav_16k.dim() == 1
         if squeeze:
             wav_16k = wav_16k.unsqueeze(0)  # [1, T]
-        mel = self.mel_transform(wav_16k)           # [B, n_mels, T_mel]
-        mel = mel.clamp(min=1e-10).log_()           # log-mel
+        # Force fp32 for mel computation — prevents fp16 truncation of
+        # near-zero power spectrum values that cause log() -> -inf -> NaN.
+        with torch.amp.autocast("cuda", enabled=False):
+            wav_f32 = wav_16k.float()
+            mel = self.mel_transform(wav_f32)       # [B, n_mels, T_mel] fp32
+            mel = mel.clamp(min=1e-10).log_()       # log-mel fp32
         mel = mel.unsqueeze(1)                      # [B, 1, n_mels, T_mel]
         if squeeze:
             mel = mel.squeeze(0)

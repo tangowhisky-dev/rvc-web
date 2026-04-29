@@ -607,6 +607,14 @@ async def _run_beatrice_pipeline(
     # phase.txt (extract_f0 → extract_feature → train) and the poller
     # picks those up in order.  Emitting "train" now causes the UI to
     # jump forward then snap back to extract_f0.
+    # Delete stale phase.txt from a prior run so the poller doesn't fire
+    # a premature "train" phase event before the subprocess begins.
+    _phase_file = os.path.join(out_dir, "phase.txt")
+    try:
+        if os.path.exists(_phase_file):
+            os.remove(_phase_file)
+    except Exception:
+        pass
     env = dict(os.environ)
     env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
