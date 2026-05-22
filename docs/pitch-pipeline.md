@@ -309,3 +309,37 @@ When auto pitch is on but std is missing from an old profile (no `std_f0` in jso
 - **σ ratio instability with short files**: if the source file has fewer than ~500 voiced frames (≈5 seconds of speech), the log-std estimate is noisy. DIO's `n_frames` count in the response can be used to detect this.
 - **Prosody is rescaled, not reconstructed**: normalization stretches/compresses the existing F0 contour — it does not resynthsize natural intonation in the target speaker's style. The output contour shape is still the source speaker's.
 - **Extreme ratios clip badly**: if σ_t/σ_s > 2 or < 0.5, consider clamping the ratio before applying to avoid unnaturally extreme intonation. The current implementation applies the ratio without clamping.
+
+---
+
+## 6. Advanced F0 Normalization (Planned)
+
+Mean-std normalization (Section 5) is a linear transform in log-Hz space. It correctly maps the central pitch and spread but does not match distribution shape, intonation dynamics, or speaking range. See `docs/f0-prior-analysis.md` for the full analysis.
+
+### 6.1 Histogram Equalization (offline only) ⏳ Planned
+
+Maps each source frame to its rank within the source distribution, then maps that rank to the corresponding value in the target distribution.
+
+```
+f0_out = CDF_t⁻¹ ( CDF_s(f0_in) )
+```
+
+**What it fixes that mean-std cannot:**\n- Bimodal targets (e.g. a speaker with a "neutral" register and an "emphasis" register)\n- Skewed distributions: a target whose pitch is skewed toward high values\n- Any higher-order distributional shape is exactly matched
+
+**Key property:** Rank-preserving → monotone → if source is locally smooth, output is locally smooth. HistEQ does not introduce jaggedness.\n\n**Storage:** 256-bucket histogram (already computed in `f0_transform.py`, stored in `speaker_f0.json` as `f0_hist`).\n\n**Limitation:** Requires full source CDF — only available for offline inference where the input file is known upfront. For realtime, a rolling CDF after ~5 seconds of warm-up is the planned approach.
+
+### 6.2 Velocity Normalization ⏳ Planned
+
+Scales the frame-to-frame rate of pitch change to match the target speaker's intonation speed.
+
+```\nΔlog_f0_out[t] = (σ_vel_t / σ_vel_s) × Δlog_f0_in[t]\nlog_f0_out[t]  = log_f0_out[t-1] + Δlog_f0_out[t]\n```\n\nThen recentered to preserve the mean established by mean-std or HistEQ.\n\n**Why it's independent:** σ_vel and σ_dist are not simply proportional. For an AR(1) speech model: `σ_vel / σ_dist = √(2(1-a))`. The AR coefficient `a` varies between speakers (smooth: a≈0.95, expressive: a≈0.70) — two speakers can have identical μ and σ but very different σ_vel.\n\n**Perceptually:** Controls whether the converted voice sounds deliberate (slow, smooth pitch contour) or animated (fast, frequent pitch excursions).\n\n**Storage:** `vel_std` (already computed in `f0_transform.py`).
+
+### 6.3 Range Soft-Clip ⏳ Planned
+
+Applies a soft sigmoidal compression that confines output F0 to the target's speaking range without hard cutting.
+
+```\ncenter     = (log(P5_t) + log(P95_t)) / 2\nhalf_range = (log(P95_t) − log(P5_t)) / 2\nf0_out = exp( center + tanh( (log_f0 − center) / half_range × k ) × half_range / tanh(k) )\n```\n\nwhere `k` controls softness (k=2 gives gentle squashing; k=5 approaches hard clip).\n\n**Why it matters:** After normalization, extreme frames can still produce out-of-character output — e.g. a source speaker who occasionally drops to a very low creaky voice will map to something that sounds wrong on a high-pitched target.\n\n**Storage:** P5, P95 percentiles (already computed in `f0_transform.py`).
+
+### 6.4 Implementation Status
+
+| Transform | Status | Offline | Realtime |\n|---|---|---|---|\n| Mean-std normalization | ✅ Implemented | ✓ | ✓ |\n| Percentile stats (P5–P95, vel_std, voiced_rate) | ✅ Computed | ✓ | ✓ |\n| Histogram equalization | ⏳ Planned | ✓ | Rolling CDF (optional) |\n| Velocity normalization | ⏳ Planned | ✓ | ✓ (causal) |\n| Range soft-clip | ⏳ Planned | ✓ | ✓ |\n

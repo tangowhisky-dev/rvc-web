@@ -54,6 +54,9 @@ does not affect generator weights.
 
 ### 1. Adversarial generator loss — `loss_gen`  (weight 1.0)
 
+**Config:** `adv_loss` (str, default "lsgan", options: "lsgan", "tprls")
+
+**LSGAN (default):**
 ```python
 def generator_loss(disc_outputs):
     loss = 0
@@ -71,6 +74,10 @@ Summed across all sub-discriminators.
 **Why this formulation:** Least-squares GAN (LSGAN) rather than the original
 BCE formulation.  LSGAN gradients don't saturate when the discriminator is confident,
 giving stable training throughout without mode collapse.
+
+**TPRLS (alternative):** Truncated Paired Relative Least Squares.  Uses median-centering
+to reduce mode collapse risk when the discriminator dominates early in training.
+Empirically more stable for voice GAN training when LSGAN oscillates.
 
 **Discriminator companion (`loss_disc`):**
 ```python
@@ -184,11 +191,19 @@ In plain terms: forces the distribution the prior produces to match the distribu
 the posterior produces.  If these diverge, inference quality drops because at inference
 time only the prior is available.
 
-**Why weight 1.0:** The KL term is already normalised by the mask sum, giving it a
-natural scale of ~1–3.  A weight of 1.0 keeps it in balance with `loss_gen` and
-`loss_fm`.  Higher weights cause posterior collapse (the posterior becomes indistinguishable
-from the prior, losing speaker-specific detail); lower weights allow the prior-posterior
-gap to grow and degrade inference quality.  1.0 is the standard VITS value.
+**Why weight 1.0:** The KL term is already normalised by the mask sum, giving it a\nnatural scale of ~1–3.  A weight of 1.0 keeps it in balance with `loss_gen` and\n`loss_fm`.  Higher weights cause posterior collapse (the posterior becomes indistinguishable\nfrom the prior, losing speaker-specific detail); lower weights allow the prior-posterior\ngap to grow and degrade inference quality.  1.0 is the standard VITS value.
+
+---
+
+### 4a. KL Annealing (optional)
+
+**Config:** `kl_anneal` (bool, default false), `kl_anneal_epochs` (int, default 40)
+
+When enabled, the KL weight is modulated by a cyclic cosine annealing schedule instead\nof staying at 1.0:
+
+```python\nkl_beta = 0.5 * (1 - cos(step / cycle * π))\n```\n\n- Starts at ~0 (KL effectively disabled), ramps to 1.0 over `kl_anneal_epochs`\n- Then cycles back to 0 and repeats\n- Prevents posterior collapse early in training when the model hasn't learned a\n  useful latent yet — applying full KL pressure from epoch 1 can force the posterior\n  to collapse to the prior before it has had a chance to encode speaker-specific detail
+
+**When to use:** beneficial for profiles with limited training data or when the KL loss\nspikes early and dominates the gradient.  For well-behaved runs with sufficient data,\nfixed `kl_beta = 1.0` is simpler and works fine.
 
 ---
 
@@ -232,6 +247,15 @@ perceptual similarity signal).
 **c_spk = 0 is valid** for simple fine-tunes with a single speaker and clean audio.
 The speaker embedding table `emb_g` still encodes speaker identity; c_spk > 0 adds an
 explicit perceptual alignment signal on top of that.
+
+**`loss_mode` parameter:** Controls which loss terms are summed for the generator update.
+- `classic` (default): `loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl` — speaker loss
+  is NOT included regardless of `c_spk`. Speaker identity is maintained only through the
+  speaker embedding table `emb_g`.
+- `combined`: `loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_spk` — adds
+  explicit ECAPA-TDNN cosine similarity loss. Requires profile embedding to be computed
+  before training starts. Use this when you want the model to actively optimise for
+  speaker identity rather than relying solely on the learned speaker embedding vector.
 
 ---
 
@@ -285,16 +309,25 @@ the frequency domain at multiple scales.
 
 ## Optimiser and learning rate schedule
 
+**Config:** `optimizer` (str, default "adamw", options: "adamw", "adamspd")
+
 ```python
 optim_g = AdamW(net_g.parameters(), lr=lr_scaled, betas=(0.8, 0.99), eps=1e-9)
 optim_d = AdamW(net_d.parameters(), lr=lr_scaled, betas=(0.8, 0.99), eps=1e-9)
 scheduler = ExponentialLR(gamma=0.999875, last_epoch=epoch_str - 2)
 ```
 
-**AdamW:** standard for transformer-adjacent models.  `betas=(0.8, 0.99)` vs the
+**AdamW (default):** standard for transformer-adjacent models.  `betas=(0.8, 0.99)` vs the
 usual `(0.9, 0.999)` gives faster momentum decay (half-life ~5 steps vs ~10) and
 faster second-moment decay.  This makes the optimiser more responsive to fresh gradient
 directions — beneficial in fine-tuning where the loss landscape changes quickly.
+
+**AdamSPD (alternative):** adds a "stiffness penalty" that projects weights back toward
+pre-trained values after each update.  Explicitly limits drift from the pretrain,
+analogous to L2 regularisation in weight space.  The stiffness penalty is conceptually
+similar to LoRA's low-rank constraint — it prevents catastrophic forgetting of the
+pretrain's learned voice prior.  Most beneficial for short fine-tuning runs (< 200 epochs)
+where preserving naturalness matters more than maximising speaker similarity.
 
 **ExponentialLR decay:** After 100 epochs, LR × 0.999875^100 ≈ 0.988 LR.  After
 1000 epochs, LR × 0.882.  After 3000 epochs, LR × 0.687.  The decay is slow enough
@@ -328,47 +361,34 @@ producing a noisy loss curve and a higher loss floor than equivalent CUDA traini
 
 ### What metric is tracked
 
-The best epoch is identified by the **epoch-average generator adversarial loss** —
-`avg_gen` — not the total loss `loss_gen_all`, and not `loss_mel`.
+The best epoch is identified by the **epoch mel loss** — `loss_mel` — not the total loss `loss_gen_all`, and not `loss_gen`.
 
-```python
-# Inside _drain_stdout in training.py:
-avg_gen = (sum of loss_gen values across all steps in the epoch) / step_count
-```
+This is the per-epoch mel spectrogram L1 loss as written to the `epoch_losses` DB table by `train.py`'s `TrainingDBWriter`.
 
-This is the average across all training steps in the epoch of `loss_gen` —
-the adversarial fooling-the-discriminator component only, without mel, KL, FM, or
-speaker terms.
+### Why not loss_gen?
 
-### Why not loss_mel?
+`loss_gen` (adversarial fooling-the-discriminator) oscillates significantly — it measures how well the generator currently fools the discriminator, which is a competitive signal that can improve or degrade independently of audio quality.  A lower `loss_gen` doesn't necessarily mean better audio.
 
-`loss_mel` is the dominant term (×45) and converges monotonically for well-behaved
-runs.  Using it as the best-model selector would produce the checkpoint from the last
-epoch almost every time — unhelpfully, since the last epoch is already `G_latest.pth`.
-
-`loss_gen` oscillates more.  It measures how well the generator currently fools the
-discriminator, which is a more sensitive indicator of perceptual quality plateau
-and overtraining.  When `loss_gen` stops improving while `loss_mel` continues improving,
-the additional spectral refinement is no longer accompanied by perceptual gains.
+`loss_mel` is a direct measure of spectral fidelity.  It is the dominant term (×45) and converges monotonically for well-behaved runs.  Using it as the best-model selector picks the epoch with the most accurate spectral reconstruction.
 
 ### Why not loss_gen_all?
 
 `loss_gen_all` is a weighted sum of five heterogeneous quantities.  Its absolute value
 is dominated by `loss_mel × 45`.  Using it as a selection metric would be equivalent
-to using `loss_mel` with noise added from the other terms.  `loss_gen` is a cleaner,
+to using `loss_mel` with noise added from the other terms.  `loss_mel` is a cleaner,
 more interpretable signal.
 
 ### The minimum improvement threshold
 
 ```python
 _min_delta = 0.004
-is_best = avg_gen < current_best - _min_delta
+is_best = cur_mel < current_best - _min_delta
 ```
 
-Updates to `G_best.pth` are only written when `avg_gen` improves by at least 0.004.
+Updates to `G_best.pth` are only written when mel loss improves by at least 0.004.
 This prevents spurious saves caused by numerical noise between consecutive epochs at
-the same quality level.  0.004 is approximately 0.02% of a typical `loss_gen` value
-of ~20 — a practically negligible difference that would not be audible.
+the same quality level.  0.004 is approximately 0.5% of a typical `loss_mel` value
+of ~0.7 — a practically negligible difference that would not be audible.
 
 ### What happens to the best checkpoint
 
@@ -390,22 +410,22 @@ more natural-sounding but less spectrally detailed).
 ## Overtraining detection
 
 ```python
-_ot_consecutive_gen += 1 when avg_gen > current_best + _min_delta
-terminate when _ot_consecutive_gen >= overtrain_threshold  (default 0 = disabled)
+_ot_consecutive += 1 when cur_mel > current_best + _min_delta
+terminate when _ot_consecutive >= overtrain_threshold  (default 0 = disabled)
 ```
 
-The logic mirrors ultimate-rvc's overtraining detection:
+The logic monitors mel loss for consecutive epochs without improvement:
 
-- `avg_gen` (epoch-average generator loss) is the primary signal.
-- A separate `avg_disc` counter fires at `2 × overtrain_threshold` — the discriminator
-  signal is noisier and less reliable, so it needs a longer confirmation window.
+- `loss_mel` (epoch mel spectrogram loss) is the primary signal.
+- When mel loss fails to improve below the best value (by at least `_min_delta`) for
+  `overtrain_threshold` consecutive epochs, training is terminated.
 - When triggered, `train_proc.terminate()` is sent to stop training immediately at
   the current epoch boundary.
 - The artifact phase then uses `G_best.pth` (written at the last best epoch before
   overtraining began) as the inference model.
 
 This means the overtraining detector and the best-epoch selector share the same metric
-and the same update logic — they are the same computation from different perspectives.
+(mel loss) and the same update logic — they are the same computation from different perspectives.
 
 ---
 
@@ -416,9 +436,20 @@ and the same update logic — they are the same computation from different persp
 | `loss_gen` | Σ MSE(1 − D(fake)) | 1.0 | Fool discriminator (perceptual) |
 | `loss_fm` | 2 × Σ L1(fmap_real − fmap_fake) | ~2.0 | Match discriminator internals |
 | `loss_mel` | L1(mel_real − mel_fake) | **45** | Spectral fidelity (dominant) |
-| `loss_kl` | KL(posterior ‖ prior) | 1.0 | Latent alignment (inference quality) |
+| `loss_kl` | KL(posterior ‖ prior) | 1.0 (or annealed) | Latent alignment (inference quality) |
 | `loss_spk` | 1 − cos(gen_emb, ref_emb) | 0–3 | Speaker identity |
 | `loss_disc` | Σ MSE(D(real)−1) + MSE(D(fake)) | — | Discriminator only, no gen grad |
+
+**Configurable training parameters:**
+| Param | Options | Default | Effect |
+|---|---|---|---|
+| `adv_loss` | lsgan, tprls | lsgan | Adversarial loss formulation |
+| `kl_anneal` | true, false | false | Cyclic cosine KL annealing |
+| `kl_anneal_epochs` | int | 40 | Cycle duration for KL annealing |
+| `optimizer` | adamw, adamspd | adamw | Optimizer (AdamSPD adds stiffness penalty) |
+| `c_spk` | 0–3 | 2.0 | Speaker loss weight |
+| `loss_mode` | classic, combined | classic | Loss combination mode |
+| `overtrain_threshold` | 0–N (0=disabled) | 0 | Early stop after N epochs without mel loss improvement |
 
 **Gradient origin of each generator update:**
 - ~85% from `loss_mel` (spectral accuracy)
@@ -430,6 +461,6 @@ and the same update logic — they are the same computation from different persp
 These percentages are approximate and shift as training progresses — early training
 is more adversarial, late training is dominated by mel refinement.
 
-**Best-epoch metric:** epoch-average `loss_gen` (adversarial component only), with
+**Best-epoch metric:** epoch `loss_mel` (mel spectrogram L1), with
 minimum improvement threshold 0.004.  Written to `G_best.pth` by `train.py` on the
 fly; converted to `model_best.pth` in the artifact phase.

@@ -188,19 +188,21 @@ The `f0_hist` array holds the empirical CDF: `f0_hist[i]` = fraction of voiced f
 
 The layers are ordered by impact-to-complexity ratio:
 
-### 1. Percentiles + velocity std (extend `compute_speaker_f0`)
+### 1. Percentiles + velocity std (extend `compute_speaker_f0`) ✅ DONE
 
 Single extra pass over the already-collected voiced F0 array. No new dependencies. Adds P5, P25, P50, P75, P95, vel_std, voiced_rate to `speaker_f0.json`. Backward compatible.
 
-### 2. Range soft-clip (inference hook)
+**Status:** Implemented. `f0_transform.py` computes all percentiles, velocity std, voiced rate, and the 256-bucket histogram. Stored in `speaker_f0.json` and exposed via `speaker_mean_f0`, `speaker_std_f0`, `speaker_p5_f0`, `speaker_p25_f0`, `speaker_p50_f0`, `speaker_p75_f0`, `speaker_p95_f0`, `speaker_vel_std`, `speaker_voiced_rate` in profile API. Frontend displays these in the profile card.
+
+### 2. Range soft-clip (inference hook) ⏳ Planned
 
 One tanh operation per voiced frame. Extend the existing `_patched_get_f0` (RVC) and `_normed_sample_pitch` (B2) with a final soft-clip stage. Requires: P5, P95 from speaker_f0.json.
 
-### 3. Velocity normalization (inference hook)
+### 3. Velocity normalization (inference hook) ⏳ Planned
 
 Causal first-difference accumulator. Extends the same hooks. Requires: vel_std from speaker_f0.json for both target and source (source comes from `input_f0` endpoint). Handle voiced/unvoiced gaps: reset the accumulator when the silence spans more than N frames (don't propagate the gap as a "pitch change").
 
-### 4. Histogram equalization (offline only)
+### 4. Histogram equalization (offline only) ⏳ Planned
 
 Requires full source CDF — only available for offline inference where the input file is known upfront. Extend `compute_speaker_f0` to also compute and store the 256-bucket histogram. Extend `input_f0` endpoint to return the source histogram. Implement `histeq_transform(src_hist, tgt_hist, f0_hz)` as a vectorized numpy operation on the whole file before the block loop.
 

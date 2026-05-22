@@ -1,36 +1,59 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# RVC Web Frontend
 
-## Getting Started
+Next.js 15 (App Router) + React 19 + TypeScript + Tailwind CSS 4.
 
-First, run the development server:
+## Structure
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+```
+app/
+  layout.tsx              ← Root layout, font, global styles
+  page.tsx                ← Main online dashboard (profiles, training, offline)
+  offline/
+    page.tsx              ← Offline inference page (file upload + convert)
+  realtime/
+    page.tsx              ← Realtime voice conversion page (mic input)
+  globals.css             ← Tailwind base, theme variables, custom utilities
+components/
+  ui/                     ← Reusable UI primitives (buttons, inputs, modals, etc.)
+  ProfileCard.tsx         ← Profile list item with stats
+  TrainingProgress.tsx    ← Live training progress with WebSocket updates
+  OfflineConvert.tsx      ← Offline conversion form + controls
+  RealtimePanel.tsx       ← Realtime inference controls
+lib/
+  api.ts                  ← API client (fetch wrappers, type-safe endpoints)
+  audio.ts                ← Audio utilities (WAV encoding, PCM processing)
+  realtime.ts             ← Realtime WebSocket client
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Key Features
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- **Profile management**: Create, upload audio, view F0 stats (mean, std, percentiles, velocity)
+- **Training**: Start/cancel training jobs, live WebSocket progress, epoch loss charts
+- **Offline inference**: Upload audio file, configure pitch/autotune/protect, download result
+- **Realtime inference**: Mic input → voice conversion → playback via Web Audio API
+- **Engine selection**: RVC or Beatrice 2 at profile creation (immutable)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## API Integration
 
-## Learn More
+All API calls go through `lib/api.ts` which wraps `fetch()` with:
+- Base URL resolution (`/api/` relative paths)
+- Error handling with typed responses
+- File upload support (FormData)
 
-To learn more about Next.js, take a look at the following resources:
+WebSocket connections for training progress and realtime inference are managed by dedicated clients in `lib/realtime.ts`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Styling
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Tailwind CSS 4 with CSS variables for theming. Dark mode via class strategy. Custom utility classes in `globals.css` for animations and layout patterns.
 
-## Deploy on Vercel
+## Development
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+cd frontend
+npm install
+npm run dev        # localhost:3000
+npm run build      # production build
+npm run lint       # ESLint + TypeScript
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The dev server proxies `/api/` requests to the backend (configured in `next.config.ts`).

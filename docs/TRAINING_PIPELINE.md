@@ -253,12 +253,16 @@ loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_spk
 | `batch_size` | 4 | Overridden by UI (default 8) |
 | `segment_size` | 12800 | Waveform samples per segment (0.4s) |
 | `epochs` | 20000 | Overridden by UI (default 50) |
-| `learning_rate` | 1e-4 | AdamW |
+| `learning_rate` | 1e-4 | AdamW, auto-scaled by sqrt(batch_size/32) |
 | `lr_decay` | 0.999875 | Per-epoch exponential decay |
 | `c_mel` | 45 | Mel loss weight |
 | `c_kl` | 1.0 | KL loss weight |
 | `c_spk` | 0-3 | Speaker loss weight (UI configurable) |
-| `fp16_run` | true | Mixed precision |
+| `fp16_run` | true | Mixed precision (auto-disabled on MPS) |
+| `adv_loss` | lsgan | Adversarial loss: lsgan or tprls |
+| `kl_anneal` | false | Cyclic cosine KL annealing schedule |
+| `kl_anneal_epochs` | 40 | Cycle duration for KL annealing |
+| `optimizer` | adamw | Optimizer: adamw or adamspd |
 
 ### Data
 | Parameter | Value | Notes |
@@ -296,7 +300,9 @@ loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_spk
 
 ## 10. Speaker Loss Integration (ECAPA-TDNN)
 
-### Current Implementation (Per-Segment)
+### Implementation (Profile-Level Embeddings)
+
+Profile-level embeddings are used — computed once before training from all profile audio, saved as `profile_embedding.pt` in the experiment directory.
 
 ```python
 # In generator training step:
@@ -304,18 +310,13 @@ _wave_16k = resample(wave.squeeze(1), 32kHz → 16kHz)    # [B, T]
 _yhat_16k = resample(y_hat.squeeze(1), 32kHz → 16kHz)   # [B, T]
 
 with torch.no_grad():
-    ref_emb = speaker_encoder(_wave_16k)    # [B, 192]
+    ref_emb = profile_embedding    # [1, 192] — loaded from profile_embedding.pt
 gen_emb = speaker_encoder(_yhat_16k)        # [B, 192]
 
 loss_spk = (1 - cosine_sim(gen_emb, ref_emb)) × c_spk
 ```
 
-### Issue
-- ECAPA-TDNN was trained on 2-4 second utterances
-- Training segments are 0.4s (12,800 samples) — **5-10× too short**
-- Embeddings from 0.4s segments are noisy and content-dependent
-
-### Planned: Profile-Level Embeddings
-- Compute **one robust speaker embedding** from all profile audio before training (completed)
-- Compare each generated segment's embedding against this fixed target
-- Eliminates per-segment noise, provides consistent speaker identity target
+- Profile embedding provides a stable, content-agnostic speaker identity target
+- Each training step compares the generated 0.4s segment against this fixed reference
+- `c_spk` weight is configurable via the training API (default 2.0)
+- Eliminates per-segment noise that would occur if embedding was computed from 0.4s segments

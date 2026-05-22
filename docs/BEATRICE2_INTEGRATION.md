@@ -1,14 +1,46 @@
-# Beatrice 2 Integration Plan
+# Beatrice 2 Integration
 
-**Status**: Planned — not yet implemented  
-**Branch**: `RVC studio - beatrice 2`  
-**Date**: 2026-04-15
+**Status**: ✅ Implemented  \n**Branch**: merged to main  \n**Date**: 2026-04-15 (planned) — implemented by 2026-05-22
 
 ---
 
 ## Overview
 
-Integrate the Beatrice 2 voice conversion trainer as a second pipeline alongside the existing RVC pipeline. Users choose the engine at profile creation time; the choice is immutable (locked after the profile is created). All training, inference (offline and realtime), and UI flows are engine-aware.
+Beatrice 2 voice conversion trainer is integrated as a second pipeline alongside the existing RVC pipeline. Users choose the engine at profile creation time; the choice is immutable (locked after the profile is created). All training, inference (offline and realtime), and UI flows are engine-aware.
+
+### What was implemented
+
+All 8 milestones from the original plan are complete:
+
+- **M1**: Branch + file layout + asset paths + DB migration (`pipeline` column, `beatrice_steps` table)
+- **M2**: `__main__.py` refactored into logical modules under `backend/beatrice2/beatrice_trainer/`
+- **M3**: Training wrapper (`backend/beatrice2/training.py`), subprocess management, DB writer
+- **M4**: Inference engine (`backend/beatrice2/inference.py`), offline convert integration
+- **M5**: API contract updates — profiles, training, offline routers are pipeline-aware
+- **M6**: Frontend: profile creation engine selector, step-based progress, B2-specific params
+- **M7**: Realtime inference integration (`_run_beatrice2_realtime` in `_realtime_worker.py`)
+- **M8**: Export / import Beatrice 2 format (zip bundle with paraphernalia)
+
+### Where to find the code
+
+```
+backend/beatrice2/
+  __init__.py
+  training.py              ← BeatriceTrainingJob + BeatriceTrainingManager
+  inference.py             ← BeatriceInferenceEngine
+  preprocess.py            ← audio preprocessing helper
+  download_assets.py       ← asset downloader
+  beatrice_trainer/        ← refactored trainer modules
+    __init__.py
+    __main__.py            ← entry point
+    config.py              ← hparams, AttrDict, prepare_training_configs()
+    layers/                ← conv.py, attention.py, vq.py
+    models/                ← phone_extractor.py, pitch_estimator.py, vocoder.py, converter.py, discriminator.py
+    data/                  ← dataset.py, filelist.py
+    train/                 ← loss.py, checkpoint.py, evaluation.py, loop.py
+    io.py                  ← binary I/O helpers
+assets/beatrice2/          ← pretrained weights, IR, noise, test audio
+```
 
 ---
 
@@ -35,18 +67,18 @@ Integrate the Beatrice 2 voice conversion trainer as a second pipeline alongside
 
 ## Milestone Breakdown (Implementation Order)
 
-| # | Title | Description | Risk |
-|---|---|---|---|
-| M1 | Branch + file layout + asset paths + DB | Create branch, move files, resolve asset paths, DB migration | Low |
-| M2 | Refactor `__main__.py` → logical modules | Split monolith into focused files, zero logic changes | Medium |
-| M3 | Training wrapper + subprocess management | `BeatriceTrainingJob`, preprocess step, stdout parsing, DB writer | High |
-| M4 | Inference engine (offline) | `BeatriceInferenceEngine`, offline convert integration | High |
-| M5 | API contract updates | Profiles, training, offline routers; pipeline-aware endpoints | Low |
-| M6 | Frontend: profile creation + training UI | Engine selector, step-based progress, beatrice2-specific params | Medium |
-| M7 | Realtime inference integration | Realtime worker beatrice2 branch, formant shift param | Medium |
-| M8 | Export / import Beatrice 2 format | Zip bundle with paraphernalia, manifest v2 | Low |
+All milestones are complete. The breakdown below documents the implementation approach taken.
 
-Pause between each milestone to avoid rate-limiting.
+| # | Title | Description | Risk | Status |
+|---|---|---|---|---|
+| M1 | Branch + file layout + asset paths + DB | Create branch, move files, resolve asset paths, DB migration | Low | ✅ |
+| M2 | Refactor `__main__.py` → logical modules | Split monolith into focused files, zero logic changes | Medium | ✅ |
+| M3 | Training wrapper + subprocess management | `BeatriceTrainingJob`, preprocess step, stdout parsing, DB writer | High | ✅ |
+| M4 | Inference engine (offline) | `BeatriceInferenceEngine`, offline convert integration | High | ✅ |
+| M5 | API contract updates | Profiles, training, offline routers; pipeline-aware endpoints | Low | ✅ |
+| M6 | Frontend: profile creation + training UI | Engine selector, step-based progress, beatrice2-specific params | Medium | ✅ |
+| M7 | Realtime inference integration | Realtime worker beatrice2 branch, formant shift param | Medium | ✅ |
+| M8 | Export / import Beatrice 2 format | Zip bundle with paraphernalia, manifest v2 | Low | ✅ |
 
 ---
 
@@ -525,16 +557,16 @@ beatrice/    ← entire directory; code migrated to backend/beatrice2/
 
 ## Key Risks and Mitigations
 
-| Risk | Impact | Mitigation |
-|---|---|---|
-| CUDA-only training | Users on MPS/CPU cannot train Beatrice 2 | Gate in UI + API with clear error; document CUDA requirement |
-| UTMOS torch.hub download | Training evaluation requires internet access | `record_metrics: false` in default config; document opt-in |
-| Binary inference format | `.bin` files not loadable with `torch.load()` | Use `.pt.gz` checkpoint path for Python inference instead |
-| Augmentation data size | ~12 MB IR/noise required before training starts | Setup page download flow; clear error if missing |
-| 24 kHz output SR mismatch | Offline output at 24k vs RVC 32k; realtime resample path changes | Clearly label output SR in UI; test 24→48 resample path |
-| `n_speakers=1` always | Beatrice 2 is multi-speaker by design | Create `data_dir/{profile_name}/` subdir as the single speaker — works correctly |
-| Circular imports in refactor | Splitting `__main__.py` may create import cycles | Resolve with local imports inside function bodies only; never restructure |
-| Monolith refactor regression | Silent behaviour change | Strict: copy blocks verbatim, no renames; verify with import smoke tests after each module |
+| Risk | Impact | Mitigation | Status |
+|---|---|---|---|
+| CUDA-only training | Users on MPS/CPU cannot train Beatrice 2 | Gate in UI + API with clear error; document CUDA requirement | ✅ Mitigated |
+| UTMOS torch.hub download | Training evaluation requires internet access | `record_metrics: false` in default config; document opt-in | ✅ Mitigated |
+| Binary inference format | `.bin` files not loadable with `torch.load()` | Use `.pt.gz` checkpoint path for Python inference instead | ✅ Mitigated |
+| Augmentation data size | ~12 MB IR/noise required before training starts | Setup page download flow; clear error if missing | ✅ Mitigated |
+| 24 kHz output SR mismatch | Offline output at 24k vs RVC 32k; realtime resample path changes | Clearly label output SR in UI; test 24→48 resample path | ✅ Mitigated |
+| `n_speakers=1` always | Beatrice 2 is multi-speaker by design | Create `data_dir/{profile_name}/` subdir as the single speaker — works correctly | ✅ Resolved |
+| Circular imports in refactor | Splitting `__main__.py` may create import cycles | Resolve with local imports inside function bodies only; never restructure | ✅ Resolved |
+| Monolith refactor regression | Silent behaviour change | Strict: copy blocks verbatim, no renames; verify with import smoke tests after each module | ✅ Resolved |
 
 ---
 

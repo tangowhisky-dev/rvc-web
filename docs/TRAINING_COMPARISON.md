@@ -14,6 +14,9 @@ Concise technical analysis of both training approaches, with quality implication
 | Embedder | SPIN-v2, SPIN, ContentVec, HuBERT | HuBERT (primary), ContentVec |
 | Sample rate | 32k (all) | 40k or 48k |
 | Speaker loss | ECAPA-TDNN cosine similarity (`combined` mode) | None |
+| Adv loss | LSGAN / TPRLS (configurable) | LSGAN / TPRLS / Hinge |
+| KL annealing | Cyclic cosine schedule (optional) | Cyclic cosine schedule (optional) |
+| Optimizer | AdamW / AdamSPD (configurable) | AdamW / RAdam / DiffGrad / Ranger21 / AdamSPD |
 
 ---
 
@@ -38,20 +41,22 @@ Three configurable options:
 
 ### 2.2 Adversarial Loss
 
-**rvc-web:** LSGAN only — `mean((1-D)²)` for generator, `mean((1-D_r)²) + mean(D_g²)` for discriminator.
+**rvc-web:** Configurable via `adv_loss` parameter:
+- **LSGAN** (default) — `mean((1-D)²)` for generator, `mean((1-D_r)²) + mean(D_g²)` for discriminator
+- **TPRLS** — same implementation as fork-4 (Truncated Paired Relative Least Squares)
 
 **fork-4:** Configurable:
 - **LSGAN** — same as rvc-web
 - **TPRLS** (Truncated Paired Relative Least Squares) — robust discriminator loss using median-centering to reduce mode collapse risk; more stable when discriminator dominates early
 - **Hinge** — `max(0, 1-D)` / `max(0, 1+D)`, preferred for many GAN papers
 
-**Quality implication:** TPRLS and hinge losses are empirically more stable for voice GAN training. LSGAN can oscillate when the discriminator learns too fast relative to the generator. rvc-web is locked to LSGAN.
+**Quality implication:** TPRLS is empirically more stable for voice GAN training. LSGAN can oscillate when the discriminator learns too fast relative to the generator. rvc-web now offers TPRLS as an alternative via the `adv_loss` training parameter.
 
 ### 2.3 KL Divergence
 
 Identical formulation in both (`logs_p - logs_q - 0.5 + 0.5*(z_p-m_p)²*exp(-2*logs_p)`).
 
-**fork-4 addition:** Optional **KL annealing** — `kl_beta = 0.5*(1 - cos(step/cycle * π))` cyclic schedule. Starts KL at ~0, ramps to 1 over `kl_annealing_cycle_duration` epochs, then repeats. Prevents posterior collapse early in training. rvc-web uses fixed `kl_beta = 1.0` throughout.
+Both support optional **KL annealing** — `kl_beta = 0.5*(1 - cos(step/cycle * π))` cyclic schedule. Starts KL at ~0, ramps to 1 over `kl_anneal_epochs` (default 40), then repeats. Prevents posterior collapse early in training. Enabled via the `kl_anneal` training parameter.
 
 ### 2.4 Feature Matching Loss
 
@@ -87,9 +92,10 @@ Matches audio amplitude peaks and troughs. Present in `losses.py` but not wired 
 ## 3. Optimiser and Learning Rate
 
 **rvc-web:**
-- AdamW, fixed `lr=1e-4` (or sqrt-scaled at non-32 batch sizes)
-- ExponentialLR decay `γ=0.999` per epoch — slow, monotonic
-- No warmup
+- Configurable: AdamW (default), AdamSPD
+- AdamSPD adds a "stiffness penalty" that projects weights back toward pre-trained values — explicitly limits drift from the pretrain, analogous to L2 regularisation in weight space
+- ExponentialLR decay `γ=0.999875` per epoch — slow, monotonic
+- Batch-size learning rate scaling (sqrt rule): `LR_eff = 1e-4 * sqrt(batch_size / 32)`
 
 **fork-4:**
 - Configurable: AdamW, RAdam, DiffGrad, Ranger21, AdamSPD
@@ -99,7 +105,7 @@ Matches audio amplitude peaks and troughs. Present in `losses.py` but not wired 
 - Optional gradient clipping schedule (tight clip early, released later)
 - Separate LR for G and D (`custom_lr_g`, `custom_lr_d`)
 
-**Quality implication:** AdamSPD's stiffness penalty is conceptually similar to LoRA's low-rank constraint — it prevents catastrophic forgetting of the pretrain's learned voice prior. For short fine-tuning runs (<200 epochs) this likely helps preserve naturalness. Cosine annealing tends to find flatter minima than monotonic exponential decay, which generally improves generalisation.
+**Quality implication:** AdamSPD's stiffness penalty is conceptually similar to LoRA's low-rank constraint — it prevents catastrophic forgetting of the pretrain's learned voice prior. For short fine-tuning runs (<200 epochs) this likely helps preserve naturalness. rvc-web now offers AdamSPD via the `optimizer` training parameter.
 
 ---
 
@@ -158,22 +164,23 @@ This is **not a loss function** — it's a display metric computed on the final 
 | Quality Factor | rvc-web | fork-4 | Winner |
 |---|---|---|---|
 | Spectral loss coverage | Single-scale L1 (HiFi-GAN) or 7-scale (RefineGAN) | 7-scale or multi-res STFT with perceptual weighting | **fork-4** (perceptual weighting) |
-| Adversarial loss stability | LSGAN only | LSGAN / TPRLS / Hinge selectable | **fork-4** |
+| Adversarial loss stability | LSGAN / TPRLS selectable | LSGAN / TPRLS / Hinge selectable | **fork-4** (hinge) |
 | Speaker identity signal | ECAPA cosine loss (combined mode) | None | **rvc-web** |
-| Pretrain preservation | ExponentialLR + standard AdamW | AdamSPD stiffness + cosine annealing | **fork-4** |
+| Pretrain preservation | AdamSPD stiffness + exponentialLR | AdamSPD stiffness + cosine annealing | **fork-4** (cosine) |
 | Phase coherence | None | Phase loss for RingFormer | **fork-4** (RingFormer) |
 | Best epoch capture | G_best.pth automatic | Manual via TensorBoard | **rvc-web** |
-| KL collapse prevention | None (β=1 fixed) | KL annealing available | **fork-4** |
+| KL collapse prevention | KL annealing available | KL annealing available | **Tie** |
 | Embedding quality | SPIN-v2 (better content disentanglement) | HuBERT primarily | **rvc-web** |
 | Operational simplicity | One config, sensible defaults | Many knobs, easy to misconfigure | **rvc-web** |
 
 ### Summary
 
-**fork-4 has a richer loss surface** — multi-res STFT with perceptual weighting, TPRLS adversarial loss, KL annealing, and phase loss (RingFormer) collectively give the optimiser more signal about perceptual quality. AdamSPD's stiffness penalty and TSTP's encoder-freezing phase both help preserve the pretrained voice prior, which matters most in short fine-tuning runs.
+**fork-4 has a richer loss surface** — multi-res STFT with perceptual weighting, hinge adversarial loss, phase loss (RingFormer), and cosine annealing collectively give the optimiser more signal about perceptual quality. AdamSPD's stiffness penalty and TSTP's encoder-freezing phase both help preserve the pretrained voice prior, which matters most in short fine-tuning runs.
 
 **rvc-web has two advantages fork-4 lacks entirely**: SPIN-v2 embedder (better speaker-content disentanglement than HuBERT, meaning cleaner content features as decoder input) and explicit speaker identity loss via ECAPA-TDNN (directly penalises speaker drift during fine-tuning).
 
-**Practical verdict for speech cloning at 100–300 epochs:**  
-The most impactful delta is the adversarial loss (TPRLS/Hinge vs LSGAN) and KL annealing. LSGAN can stall when the discriminator overtakes the generator early — something we observe as `loss_gen` plateauing above 3.0 while `loss_mel` keeps improving. Adopting TPRLS or hinge loss in rvc-web, and adding cyclic KL annealing, would close the gap on fork-4's quality advantage without requiring the full TSTP machinery.
+**Gaps closed:** rvc-web now offers TPRLS adversarial loss (`adv_loss`), KL annealing (`kl_anneal`), and AdamSPD (`optimizer`) — the three features that were most impactful for fork-4's quality advantage. The remaining deltas are fork-4's hinge loss, cosine annealing scheduler, multi-res STFT perceptual weighting, and RingFormer phase loss.
+
+**Practical verdict for speech cloning at 100–300 epochs:**  \nWith TPRLS, KL annealing, and AdamSPD now available in rvc-web, the quality gap has narrowed significantly. The most impactful remaining delta is fork-4's multi-res STFT loss with perceptual weighting and cosine annealing scheduler.
 
 SPIN-v2 + ECAPA speaker loss is rvc-web's meaningful differentiator and should be preserved.
